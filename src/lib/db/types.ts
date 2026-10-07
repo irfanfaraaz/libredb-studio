@@ -1182,8 +1182,12 @@ export interface ProviderCapabilities {
    * `"double-always"` quotes every name. InfluxDB 3 declares it: its read policy
    * refuses a bare `$`, which the `"double"` rule lets through, so a generated Count
    * of a table named `a$b` was refused by Studio itself.
+   *
+   * `"backtick-always"` puts a backtick around every name, doubling one inside. Databend
+   * declares it: it folds an unquoted name to lower case, so a bare `MyTable` would name
+   * `mytable`, and a backtick quotes an identifier in every one of its `sql_dialect`s.
    */
-  identifierQuoting?: "double" | "backtick" | "double-always";
+  identifierQuoting?: "double" | "backtick" | "double-always" | "backtick-always";
   /**
    * Whether a statement this product runs may end with `;`.
    *

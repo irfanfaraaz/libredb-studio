@@ -1888,6 +1888,9 @@ describe("useConnectionForm", () => {
     influxdb: true,
     influxdb3: true,
     oxia: true,
+    // Today's truth: the picker does not offer Databend until the connection-form task adds it with its Warehouse
+    // field (design 6.1), which sets this to true.
+    databend: false,
   };
 
   test("dbTypes offers every database type a connection can carry", () => {

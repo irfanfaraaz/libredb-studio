@@ -441,6 +441,9 @@ const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
   influxdb3: "established",
   // One `oxia client` read command, not SQL (SB2-4.3): no SQL grammar is established for it, and none is read.
   oxia: "default",
+  // Today's truth: Databend reads as SQL under the compatibility grammar until its grammar task establishes
+  // DATABEND_GRAMMAR (design 7.1), which changes this row.
+  databend: "default",
 };
 
 /**
@@ -617,6 +620,8 @@ const SQL_TEXT_COVERAGE: Record<DatabaseType, boolean> = {
   // An `oxia client` read command is words split by POSIX shell rules, not SQL text: its quoting is the shell's,
   // which a SQL span reader would report as unreadable (SB2-4.3).
   oxia: false,
+  // SQL, and the statement text IS what the editor sends to `POST /v1/query`; the provider extends SQLBaseProvider.
+  databend: true,
 };
 
 describe("readsSqlText", () => {

@@ -5,6 +5,7 @@ import {
   connectionFieldHint,
   connectionFieldLabel,
   connectionFieldPlaceholder,
+  DATABEND_FIELD_HINTS,
   DB_UI_CONFIG,
   getDBConfig,
   getDBIcon,
@@ -19,7 +20,7 @@ import {
 } from "@/lib/db-ui-config";
 import { SHOWCASE_DATABASE_ORDER, SHOWCASE_RANK, listShowcaseDatabases } from "@/lib/db-showcase";
 import type { DatabaseType } from "@/lib/types";
-import { InfluxDBIcon } from "@/components/icons/db-icons";
+import { DatabendIcon, InfluxDBIcon } from "@/components/icons/db-icons";
 import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
 import { declareHostUri } from "../../helpers/synthetic-host-uri";
 import { providerDirectoryFiles } from "../../helpers/provider-directory-map";
@@ -59,6 +60,7 @@ const ALL_TYPES: DatabaseType[] = [
   "influxdb",
   "influxdb3",
   "oxia",
+  "databend",
 ];
 
 describe("db-ui-config", () => {
@@ -351,6 +353,7 @@ describe("db-ui-config", () => {
       expect(isFileBased("kafka")).toBe(false);
       expect(isFileBased("influxdb")).toBe(false);
       expect(isFileBased("influxdb3")).toBe(false);
+      expect(isFileBased("databend")).toBe(false);
     });
   });
 
@@ -493,6 +496,7 @@ describe("db-ui-config", () => {
           "apiKeyId",
           "apiKeySecret",
           "saslMechanism",
+          "warehouse",
         ] as const;
         for (const type of ALL_TYPES) {
           for (const field of FIELDS) {
@@ -624,6 +628,7 @@ const FIELD_CHECKLIST: Record<ConnectionField, true> = {
   saslMechanism: true,
   allowInsecureAuth: true,
   dataServers: true,
+  warehouse: true,
 };
 const EVERY_FIELD = Object.keys(FIELD_CHECKLIST) as ConnectionField[];
 
@@ -720,6 +725,41 @@ describe("declared connection-field copy (#1085)", () => {
     expect(oxia.credentialWarnings).toBe(CREDENTIAL_WARNINGS.oxia);
   });
 
+  test("databend declares its label, port, fields, Warehouse, the placeholders, the exported hints and the Host box addresses (design 6.1)", () => {
+    const databend = getDBConfig("databend");
+    expect(databend).toMatchObject({
+      label: "Databend",
+      color: "text-hue-red-alt",
+      // Self-hosted's HTTP handler port. 443 comes from TLS, a DSN or an https:// paste, never a host heuristic.
+      defaultPort: "8000",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],
+    });
+    expect(databend.icon).toBe(DatabendIcon);
+    // The SSL panel and the SSH tunnel are both offered.
+    expect(databend.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("databend")).toBe(true);
+    expect(takesConnectionField("databend", "warehouse")).toBe(true);
+    expect(takesConnectionField("postgres", "warehouse")).toBe(false);
+    expect(databend.fieldLabels).toEqual({ warehouse: "Warehouse" });
+    expect(databend.fieldPlaceholders).toEqual({ user: "root", database: "default" });
+    expect(connectionFieldPlaceholder(databend, "database", "db")).toBe("default");
+    expect(databend.fieldHints).toBe(DATABEND_FIELD_HINTS);
+    expect(DATABEND_FIELD_HINTS).toEqual({
+      host: "A host name or address, or a pasted https:// address, which is split into Host and Port. Databend Cloud: the host from Connect in the Cloud console, on port 443 with SSL mode verify-system. Self-hosted: the query node, port 8000 unless http_handler_port was changed.",
+      user: "A SQL user. On Databend Cloud: cloudapp, or a user created with CREATE USER; the email you sign in to the Cloud console with is not a SQL user.",
+      database: "The current database for names a statement does not qualify. Empty means default.",
+      warehouse:
+        "Databend Cloud: the warehouse= value of the DSN from Connect. A suspended warehouse resumes on the first statement, opening the connection included, because it reads the object tree, and is billed while it runs; with Warehouse set, Studio sends no background health checks. Self-hosted: leave empty unless your cluster routes requests by warehouse.",
+      allowInsecureAuth:
+        "Ticked, the password crosses the network in cleartext to this host. Databend Cloud never needs this: it serves HTTPS on port 443.",
+    });
+    expect(databend.readOnlyHint).toBeUndefined();
+    expect(databend.fieldOptions).toBeUndefined();
+    expect(hostUriSchemes("databend")).toEqual(["http", "https"]);
+    expect(databend.credentialWarnings).toBe(CREDENTIAL_WARNINGS.databend);
+  });
+
   test("milvus declares its port, the Database box, Password or token, the field hints and the Host box addresses (vector-family spec 5.2)", () => {
     const milvus = getDBConfig("milvus");
     expect(milvus).toMatchObject({
@@ -810,14 +850,14 @@ describe("declared connection-field copy (#1085)", () => {
     // The consent box draws the type's own sentence, with no fallback, so a type that takes the field and declares no
     // hint would draw an empty paragraph under the box (InfluxDB spec R4).
     const taking = ALL_TYPES.filter((type) => takesConnectionField(type, "allowInsecureAuth"));
-    expect(taking).toEqual(["db2", "influxdb", "influxdb3", "oxia"]);
+    expect(taking).toEqual(["db2", "influxdb", "influxdb3", "oxia", "databend"]);
     for (const type of taking) {
       const hint = connectionFieldHint(getDBConfig(type), "allowInsecureAuth");
       expect({ type, hint: typeof hint, empty: hint?.length === 0 }).toEqual({ type, hint: "string", empty: false });
     }
   });
 
-  test("only libsql, db2, prometheus, kafka, etcd, neo4j, milvus, qdrant, the two InfluxDB types and oxia declare field copy, so every other engine draws every label and hint it drew before", () => {
+  test("only libsql, db2, prometheus, kafka, etcd, neo4j, milvus, qdrant, the two InfluxDB types, oxia and databend declare field copy, so every other engine draws every label and hint it drew before", () => {
     const declared = Object.entries(DB_UI_CONFIG)
       .filter(([, config]) => config.fieldLabels !== undefined || config.fieldHints !== undefined)
       .map(([type]) => type);
@@ -833,6 +873,7 @@ describe("declared connection-field copy (#1085)", () => {
       "influxdb",
       "influxdb3",
       "oxia",
+      "databend",
     ]);
     // The control that the walk saw the whole table rather than nothing.
     expect(Object.keys(DB_UI_CONFIG).sort()).toEqual([...ALL_TYPES].sort());
@@ -940,6 +981,9 @@ describe("db-showcase", () => {
         // Behind Qdrant and ahead of libSQL (SB3-1.2 R19): the store an Apache Pulsar cluster keeps its metadata
         // in, met beside the databases rather than as one of them.
         "oxia",
+        // Behind Oxia and ahead of libSQL (design 7.2): the cloud data warehouse a team runs beside its databases,
+        // the newest name on this page, so only libSQL and the embedded store move (the Milvus, Qdrant, Oxia precedent).
+        "databend",
         "libsql",
         "libredb",
       ]);
@@ -966,12 +1010,13 @@ describe("db-showcase", () => {
 });
 
 describe("Host box addresses and credential warnings", () => {
-  test("only milvus, qdrant and the two InfluxDB types declare hostAcceptsUri, so every other Host box takes a host alone", () => {
+  test("only milvus, qdrant, the two InfluxDB types and databend declare hostAcceptsUri, so every other Host box takes a host alone", () => {
     expect(ALL_TYPES.filter((type) => hostUriSchemes(type).length > 0)).toEqual([
       "milvus",
       "qdrant",
       "influxdb",
       "influxdb3",
+      "databend",
     ]);
   });
 

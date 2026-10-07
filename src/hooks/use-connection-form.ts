@@ -81,6 +81,8 @@ const FIELD_OWNERSHIP: Record<keyof DatabaseConnection, FieldOwnership> = {
   // The text box owns it, so emptying it has to CLEAR it: `preserved` would keep sending the token to servers the
   // user took off the list.
   dataServers: "edited",
+  // Databend's Warehouse box owns it, so emptying it has to CLEAR it, as dataServers.
+  warehouse: "edited",
   group: "preserved",
   managed: "preserved",
   seedId: "preserved",

@@ -1103,6 +1103,9 @@ describe("generateMigrationSQL: SQLite's grammar declares a foreign key only ins
     influxdb: "engine-has-no-foreign-key",
     influxdb3: "engine-has-no-foreign-key",
     oxia: "engine-has-no-foreign-key",
+    // Today's generator output; Databend declares no foreign key (design 2.4), and the schema-diff task moves it onto
+    // NO_FOREIGN_KEYS (design 7.2) and changes this row.
+    databend: "key-follows-in-an-alter",
   };
 
   for (const [dialectId, entry] of Object.entries(GRAMMAR)) {
@@ -1233,6 +1236,9 @@ const MODIFIED_COLUMN_COVERAGE: Record<
   // Not a table store either (SB2-4.3): a key holds opaque bytes, and the columns a read shows are a record's fixed
   // shape, which nothing declares.
   oxia: { label: "Oxia", reason: "has no schema, so there is no column definition to change" },
+  // Today's generator reaches the PostgreSQL branch, unmeasured; the schema-diff task moves Databend onto
+  // NO_COLUMN_MODIFICATION per L8 (design 7.2) and changes this row.
+  databend: "postgres-branch-measured",
 };
 
 /**
@@ -1478,6 +1484,7 @@ const TRANSACTION_WRAPPER_COVERAGE: Record<DatabaseType, "BEGIN;" | "BEGIN TRANS
   influxdb: false, // an InfluxQL statement, not SQL text at all (`NON_SQL_DIALECTS`), and no table DDL to wrap (`NO_TABLE_DDL`)
   influxdb3: false, // SQL, but the 3.x planner takes no DDL, so there is no table DDL to wrap (`NO_TABLE_DDL`)
   oxia: false, // an `oxia client` read command, not SQL text (`NON_SQL_DIALECTS`), and no table DDL to wrap (`NO_TABLE_DDL`)
+  databend: "BEGIN;", // today's generator output; the schema-diff task moves Databend onto NO_TRANSACTION_WRAPPER (design 7.2)
 };
 
 // Both creation and modification paths must use the same wrapper policy.

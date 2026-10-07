@@ -26,6 +26,7 @@ import {
   MilvusIcon,
   InfluxDBIcon,
   OxiaIcon,
+  DatabendIcon,
 } from "@/components/icons/db-icons";
 import type { DatabaseType } from "@/lib/types";
 import type { HostUriScheme } from "@/lib/connection-host-uri";
@@ -69,6 +70,8 @@ export interface DatabaseUIConfig {
     | "allowInsecureAuth"
     // Oxia only (O6): a cluster's data-server addresses, one text box.
     | "dataServers"
+    // Databend only (design 6.1): the warehouse every statement runs on, one text box.
+    | "warehouse"
   )[];
   /**
    * The connection dialog's label for a field, where this engine names the field differently from
@@ -126,6 +129,20 @@ export interface DatabaseUIConfig {
 
 /** One addressing field, named by the same list that decides whether a save writes it. */
 export type ConnectionField = DatabaseUIConfig["connectionFields"][number];
+
+/**
+ * The sentences the connection dialog draws under Databend's fields (design 6.1), exported so the docs and the form's
+ * own refusals can be held to the same words.
+ */
+export const DATABEND_FIELD_HINTS: Readonly<Partial<Record<ConnectionField, string>>> = Object.freeze({
+  host: "A host name or address, or a pasted https:// address, which is split into Host and Port. Databend Cloud: the host from Connect in the Cloud console, on port 443 with SSL mode verify-system. Self-hosted: the query node, port 8000 unless http_handler_port was changed.",
+  user: "A SQL user. On Databend Cloud: cloudapp, or a user created with CREATE USER; the email you sign in to the Cloud console with is not a SQL user.",
+  database: "The current database for names a statement does not qualify. Empty means default.",
+  warehouse:
+    "Databend Cloud: the warehouse= value of the DSN from Connect. A suspended warehouse resumes on the first statement, opening the connection included, because it reads the object tree, and is billed while it runs; with Warehouse set, Studio sends no background health checks. Self-hosted: leave empty unless your cluster routes requests by warehouse.",
+  allowInsecureAuth:
+    "Ticked, the password crosses the network in cleartext to this host. Databend Cloud never needs this: it serves HTTPS on port 443.",
+});
 
 export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
   postgres: {
@@ -617,6 +634,26 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     },
     readOnlyHint:
       "Oxia connections are read-only in this version, whether or not this is ticked: Studio sends Oxia no write.",
+  },
+  databend: {
+    // A mark drawn for Studio, never Databend's logo.
+    icon: DatabendIcon,
+    // `hue-red` is Oracle's; its `-alt` step joins IDENTITY_ALTS with this entry, the first of the hues with no
+    // identity `-alt` to clear tests/unit/theme-accent-contrast.test.ts.
+    color: "text-hue-red-alt",
+    label: "Databend",
+    // Self-hosted's HTTP handler port. Port 443 comes from TLS, a DSN or an https:// paste, never a host heuristic.
+    defaultPort: "8000",
+    // The connection-string box reads http:// and https:// as ClickHouse, so a pasted address belongs in the Host box,
+    // which splits it (hostAcceptsUri below); a databend:// DSN is the paste handler's.
+    showConnectionStringToggle: false,
+    // The SSL panel and the SSH tunnel stay offered. The last field is the consent to send the password without TLS,
+    // drawn while SSL Mode is disable.
+    connectionFields: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],
+    fieldLabels: { warehouse: "Warehouse" },
+    fieldPlaceholders: { user: "root", database: "default" },
+    fieldHints: DATABEND_FIELD_HINTS,
+    hostAcceptsUri: ["http", "https"],
   },
   libredb: {
     icon: LibreDBIcon,

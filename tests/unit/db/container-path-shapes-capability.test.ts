@@ -45,6 +45,8 @@ const EXPECTED_CONTAINER_PATH_SHAPES: Readonly<
   milvus: "exact",
   // Its one level is the database (InfluxDB spec I11), checked in influxql-provider.ts.
   influxdb: "exact",
+  // Two levels, the catalog and the database, each path exactly as deep (design 2.4).
+  databend: "exact",
   libredb: "exact",
   duckdb: "prefixes",
   mssql: "prefixes",

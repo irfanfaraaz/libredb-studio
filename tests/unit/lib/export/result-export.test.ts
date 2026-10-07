@@ -158,6 +158,8 @@ describe("buildResultExport — sql-insert", () => {
     ["sqlite", "VALUES (NULL, 9e999, -9e999);"],
     ["oracle", "VALUES (BINARY_DOUBLE_NAN, BINARY_DOUBLE_INFINITY, -BINARY_DOUBLE_INFINITY);"],
     ["duckdb", "VALUES ('NaN', 'Infinity', '-Infinity');"],
+    // Databend: the spellings M08b inserted on the pinned image, read back as NaN, inf and -inf.
+    ["databend", "VALUES ('NaN'::FLOAT, 'inf'::DOUBLE, '-inf'::FLOAT);"],
     ["mysql", "VALUES (NULL, NULL, NULL);"],
     ["mssql", "VALUES (NULL, NULL, NULL);"],
     [undefined, "VALUES (NULL, NULL, NULL);"],
@@ -610,6 +612,14 @@ describe("buildResultExport — a binary value in a statement", () => {
     const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "db2" }));
 
     expect(file.content).toContain("VALUES (BX'0102deadbeef');");
+  });
+
+  // Databend reads a quoted string into BINARY through `binary_input_format`, utf-8 by default, so `X'…'` is not the
+  // spelling it was measured with: M08b inserted `unhex('00ff10')` and read back the three bytes.
+  test("writes Databend's unhex", () => {
+    const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "databend" }));
+
+    expect(file.content).toContain("VALUES (unhex('0102deadbeef'));");
   });
 
   test("writes ClickHouse's unhex", () => {
@@ -1773,5 +1783,69 @@ describe("buildResultExport — markdown and html", () => {
   test("returns text content, never a binary blob", () => {
     expect(typeof buildResultExport("markdown", source()).content).toBe("string");
     expect(typeof buildResultExport("html", source()).content).toBe("string");
+  });
+});
+
+// The four rulings design 7.2 asks of Databend (X01), each from the spellings M08a created and M08c read back on the
+// pinned image. The quote character is the identifier module's, so it is stripped before comparing.
+describe("buildResultExport: Databend's type rulings (X01)", () => {
+  const ddl = (columnTypes: Record<string, string> | undefined, rows: Record<string, unknown>[] = [{ c: null }]) =>
+    buildResultExport(
+      "sql-ddl",
+      source({ rows, fields: Object.keys(rows[0]), dialect: "databend", columnTypes }),
+    ).content.replace(/[`"]/g, "");
+
+  test("DIALECT_TYPES: an inferred column is spelled VARCHAR, DOUBLE and BINARY, the names M08a created", () => {
+    const content = ddl(undefined, [
+      { t: "x", n: 1.5, b: new Uint8Array([1]), i: 7, f: true, d: new Date("2026-10-07T00:00:00Z") },
+    ]);
+    expect(content).toContain("t VARCHAR");
+    expect(content).toContain("n DOUBLE,");
+    expect(content).toContain("b BINARY");
+    expect(content).toContain("i BIGINT");
+    expect(content).toContain("f BOOLEAN");
+    expect(content).toContain("d TIMESTAMP");
+  });
+
+  test("STANDS_ALONE: VARCHAR, TIMESTAMP and BINARY are kept, and a name Databend was not measured with is re-spelled", () => {
+    expect(ddl({ c: "varchar" })).toContain("c varchar");
+    expect(ddl({ c: "Timestamp" })).toContain("c Timestamp");
+    expect(ddl({ c: "Binary" })).toContain("c Binary");
+    expect(ddl({ c: "text" })).toContain("c VARCHAR");
+    expect(ddl({ c: "bytea" })).toContain("c BINARY");
+    expect(ddl({ c: "decimal" })).toContain("c DOUBLE");
+  });
+
+  test("DIALECT_BARE_SPELLING: no row, so a bare datetime is TIMESTAMP and never MySQL's datetime(6)", () => {
+    // Databend's Timestamp keeps microseconds without a precision, so no bare name it reports narrows the value.
+    expect(ddl({ c: "datetime" })).toContain("c TIMESTAMP");
+    expect(ddl({ c: "String" })).toContain("c String");
+  });
+
+  test("DECLARED_TYPE_REWRITE: no row, so a declared composite is written as Databend spelled it", () => {
+    expect(ddl({ c: "Nullable(Array(Int32 NULL))" })).toContain("c Nullable(Array(Int32 NULL))");
+    expect(ddl({ c: "Map(String, Int32)" })).toContain("c Map(String, Int32)");
+  });
+
+  test("a declared Binary cell replays as bytes, and a Binary cell that is not hex skips its row with the #1386 comment", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ b: "616263" }, { b: "<bitmap binary>" }],
+        fields: ["b"],
+        dialect: "databend",
+        columnTypes: { b: "Nullable(Binary)" },
+      }),
+    );
+    expect(file.content).toContain("VALUES (unhex('616263'));");
+    expect(file.content).toContain('-- Row 2 skipped: column "b" holds a Binary that is not hex');
+  });
+
+  test("a declared Bitmap row is skipped with the #1386 comment", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ b: "<bitmap binary>" }], fields: ["b"], dialect: "databend", columnTypes: { b: "Bitmap" } }),
+    );
+    expect(file.content).toContain('-- Row 1 skipped: column "b" holds a value of type Bitmap');
   });
 });
