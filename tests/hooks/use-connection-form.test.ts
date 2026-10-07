@@ -23,6 +23,7 @@ const DEFAULT_PORTS: Record<string, string> = {
   influxdb: "8086",
   influxdb3: "8181",
   oxia: "6648",
+  databend: "8000",
 };
 
 // The engines whose addressing fields diverge from the networked default. Spelled out
@@ -60,6 +61,8 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
   // No User: Oxia has no user name; the token is the password, the namespace the database, and a cluster's data
   // servers and the consent to a cleartext token are fields of Oxia's own (SB3-1.5).
   oxia: ["host", "port", "password", "database", "dataServers", "allowInsecureAuth"],
+  // The warehouse and the consent to a cleartext password are fields of Databend's own (design 6.1).
+  databend: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],
 };
 const mockFields = (type: string): string[] =>
   MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
@@ -86,6 +89,11 @@ mock.module("@/lib/db-ui-config", () => ({
 import { CONNECTION_FORM_DEFAULTS, offersReadOnlyToggle, useConnectionForm } from "@/hooks/use-connection-form";
 import { resolveAgentRunConnectionId } from "@/hooks/use-connection-payload";
 import type { DatabaseConnection, DatabaseType } from "@/lib/types";
+import {
+  DATABEND_DSN_REFUSALS,
+  DATABEND_SSLMODE_NOTICES,
+  databendNotAppliedNotice,
+} from "@/lib/connection-string-parser";
 import { READ_ONLY_ENFORCED, SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
 
 // =============================================================================
@@ -1888,9 +1896,7 @@ describe("useConnectionForm", () => {
     influxdb: true,
     influxdb3: true,
     oxia: true,
-    // Today's truth: the picker does not offer Databend until the connection-form task adds it with its Warehouse
-    // field (design 6.1), which sets this to true.
-    databend: false,
+    databend: true,
   };
 
   test("dbTypes offers every database type a connection can carry", () => {
@@ -3576,5 +3582,168 @@ describe("the dataServers field", () => {
     rerender({ ...props, isOpen: true, editConnection: null });
     expect(result.current.dataServers).toBe("");
     expect(CONNECTION_FORM_DEFAULTS.dataServers).toBe("");
+  });
+});
+
+describe("the warehouse field (Databend design 6.1)", () => {
+  const props = {
+    isOpen: true,
+    onClose: mock(() => {}),
+    onConnect: mock<(connection: DatabaseConnection) => void>(() => {}),
+    onTestConnection: async () => ({ success: true }),
+    editConnection: null as DatabaseConnection | null,
+  };
+  beforeEach(() => {
+    props.onConnect.mockClear();
+  });
+
+  const saved = async (result: { current: ReturnType<typeof useConnectionForm> }) => {
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    expect(props.onConnect).toHaveBeenCalledTimes(1);
+    return props.onConnect.mock.calls[0][0];
+  };
+
+  test("buildConnection carries the warehouse for a type that takes the field", async () => {
+    const { result } = renderHook(() => useConnectionForm(props));
+    act(() => result.current.setType("databend"));
+    act(() => result.current.setUser("cloudapp"));
+    act(() => result.current.setWarehouse("small-xy2t"));
+    expect((await saved(result)).warehouse).toBe("small-xy2t");
+  });
+
+  test("an empty box writes no key, and a type that does not take the field drops it", async () => {
+    const empty = renderHook(() => useConnectionForm(props));
+    act(() => empty.result.current.setType("databend"));
+    expect(await saved(empty.result)).not.toHaveProperty("warehouse");
+
+    props.onConnect.mockClear();
+    const switched = renderHook(() => useConnectionForm(props));
+    act(() => switched.result.current.setType("databend"));
+    act(() => switched.result.current.setWarehouse("small-xy2t"));
+    act(() => switched.result.current.setType("postgres"));
+    expect(await saved(switched.result)).not.toHaveProperty("warehouse");
+  });
+
+  test("editing loads the stored warehouse, and a connection without one shows an empty box", () => {
+    const named: DatabaseConnection = {
+      id: "c1",
+      name: "Cloud",
+      type: "databend",
+      host: "tenant.gw.aws-us-east-2.default.databend.com",
+      port: 443,
+      warehouse: "small-xy2t",
+      createdAt: new Date(),
+    };
+    const unnamed: DatabaseConnection = { ...named, id: "c2", warehouse: undefined };
+    const { result, rerender } = renderHook((p) => useConnectionForm(p), {
+      initialProps: { ...props, editConnection: named },
+    });
+    expect(result.current.warehouse).toBe("small-xy2t");
+    rerender({ ...props, editConnection: unnamed });
+    expect(result.current.warehouse).toBe("");
+  });
+
+  test("closing the dialog resets it", () => {
+    const { result, rerender } = renderHook((p) => useConnectionForm(p), {
+      initialProps: { ...props, isOpen: true },
+    });
+    act(() => result.current.setWarehouse("small-xy2t"));
+    rerender({ ...props, isOpen: false });
+    rerender({ ...props, isOpen: true, editConnection: null });
+    expect(result.current.warehouse).toBe("");
+    expect(CONNECTION_FORM_DEFAULTS.warehouse).toBe("");
+  });
+});
+
+describe("a databend:// paste (Databend design 6.2)", () => {
+  const paste = (text: string, setup?: (form: ReturnType<typeof useConnectionForm>) => void) => {
+    const { result } = renderHook(() => useConnectionForm(defaultPasteProps));
+    if (setup) act(() => setup(result.current));
+    act(() => result.current.setPasteInput(text));
+    act(() => result.current.handlePasteConnectionString());
+    return result;
+  };
+  const defaultPasteProps = {
+    isOpen: true,
+    onClose: mock(() => {}),
+    onConnect: mock(() => {}),
+    editConnection: null as DatabaseConnection | null,
+  };
+
+  test("a Cloud DSN switches the type and fills Host, Port 443, verify-system and Warehouse", () => {
+    const result = paste(
+      "databend://cloudapp:p%40ss@tn3ftqihs.gw.aws-us-east-2.default.databend.com/default?warehouse=small-xy2t",
+    );
+    expect(result.current.type).toBe("databend");
+    expect(result.current.host).toBe("tn3ftqihs.gw.aws-us-east-2.default.databend.com");
+    // No port in the DSN: 443 from TLS, never the type's default 8000.
+    expect(result.current.port).toBe("443");
+    expect(result.current.sslMode).toBe("verify-system");
+    expect(result.current.user).toBe("cloudapp");
+    expect(result.current.password).toBe("p@ss");
+    expect(result.current.database).toBe("default");
+    expect(result.current.warehouse).toBe("small-xy2t");
+    expect(result.current.testResult).toEqual({
+      tone: "success",
+      message: "Connection string parsed successfully. Review the fields and connect.",
+    });
+  });
+
+  test("sslmode=require sets verify-system and shows its notice (X34)", () => {
+    const result = paste("databend://root:pw@db.example.com:8000/default?sslmode=require");
+    expect(result.current.sslMode).toBe("verify-system");
+    expect(result.current.testResult!.tone).toBe("success");
+    expect(result.current.testResult!.message).toContain(DATABEND_SSLMODE_NOTICES.require);
+  });
+
+  test("parameters not applied are named in a warning, with the notice after them", () => {
+    const result = paste("databend://root:pw@db.example.com/default?role=analyst&sslmode=enable");
+    expect(result.current.type).toBe("databend");
+    expect(result.current.testResult).toEqual({
+      tone: "warning",
+      message: `${databendNotAppliedNotice(["role"])} ${DATABEND_SSLMODE_NOTICES.enable}`,
+    });
+    const plain = paste("databend://root:pw@db.example.com/default?role=analyst");
+    expect(plain.current.testResult).toEqual({ tone: "warning", message: databendNotAppliedNotice(["role"]) });
+  });
+
+  test("a TLS warning keeps the not-applied names and the sslmode notice after it", () => {
+    const file = paste("databend://u:p@host/db?tls_ca_file=/ca.pem&role=r&sslmode=require");
+    expect(file.current.sslMode).toBe("verify-system");
+    expect(file.current.testResult!.tone).toBe("warning");
+    expect(file.current.testResult!.message).toStartWith('"tls_ca_file=/ca.pem" is a file path');
+    expect(file.current.testResult!.message).toEndWith(
+      ` ${databendNotAppliedNotice(["role"])} ${DATABEND_SSLMODE_NOTICES.require}`,
+    );
+    const unmapped = paste("databend://u:p@host/db?sslmode=bogus&role=r&tenant=t");
+    expect(unmapped.current.testResult!.tone).toBe("warning");
+    expect(unmapped.current.testResult!.message).toStartWith('TLS setting not applied: "sslmode=bogus"');
+    expect(unmapped.current.testResult!.message).toEndWith(` ${databendNotAppliedNotice(["role", "tenant"])}`);
+  });
+
+  test.each([
+    ["databend+flight://root:@localhost:8900/db", DATABEND_DSN_REFUSALS.flight],
+    ["databend://root:pa#ss@host/db", DATABEND_DSN_REFUSALS.fragment],
+    ["databend://root:pw@host/db?access_token=abc", DATABEND_DSN_REFUSALS.signIn],
+  ])("a refused paste (%s) shows its sentence and changes nothing, the type included", (text, sentence) => {
+    const result = paste(text, (form) => {
+      form.setWarehouse("kept");
+      form.setShowPasteInput(true);
+    });
+    expect(result.current.testResult).toEqual({ tone: "error", message: sentence });
+    expect(result.current.type).toBe("postgres");
+    expect(result.current.host).toBe("localhost");
+    expect(result.current.port).toBe("5432");
+    expect(result.current.warehouse).toBe("kept");
+    // The paste stays open with its text, so the person can correct it.
+    expect(result.current.showPasteInput).toBe(true);
+    expect(result.current.pasteInput).toBe(text);
+  });
+
+  test("the unparsed-paste sentence names databend://", () => {
+    const result = paste("ftp://nowhere");
+    expect(result.current.testResult!.message).toContain("databend://");
   });
 });

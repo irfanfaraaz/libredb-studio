@@ -77,6 +77,25 @@ export interface ParsedConnection {
    * with `np:myserver`, which would only fail later as a misleading `ENOTFOUND`.
    */
   unsupportedServerProtocol?: string;
+  /**
+   * Databend's `warehouse=` (design 6.2): the warehouse every statement runs on, for the form's Warehouse box.
+   */
+  warehouse?: string;
+  /**
+   * The names of the query parameters the paste did not apply, each once, in the order pasted. Names only: a
+   * parameter's value can be a secret, so it never leaves the parser.
+   */
+  ignoredParameters?: string[];
+  /**
+   * Why the paste was refused as a whole, in the sentence the form shows. When set, nothing but `type` is, and the
+   * form applies nothing, its type included.
+   */
+  refusal?: string;
+  /**
+   * A sentence the form shows beside a successful paste, for a parameter that was applied with a meaning the field
+   * alone does not show.
+   */
+  notice?: string;
 }
 
 /**
@@ -120,18 +139,56 @@ export const ENGINE_URI_SCHEMES: Partial<Record<DatabaseType, string>> = {
   couchbase: "couchbase",
   clickhouse: "clickhouse",
   libsql: "libsql",
+  databend: "databend",
 };
+
+/**
+ * The sentences a refused Databend paste shows (design 6.2), one per refusal. Each refusal fills no field, so the
+ * sentence says what to paste instead.
+ */
+export const DATABEND_DSN_REFUSALS = Object.freeze({
+  fragment: "The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field.",
+  signIn:
+    "Token and key-pair sign-in are not supported in this version: paste a DSN that signs in with a SQL user and password, or fill the fields.",
+  flight: "Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443.",
+  jdbc: "This is a JDBC URL, which reads TLS and ports differently (TLS off and port 8000 by default). Paste the databend:// DSN from Connect, or fill the fields.",
+  shellExport: "Paste the DSN itself: the databend:// text inside the quotes.",
+});
+
+/**
+ * What a Databend DSN's `sslmode=require` and `sslmode=enable` mean (X34): BendSQL connects over https with the
+ * certificate verified, which is this form's verify-system and not its unverified require.
+ */
+export const DATABEND_SSLMODE_NOTICES = Object.freeze({
+  require: "sslmode=require in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
+  enable: "sslmode=enable in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
+});
+
+/** The warning a Databend paste shows for the parameters it did not apply, named and never valued. */
+export function databendNotAppliedNotice(names: readonly string[]): string {
+  return `Not applied: ${names.join(", ")}. Studio's Databend connection takes host, port, user, password, database, warehouse and TLS; the other fields were filled in.`;
+}
 
 /**
  * Parse a database connection string into its components, or null when no form below reads it.
  * Schemes, matched case-sensitively on the trimmed input: postgres://, postgresql://, mysql://,
  * mongodb://, mongodb+srv://, rediss://, redis://, oracle://, mssql://, sqlserver://, db2://,
  * couchbases://, couchbase://, libsql://, clickhouse://, and http:// and https:// (both ClickHouse),
- * plus the ADO.NET form `Server=...;` (SQL Server), whose `Server=` key is matched case-insensitively.
+ * databend://, databend+http:// and databend+https://, plus the ADO.NET form `Server=...;` (SQL Server), whose
+ * `Server=` key is matched case-insensitively. Databend's other spellings (`databend+flight://`, `databend+grpc://`,
+ * `jdbc:databend://` and a `BENDSQL_DSN=` shell line) parse to a refusal.
  */
 export function parseConnectionString(input: string): ParsedConnection | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
+
+  // Databend (design 6.2). The refusals first: each names a Databend spelling Studio does not connect with.
+  if (/^(export\s+)?BENDSQL_DSN=/.test(trimmed)) return databendRefusal("shellExport");
+  if (trimmed.startsWith("jdbc:databend://")) return databendRefusal("jdbc");
+  if (trimmed.startsWith("databend+flight://") || trimmed.startsWith("databend+grpc://")) {
+    return databendRefusal("flight");
+  }
+  if (/^databend(\+https?)?:\/\//.test(trimmed)) return parseDatabendDSN(trimmed);
 
   // MongoDB connection strings
   if (trimmed.startsWith("mongodb://") || trimmed.startsWith("mongodb+srv://")) {
@@ -674,6 +731,78 @@ function parseGenericURL(uri: string, type: DatabaseType, defaultPort: string): 
   }
 }
 
+function databendRefusal(key: keyof typeof DATABEND_DSN_REFUSALS): ParsedConnection {
+  return { type: "databend", refusal: DATABEND_DSN_REFUSALS[key] };
+}
+
+/** The DSN parameters a paste applies; every other name is reported as not applied. */
+const DATABEND_APPLIED_PARAMETERS = new Set(["warehouse", "sslmode", "tls_ca_file"]);
+
+/** The `sslmode` values BendSQL reads; any other refuses the DSN there. */
+const DATABEND_SSLMODES = new Set(["disable", "require", "enable"]);
+
+/** BendSQL's sign-in parameters other than a password, which this version does not support. */
+const DATABEND_SIGN_IN_PARAMETERS = new Set([
+  "access_token",
+  "access_token_file",
+  "private_key_file",
+  "private_key_passphrase_file",
+]);
+
+/**
+ * A Databend DSN, read the way BendSQL reads it (`core/src/client.rs`, `from_dsn`): TLS unless `sslmode=disable`,
+ * where `require` and `enable` verify the certificate; the DSN's port, else 443 with TLS and 80 without; the path is
+ * the database and `warehouse=` the warehouse. `databend+http://` and `databend+https://` set the transport as
+ * databend-go reads them, and an explicit `sslmode` wins over either. A repeated parameter takes its last value, as
+ * BendSQL's does (databend-go takes the first).
+ *
+ * Two departures, both refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut
+ * short, and BendSQL's token and key-pair sign-in have no field here. Unlike BendSQL, which decodes the password
+ * only, the user is percent-decoded too, as every other scheme here does.
+ */
+function parseDatabendDSN(uri: string): ParsedConnection | null {
+  if (uri.includes("#")) return databendRefusal("fragment");
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return null;
+  }
+
+  const names = [...new Set(url.searchParams.keys())];
+  if (names.some((name) => DATABEND_SIGN_IN_PARAMETERS.has(name))) return databendRefusal("signIn");
+
+  // A repeated parameter takes its last value, as BendSQL's loop over the pairs overwrites, and an sslmode it
+  // cannot read refuses the DSN wherever it stands.
+  const sslmodes = url.searchParams.getAll("sslmode");
+  const sslmode = sslmodes.find((mode) => !DATABEND_SSLMODES.has(mode)) ?? sslmodes.at(-1) ?? null;
+  let tls: TLSIntent = { sslMode: uri.startsWith("databend+http://") ? "disable" : "verify-system" };
+  let notice: string | undefined;
+  if (sslmode === "disable") tls = { sslMode: "disable" };
+  else if (sslmode === "require" || sslmode === "enable") {
+    tls = { sslMode: "verify-system" };
+    notice = DATABEND_SSLMODE_NOTICES[sslmode];
+  } else if (sslmode !== null) tls = { unmappedTLSParam: `sslmode=${sslmode}` };
+
+  const warehouse = url.searchParams.getAll("warehouse").at(-1);
+  const caFile = url.searchParams.getAll("tls_ca_file").at(-1);
+  const ignored = names.filter((name) => !DATABEND_APPLIED_PARAMETERS.has(name));
+  return {
+    type: "databend",
+    host: url.hostname || "localhost",
+    // A refused sslmode leaves the mode unset, and BendSQL refuses the DSN, so the port follows the TLS default.
+    port: url.port || (tls.sslMode === "disable" ? "80" : "443"),
+    user: url.username ? safeDecodeURIComponent(url.username) : undefined,
+    password: url.password ? safeDecodeURIComponent(url.password) : undefined,
+    database: url.pathname.slice(1) || undefined,
+    ...(warehouse ? { warehouse } : {}),
+    ...tls,
+    ...(notice ? { notice } : {}),
+    ...(caFile !== undefined ? { tlsFileParam: `tls_ca_file=${caFile}` } : {}),
+    ...(ignored.length > 0 ? { ignoredParameters: ignored } : {}),
+  };
+}
+
 /**
  * Detect the database type from a connection string.
  */
@@ -688,6 +817,7 @@ export function detectConnectionStringType(input: string): DatabaseType | null {
   if (trimmed.startsWith("db2://")) return "db2";
   if (trimmed.startsWith("couchbase://") || trimmed.startsWith("couchbases://")) return "couchbase";
   if (trimmed.startsWith("libsql://")) return "libsql";
+  if (/^databend(\+https?)?:\/\//.test(trimmed)) return "databend";
   if (trimmed.startsWith("clickhouse://") || trimmed.startsWith("http://") || trimmed.startsWith("https://"))
     return "clickhouse";
   if (/^server\s*=/i.test(trimmed)) return "mssql";

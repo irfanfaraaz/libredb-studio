@@ -1,0 +1,203 @@
+/**
+ * The sign-in latch of design 3.5: once Databend refuses a sign-in, Studio sends that password to that server again
+ * only after 15 minutes, or after the credential changes.
+ *
+ * Databend counts failed sign-ins only for a user under a password policy, and five in 15 minutes lock that user for
+ * 15 minutes, during which the right password is refused too (measured, L10). Studio retries on its own (the pulse,
+ * the fleet check, a tree read and a probe sent at once on activation), and a failed `connect()` is never cached, so
+ * the latch lives in the process, not in a provider: two instances on one key share it, a disconnect does not clear
+ * it, and a restart does.
+ *
+ * The key is SHA-256 over the length-framed scheme, far end, bastion route, user and password [X03]. The far end is
+ * the tunnel's when an SSH tunnel carries the connection, never the local forward, which is a new port for every
+ * tunnel and every Test Connection; the warehouse is not framed, because the user is locked whatever compute is
+ * named. No secret is kept: the map holds digests.
+ *
+ * Single flight [X14]: until a key has had a 200 answer, one attempt holds it. Another acquire waits inside its own
+ * signal and is refused unsent if the first latches; a proven key never waits. An attempt that ends with neither a
+ * 200 nor a latching refusal hands the key to the next waiter.
+ *
+ * At most 256 entries, each lasting 15 minutes: a new key first drops every expired entry, then the oldest [X30].
+ */
+import { createHash } from "node:crypto";
+import { latchedError } from "./errors";
+import type { DatabendError } from "./transport";
+
+/** How long a refusal holds its key, Databend's own lockout window (`password_policy.rs:45-46`). */
+export const AUTH_LATCH_TTL_MS = 15 * 60 * 1000;
+/** The most keys the latch holds. */
+export const AUTH_LATCH_MAX_ENTRIES = 256;
+/** The codes of a 401 that refuse the credential: wrong password, the two token codes, and an unknown user. */
+export const LATCHING_401_CODES = Object.freeze([5100, 5101, 5103, 2201] as const);
+/** The lockout code, which latches over HTTP 500 and never in a body, where it is also a complexity error. */
+export const LOCKOUT_CODE = 2215;
+/** The Databend Cloud gateway's kinds for a refused credential. */
+export const LATCHING_GATEWAY_KINDS = Object.freeze([
+  "PasswordAuthFailed",
+  "JWTVerificationFailed",
+  "ForbiddenAccessUser",
+] as const);
+
+/** What the key frames, each field as the connection options validated it. */
+export interface AuthLatchIdentity {
+  readonly scheme: "http" | "https";
+  /** The far end: the tunnel's when one carries the connection, else the connection's own host. */
+  readonly host: string;
+  readonly port: number;
+  /** `tunnelRoute` of the connection's SSH tunnel, empty without one. */
+  readonly route: string;
+  readonly user: string;
+  /** Empty when none is set, which Studio still sends as Basic (I10). */
+  readonly password: string;
+}
+
+/** The part of an answer that decides a sign-in: its status, Databend's code, and a gateway's kind. */
+export interface SignInAnswer {
+  readonly status: number;
+  readonly code?: number;
+  readonly gatewayKind?: string;
+}
+
+/** One attempt's hold on its key, which its first answer settles. */
+export interface AuthAttempt {
+  /** Reports an answer: a 200 proves the key, a latching refusal latches it, and anything else hands it on. */
+  settle(answer: SignInAnswer): void;
+  /** The attempt ended with no answer (a network failure, a timeout or a cancel): the key goes to the next waiter. */
+  abandon(): void;
+}
+
+export interface AuthLatch {
+  /**
+   * The hold to send under. Refused with `latchedError` of `errors.ts` while the key is latched; on an unproven key held by
+   * another attempt, waits until that one settles, and is refused with the signal's reason if the signal fires first.
+   */
+  acquire(key: string, signal: AbortSignal): Promise<AuthAttempt>;
+}
+
+/** The key of one identity: SHA-256 hex over the length-framed fields, so no field slides into the next. */
+export function authLatchKey(identity: AuthLatchIdentity): string {
+  const { scheme, host, port, route, user, password } = identity;
+  const framed = [scheme, host, String(port), route, user, password].map((value) => `${value.length}:${value}`);
+  return createHash("sha256").update(framed.join(""), "utf8").digest("hex");
+}
+
+/**
+ * Whether an answer refuses the credential itself (design 3.13), which latches its key: any one of the three signals,
+ * the same OR as `refusalError` of `errors.ts`, so a code still latches beside an unrelated gateway kind.
+ */
+export function latchesSignIn(answer: SignInAnswer): boolean {
+  const { status, code, gatewayKind } = answer;
+  return (
+    (LATCHING_GATEWAY_KINDS as readonly (string | undefined)[]).includes(gatewayKind) ||
+    (status === 401 && (LATCHING_401_CODES as readonly (number | undefined)[]).includes(code)) ||
+    (status === 500 && code === LOCKOUT_CODE)
+  );
+}
+
+interface Entry {
+  readonly state: "latched" | "proven";
+  readonly at: number;
+}
+
+interface Waiter {
+  readonly resolve: (attempt: AuthAttempt) => void;
+  readonly reject: (reason: unknown) => void;
+  readonly detach: () => void;
+}
+
+export function createAuthLatch(deps: { readonly now: () => number }): AuthLatch {
+  const entries = new Map<string, Entry>();
+  /** The unproven keys an attempt holds, each with the acquires waiting behind it. */
+  const flights = new Map<string, Waiter[]>();
+
+  function liveEntry(key: string): Entry | undefined {
+    const entry = entries.get(key);
+    if (entry === undefined || !expired(entry)) return entry;
+    entries.delete(key);
+    return undefined;
+  }
+
+  function expired(entry: Entry): boolean {
+    return deps.now() - entry.at >= AUTH_LATCH_TTL_MS;
+  }
+
+  function write(key: string, state: Entry["state"]): void {
+    entries.delete(key);
+    if (entries.size >= AUTH_LATCH_MAX_ENTRIES) {
+      for (const [other, entry] of entries) if (expired(entry)) entries.delete(other);
+    }
+    if (entries.size >= AUTH_LATCH_MAX_ENTRIES) entries.delete(entries.keys().next().value as string);
+    entries.set(key, { state, at: deps.now() });
+  }
+
+  function refusal(entry: Entry): DatabendError {
+    return latchedError(new Date(entry.at), new Date(entry.at + AUTH_LATCH_TTL_MS));
+  }
+
+  /** Ends a flight: every waiter is refused on a latch and proceeds on a proof; otherwise the next one takes it. */
+  function handOn(key: string): void {
+    const waiters = flights.get(key) as Waiter[];
+    const entry = liveEntry(key);
+    if (entry === undefined) {
+      const next = waiters.shift();
+      if (next === undefined) {
+        flights.delete(key);
+        return;
+      }
+      next.detach();
+      next.resolve(attempt(key, true));
+      return;
+    }
+    flights.delete(key);
+    for (const waiter of waiters) {
+      waiter.detach();
+      if (entry.state === "latched") waiter.reject(refusal(entry));
+      else waiter.resolve(attempt(key, false));
+    }
+  }
+
+  function attempt(key: string, holdsFlight: boolean): AuthAttempt {
+    let holding = holdsFlight;
+    const release = () => {
+      if (!holding) return;
+      holding = false;
+      handOn(key);
+    };
+    return {
+      settle(answer) {
+        // A late 200 from an attempt acquired before a newer refusal never lifts that latch.
+        if (answer.status === 200) {
+          if (liveEntry(key)?.state !== "latched") write(key, "proven");
+        } else if (latchesSignIn(answer)) write(key, "latched");
+        release();
+      },
+      abandon: release,
+    };
+  }
+
+  return {
+    async acquire(key, signal) {
+      const entry = liveEntry(key);
+      if (entry?.state === "latched") throw refusal(entry);
+      if (entry?.state === "proven") return attempt(key, false);
+      const waiters = flights.get(key);
+      if (waiters === undefined) {
+        flights.set(key, []);
+        return attempt(key, true);
+      }
+      signal.throwIfAborted();
+      return new Promise<AuthAttempt>((resolve, reject) => {
+        const onAbort = () => {
+          waiters.splice(waiters.indexOf(waiter), 1);
+          reject(signal.reason);
+        };
+        const waiter: Waiter = { resolve, reject, detach: () => signal.removeEventListener("abort", onAbort) };
+        signal.addEventListener("abort", onAbort, { once: true });
+        waiters.push(waiter);
+      });
+    },
+  };
+}
+
+/** The process's one latch, shared by every Databend provider. */
+export const databendAuthLatch: AuthLatch = createAuthLatch({ now: Date.now });

@@ -1,5 +1,13 @@
 import { describe, test, expect } from "bun:test";
-import { parseConnectionString, detectConnectionStringType, ENGINE_URI_SCHEMES } from "@/lib/connection-string-parser";
+import {
+  parseConnectionString,
+  detectConnectionStringType,
+  ENGINE_URI_SCHEMES,
+  DATABEND_DSN_REFUSALS,
+  DATABEND_SSLMODE_NOTICES,
+  databendNotAppliedNotice,
+} from "@/lib/connection-string-parser";
+import { getDBConfig } from "@/lib/db-ui-config";
 import type { SSLMode } from "@/lib/types";
 
 // ─── parseConnectionString ──────────────────────────────────────────────────
@@ -1251,5 +1259,183 @@ describe("parseConnectionString: TLS parameters", () => {
       expect(result!.sslMode).toBeUndefined();
       expect(result!.unmappedTLSParam).toBe("tls=maybe");
     });
+  });
+});
+
+// ─── databend:// DSNs (Databend design 6.2) ─────────────────────────────────
+
+describe("parseConnectionString: databend:// DSNs", () => {
+  test("a Databend Cloud DSN fills every field, with TLS verified and the warehouse", () => {
+    const result = parseConnectionString(
+      "databend://cloudapp:p%40ss@tn3ftqihs.gw.aws-us-east-2.default.databend.com:443/default?warehouse=small-xy2t",
+    );
+    expect(result).toEqual({
+      type: "databend",
+      host: "tn3ftqihs.gw.aws-us-east-2.default.databend.com",
+      port: "443",
+      user: "cloudapp",
+      password: "p@ss",
+      database: "default",
+      warehouse: "small-xy2t",
+      sslMode: "verify-system",
+    });
+  });
+
+  test("TLS is on unless sslmode=disable, as BendSQL reads the DSN", () => {
+    expect(parseConnectionString("databend://root:@localhost:8000/default")!.sslMode).toBe("verify-system");
+    const plain = parseConnectionString("databend://root:@localhost:8000/?sslmode=disable")!;
+    expect(plain.sslMode).toBe("disable");
+    expect(plain.port).toBe("8000");
+    expect(plain.user).toBe("root");
+    expect(plain.password).toBeUndefined();
+    expect(plain.database).toBeUndefined();
+  });
+
+  test("databend+http:// is plaintext and databend+https:// is TLS", () => {
+    const http = parseConnectionString("databend+http://root:@localhost:8000/default")!;
+    expect(http.type).toBe("databend");
+    expect(http.sslMode).toBe("disable");
+    expect(http.port).toBe("8000");
+    expect(parseConnectionString("databend+https://root:@db.example.com/default")!.sslMode).toBe("verify-system");
+  });
+
+  test("a DSN without a port gets 443 with TLS and 80 without, never the form's 8000", () => {
+    expect(getDBConfig("databend").defaultPort).toBe("8000");
+    expect(parseConnectionString("databend://u:p@host/db")!.port).toBe("443");
+    expect(parseConnectionString("databend+https://u:p@host/db")!.port).toBe("443");
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=disable")!.port).toBe("80");
+    expect(parseConnectionString("databend+http://u:p@host/db")!.port).toBe("80");
+  });
+
+  test("an empty host reads as localhost", () => {
+    expect(parseConnectionString("databend:///db?sslmode=disable")!.host).toBe("localhost");
+  });
+
+  test("user and password are percent-decoded, and a broken escape is kept as written", () => {
+    const result = parseConnectionString("databend://us%40er:p%3Aw%2Fd@host/db")!;
+    expect(result.user).toBe("us@er");
+    expect(result.password).toBe("p:w/d");
+    expect(parseConnectionString("databend://u:100%25%zz@host/db")!.password).toBe("100%25%zz");
+  });
+
+  test("a # anywhere is refused, because it ends the URL", () => {
+    const result = parseConnectionString("databend://root:pa#ss@host:443/db");
+    expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.fragment });
+    expect(DATABEND_DSN_REFUSALS.fragment).toBe(
+      "The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field.",
+    );
+  });
+
+  test("sslmode=require and sslmode=enable verify the certificate, with a notice saying so (X34)", () => {
+    const required = parseConnectionString("databend://u:p@host/db?sslmode=require")!;
+    expect(required.sslMode).toBe("verify-system");
+    expect(required.notice).toBe(DATABEND_SSLMODE_NOTICES.require);
+    expect(DATABEND_SSLMODE_NOTICES.require).toBe(
+      "sslmode=require in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
+    );
+    const enabled = parseConnectionString("databend://u:p@host/db?sslmode=enable")!;
+    expect(enabled.sslMode).toBe("verify-system");
+    expect(enabled.notice).toBe(DATABEND_SSLMODE_NOTICES.enable);
+    expect(parseConnectionString("databend://u:p@host/db")!.notice).toBeUndefined();
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=disable")!.notice).toBeUndefined();
+  });
+
+  test("an sslmode BendSQL refuses sets no mode and is reported, with the port still the TLS one", () => {
+    const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
+    expect(result.sslMode).toBeUndefined();
+    expect(result.unmappedTLSParam).toBe("sslmode=verify-full");
+    expect(result.port).toBe("443");
+  });
+
+  test("other parameters are named once each, in order, and never valued", () => {
+    const result = parseConnectionString(
+      "databend://u:p@host/db?role=analyst_secret&enable_dphyp=1&warehouse=w1&tenant=t9&role=again&sslmode=disable",
+    )!;
+    expect(result.ignoredParameters).toEqual(["role", "enable_dphyp", "tenant"]);
+    expect(result.warehouse).toBe("w1");
+    const text = JSON.stringify(result);
+    for (const value of ["analyst_secret", "again", "t9"]) expect(text).not.toContain(value);
+    expect(parseConnectionString("databend://u:p@host/db?warehouse=w1")!.ignoredParameters).toBeUndefined();
+  });
+
+  test("a repeated applied parameter takes its last value, as BendSQL's query_pairs loop does", () => {
+    const tls = parseConnectionString("databend://u:p@host/db?sslmode=disable&sslmode=require")!;
+    expect(tls.sslMode).toBe("verify-system");
+    expect(tls.port).toBe("443");
+    const plain = parseConnectionString("databend://u:p@host/db?sslmode=require&sslmode=disable")!;
+    expect(plain.sslMode).toBe("disable");
+    expect(plain.port).toBe("80");
+    expect(parseConnectionString("databend://u:p@host/db?warehouse=a&warehouse=b")!.warehouse).toBe("b");
+    // BendSQL refuses the DSN at an sslmode it cannot read, wherever it stands.
+    const refused = parseConnectionString("databend://u:p@host/db?sslmode=bogus&sslmode=disable")!;
+    expect(refused.sslMode).toBeUndefined();
+    expect(refused.unmappedTLSParam).toBe("sslmode=bogus");
+  });
+
+  test("an IPv6 host and a password holding a raw @ or : are read as the URL parser splits them", () => {
+    const v6 = parseConnectionString("databend://u:p@[::1]:8000/db")!;
+    expect(v6.host).toBe("[::1]");
+    expect(v6.port).toBe("8000");
+    // The last @ ends the credentials and the first : ends the user.
+    const at = parseConnectionString("databend://u:p@ss@host/db")!;
+    expect([at.user, at.password, at.host]).toEqual(["u", "p@ss", "host"]);
+    const colon = parseConnectionString("databend://u:a:b@host/db")!;
+    expect([colon.user, colon.password, colon.host]).toEqual(["u", "a:b", "host"]);
+  });
+
+  test("the not-applied notice names the parameters and what the connection takes", () => {
+    expect(databendNotAppliedNotice(["role", "enable_dphyp"])).toBe(
+      "Not applied: role, enable_dphyp. Studio's Databend connection takes host, port, user, password, database, warehouse and TLS; the other fields were filled in.",
+    );
+  });
+
+  test("an empty warehouse= fills nothing", () => {
+    expect(parseConnectionString("databend://u:p@host/db?warehouse=")!.warehouse).toBeUndefined();
+  });
+
+  test("tls_ca_file is reported as a file path, as MongoDB's tlsCAFile is", () => {
+    const result = parseConnectionString("databend://u:p@host/db?tls_ca_file=/etc/ca.pem")!;
+    expect(result.tlsFileParam).toBe("tls_ca_file=/etc/ca.pem");
+    expect(result.ignoredParameters).toBeUndefined();
+  });
+
+  test.each(["access_token", "access_token_file", "private_key_file", "private_key_passphrase_file"])(
+    "%s refuses the paste and never echoes its value",
+    (name) => {
+      const result = parseConnectionString(`databend://u:p@host/db?warehouse=w&${name}=topsecret-value`);
+      expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.signIn });
+      expect(JSON.stringify(result)).not.toContain("topsecret-value");
+    },
+  );
+
+  test.each([
+    ["databend+flight://root:@localhost:8900/db", "flight"],
+    ["databend+grpc://root:@localhost:8900/db", "flight"],
+    ["jdbc:databend://host:443/db?ssl=true", "jdbc"],
+    ['export BENDSQL_DSN="databend://root:pw@host:8000/db"', "shellExport"],
+    ["BENDSQL_DSN=databend://root:pw@host:8000/db", "shellExport"],
+  ] as const)("%s is refused with its own sentence", (input, key) => {
+    expect(parseConnectionString(input)).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS[key] });
+  });
+
+  test("each refusal sentence is its own", () => {
+    const sentences = Object.values(DATABEND_DSN_REFUSALS);
+    expect(new Set(sentences).size).toBe(sentences.length);
+    expect(DATABEND_DSN_REFUSALS.flight).toBe(
+      "Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443.",
+    );
+    expect(DATABEND_DSN_REFUSALS.shellExport).toBe("Paste the DSN itself: the databend:// text inside the quotes.");
+  });
+
+  test("a DSN the URL parser rejects parses to null", () => {
+    expect(parseConnectionString("databend://u:p@host:99999/db")).toBeNull();
+  });
+
+  test("databend is the engine's canonical scheme and detected from all three REST schemes", () => {
+    expect(ENGINE_URI_SCHEMES.databend).toBe("databend");
+    expect(detectConnectionStringType("databend://host")).toBe("databend");
+    expect(detectConnectionStringType("Databend+HTTP://host")).toBe("databend");
+    expect(detectConnectionStringType("databend+https://host")).toBe("databend");
+    expect(detectConnectionStringType("databend+flight://host:8900")).toBeNull();
   });
 });
