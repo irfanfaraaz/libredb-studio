@@ -111,7 +111,8 @@ A `next_uri` is accepted only when it is exactly the page or final path of this 
 The first answer must also be for Studio's query id and session, from a node id of the accepted shape, before any page is asked for.
 Every later page must be for the same query id and session, and a page that holds a schema or rows must hold the schema the rows before it were kept under, the same names and types in the same order; a page with neither is a long poll still running.
 A page that breaks either rule is a protocol fault that names another statement, another session or another schema (section 10); none of its rows is kept, and the statement is closed under its own query id and session.
-Every later page of the captures, on the local fixture and on Databend Cloud, passes both rules.
+The captures, on the local fixture and on Databend Cloud, were taken without a client session, so they show only the same query id and schema on every later page.
+That every later page also echoes Studio's own session was measured live under Studio's headers on the pinned v1.2.951-nightly and on v1.2.881.
 
 ### 3.4 Every statement runs in a session of its own
 
@@ -150,7 +151,7 @@ Each close is best effort under its own 5 seconds, off the statement's signal; o
 
 > The statement finished, but Studio's request to end its session (logout) got no answer within 5 seconds.
 
-One answered with anything but its acknowledgment, an error status, a refused sign-in or, on the ROLLBACK's links, an HTTP 200 that could not be read, says so instead:
+One answered with anything but its acknowledgment, an error status, a refused sign-in, an answer the transport does not read (one past the 16 MiB cap, one under a content-encoding other than identity, a redirect, or one cut short once it began) or, on the ROLLBACK's links, an HTTP 200 that could not be read, says so instead:
 
 > The statement finished, but Studio's request to close the finished statement (final) was answered with an error.
 
@@ -207,7 +208,7 @@ There is no token exchange and no server-minted session, so each request costs o
 
 | Bound | Value |
 |---|---|
-| One answer | 16 MiB (16,777,216 bytes) per HTTP answer; past it the socket is destroyed, the statement is killed and the run fails as too large |
+| One answer | 16 MiB (16,777,216 bytes) per HTTP answer; past it the socket is destroyed, the statement is killed and the run fails as too large, and a close's answer past it is a refused close (section 3.5) |
 | Rows of one answer | the page the statement asked for, `max_rows_per_page` |
 | Columns of one answer | 250,000, the cell budget, since a wider schema keeps no row; inside them, 750,000 keys and commas, three per column |
 | The rest of one answer | 65,536 arrays, objects, keys and values outside its rows and columns |
@@ -344,7 +345,7 @@ On Databend Cloud, or with Warehouse set, the refusal adds:
 Through the Databend Cloud gateway a refused sign-in is a 401 of kind `AuthorizationFailed` wrapping the query node's own 401 and code, and a lockout a 500 wrapping code 2215; both are read and latched like a direct answer, as is either kind over another status, HTTP 200 included.
 A refused sign-in on any request of a statement, its kill, final, ROLLBACK or logout included, is latched the same way.
 A 401 with no sign-in code, on a follow-up request of a running statement, reads "Databend refused a follow-up request of this statement." and is not latched.
-On the statement's own POST such a 401 refused the request before anything ran, so it reads "Databend refused the request before running it: [server text]." with the server's text cut and scrubbed as section 10 says, sends nothing more, and is not latched either.
+On the statement's own POST such a 401 refused the request before anything ran, so it reads "Databend refused the request before running it: [server text]." with the server's text cut and scrubbed as section 10 says, or "Databend refused the request before running it." when the answer carries no text, sends nothing more, and is not latched either.
 A connection that signs in as `root` with no password gets a warning in the dialog:
 
 > Credential warning: Signing in as root with no password works only when the server's root user has no password, and such a user accepts any password or none, so anyone who can reach the server signs in as its administrator. Set a password for root on the server, or connect as a user of your own.
@@ -582,7 +583,8 @@ The query timeout is sent as `max_execute_time_in_seconds` and is also Studio's 
 
 > The statement did not finish within [seconds] seconds, so Studio cancelled it.
 
-After the first answer, a kill that Databend did not acknowledge leaves the statement's outcome unknown, as it does for Stop:
+A statement Studio writes itself (the tree, describe, source, monitoring and the probe) reads so at its deadline whatever the kill answered, before or after its first answer, since checking before running it again means nothing for Studio's own statements; on a named warehouse it reads as the resuming sentence of section 4.4 instead.
+For a user statement, after the first answer, a kill that Databend did not acknowledge leaves the outcome unknown, as it does for Stop:
 
 > The statement did not finish within [seconds] seconds, and Databend did not acknowledge Studio's request to stop it, so it may still finish: check before running it again.
 
@@ -629,7 +631,7 @@ A bulk read instead drops the partly read last object and says "the bulk column 
 Every kind has a source, labelled "Definition".
 A table, view or dynamic table is read with `SHOW CREATE TABLE <catalog>.<database>.<name> WITH QUOTED_IDENTIFIERS`, which quotes every name so the DDL re-runs; provider statements run under the PostgreSQL dialect, so the names are double-quoted.
 A materialized view is read with `SHOW CREATE MATERIALIZED VIEW`, since `SHOW CREATE TABLE` refuses one with 1302, and its DDL comes back with backticks (L6).
-The part is `regenerated` and `complete`, since the DDL runs as given, and a caller's character bound marks it truncated without changing its form, as in every provider.
+The part is `regenerated` and `complete`, since the DDL runs as given, and a caller's character bound marks it truncated without changing its form.
 The DDL is the answer's one row, which the statement budget keeps or drops whole and never cuts, so a definition read that reached the budget is refused rather than shown, as the reads of section 6.1 are:
 
 > Databend's answer to the definition reached Studio's statement budget of 16,777,216 bytes of answer text, so Studio shows none of it rather than part of it.
@@ -637,6 +639,10 @@ The DDL is the answer's one row, which the statement budget keeps or drops whole
 An object Databend does not hold is Databend's own error, 1025 for a table and 1003 for a database (measured on the pinned image), and an answer with no definition text is raised naming the object, never shown as a part:
 
 > Databend answered no definition for "[object]".
+
+Databend lists an object in `system.tables` for any grant on it, or on its database other than `USAGE` alone, while `SHOW CREATE` needs `SELECT` on the object, or for a materialized view on its source table (its `visibility_checker.rs` and `privilege_access.rs`), so it can refuse the definition of an object the tree lists, with 1063.
+That refusal is the part, never a raise: it holds Databend's own words in place of a definition, withheld when they hold the password and cut at 300 characters, as a refusal's text is (section 10).
+Measured on the pinned image, `studio_reader` reading `studio_demo.notes` is refused with `Permission denied: privilege [Select] is required on 'default'.'studio_demo'.'notes' for user 'studio_reader'@'%' with roles [public,studio_ro]`.
 
 ### 6.3 Object edit (#789): not in this version
 
@@ -749,7 +755,7 @@ Every server text passes `serverText` with the connection's secret forms (the pa
 | What happened | What Studio says |
 |---|---|
 | An in-body error over HTTP 200 | the server's text; with `--> SQL:<line>:<col>` the editor marks the position |
-| An in-body 1003 unknown database | the server's text, then "Database is the current database for unqualified names: check it, or leave it empty." |
+| An in-body 1003 unknown database on a user statement | the server's text, then "Database is the current database for unqualified names: check it, or leave it empty." |
 | A fail-to-start answer (nothing ran) | the server's text, then "Nothing ran." |
 | A sign-in refused, or locked | Databend refused the sign-in for this user. (section 4.2) |
 | A latched sign-in | Databend refused this sign-in at [time] UTC, so this Studio server will not send this password again before [until] UTC, or until it changes. |
@@ -757,6 +763,7 @@ Every server text passes `serverText` with the connection's secret forms (the pa
 | A Cloud statement refused `ForbiddenAccessUser` | Databend Cloud refused this statement for this user: [server text]. |
 | A Cloud request with no sign-in, `AuthorizationRequired` | No sign-in reached Databend Cloud: a proxy between Studio and Databend may drop the Authorization header. |
 | A middleware 400, or the POST refused 401 with no sign-in code | Databend refused the request before running it: [server text]. |
+| A middleware 400, or the POST refused 401 with no sign-in code, with no server text | Databend refused the request before running it. |
 | A gateway's warehouse or host refusal | the sentences of section 4.4 |
 | A 503 or 429 on a GET past its retries, with no warehouse named | Databend did not answer within [seconds] seconds ([cause]). Try again in a minute. |
 | No answer to the POST | No answer arrived from Databend ([cause]). If the request reached it, Databend may have run the statement: check before running it again. |
@@ -766,7 +773,7 @@ Every server text passes `serverText` with the connection's secret forms (the pa
 | Unreachable, on a probe or a tree read | The server at [host]:[port] did not answer Databend's HTTP API ([cause]). It listens on 8000 self-hosted and 443 on Databend Cloud; 3307 (MySQL) and 8900 (Flight SQL) are not used. |
 | Stop, and the deadline | the sentences of section 5.8 |
 
-With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), an outcome-unknown sentence adds "A suspended warehouse may still be starting.", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.
+With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), the no-answer sentence of the POST, of a dropped connection and of a stop before the first answer adds "A suspended warehouse may still be starting.", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.
 A user statement whose connection drops gets the no-answer sentence rather than the unreachable one, because the statement may have run.
 The [fault] of the protocol sentence is one of: "a 200 answer that is not JSON", "a body that does not parse as JSON", "a key named __proto__", "the field [field] of the wrong type", "a cell that is neither text nor null", "a row of [cells] cells for [columns] columns", "a link Studio does not follow", "a next_uri link of a shape Studio does not follow", "an answer for another statement", "an answer for another session", "an answer for another session; a proxy may drop the X-DATABEND-SESSION header", "a later page with another schema" and "more answers than one statement may take".
 An answer past a bound of section 3.10 names what was too large: "more rows than the page Studio asked for", "a schema larger than a result can keep", "more values than one answer may hold" or "nesting deeper than one answer may have".

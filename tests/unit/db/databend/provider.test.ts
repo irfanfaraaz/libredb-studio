@@ -1166,6 +1166,39 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
     expect(sent()).toEqual([]);
   });
 
+  test("a definition Databend refuses with 1063 is the part's refusal in Databend's own words", async () => {
+    const denied =
+      "Permission denied: privilege [Select] is required on 'default'.'libredb_demo'.'every_type' for user 'analyst'@'%' with roles [public,analyst]";
+    const { provider } = await connected((sql) =>
+      sql === SQL.materializedSource("t") ? failed(1063, denied) : undefined,
+    );
+    expect(await provider.readObjectSource(["default", "libredb_demo", "t"], "materialized_view")).toEqual({
+      path: ["default", "libredb_demo", "t"],
+      kind: "materialized_view",
+      parts: [{ id: "definition", label: DATABEND_OBJECT_SENTENCES.sourceLabel, unavailable: denied }],
+    });
+  });
+
+  // Both answers as the pinned image gave them, with the connection's Database left at `default`, which exists.
+  test("an unknown database is hinted at Database on a user statement, never on a tree read that named a full path", async () => {
+    const source = "SHOW CREATE TABLE `default`.`no_such_db`.`t` WITH QUOTED_IDENTIFIERS";
+    const typed = "SELECT * FROM no_such_db.t";
+    const unknown = `error: \n  --> SQL:1:15\n  |\n1 | ${typed}\n  |               ^^^^^^^^^^ Unknown database "default"."no_such_db" .\n\n`;
+    const { provider } = await connected((sql) => {
+      if (sql === source) return failed(1003, "Unknown database 'no_such_db'");
+      return sql === typed ? failed(1003, unknown) : undefined;
+    });
+    const tree = await provider
+      .readObjectSource(["default", "no_such_db", "t"], "table")
+      .catch((error: unknown) => error);
+    expect(tree).toBeInstanceOf(QueryError);
+    expect((tree as QueryError).message).toBe("Unknown database 'no_such_db'");
+    const user = await provider.query(typed).catch((error: unknown) => error);
+    expect(user).toBeInstanceOf(QueryError);
+    expect((user as QueryError).message).toBe(`${unknown.trimEnd()} ${DATABEND_ERROR_SENTENCES.currentDatabase}`);
+    expect((user as QueryError).position).toBe(15);
+  });
+
   test("a surface statement's failure is mapped to the house class, naming its statement", async () => {
     const { provider } = await connected((sql) =>
       sql === SQL.catalogs ? failed(1006, "catalogs unreadable") : undefined,

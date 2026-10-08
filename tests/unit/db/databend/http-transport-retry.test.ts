@@ -54,7 +54,8 @@ describe("the final of a complete result (X02)", () => {
   });
 
   test("a final that fails on the network three times is retried after 1 and 2 s, then a notice", async () => {
-    const lost: ScriptedStep = { method: "GET", path: P.final, reply: { fail: "network", truncated: true } };
+    // No answer at all: one cut short once it began was answered, a refused close (http-transport-session.test.ts).
+    const lost: ScriptedStep = { method: "GET", path: P.final, reply: { fail: "network" } };
     const { script, time, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: ok(FIRST, INSERTED) },
       lost,

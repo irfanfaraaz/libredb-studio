@@ -28,6 +28,7 @@ import {
   READS_FILE_ACCESS_POSTURE,
 } from "@/lib/db/compatibility";
 import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
+import { TransportError } from "@/lib/db/http/node-transport";
 import { DATABEND_ANSWER_SENTENCES, RESULT_MODE_FLOOR, readAnswer } from "@/lib/db/providers/sql/databend/answer";
 import { AUTH_LATCH_MAX_ENTRIES, AUTH_LATCH_TTL_MS } from "@/lib/db/providers/sql/databend/auth-latch";
 import { databendCloudHostWarehouse } from "@/lib/db/providers/sql/databend/cloud-host";
@@ -50,6 +51,8 @@ import {
   DATABEND_PROTOCOL_FAULTS,
   type DatabendFailureContext,
   refusalError,
+  stopError,
+  transportFailure,
 } from "@/lib/db/providers/sql/databend/errors";
 import { DATABEND_PAGE_UNANSWERED, DATABEND_WARNING_LIMIT } from "@/lib/db/providers/sql/databend/http-transport";
 import { DATABEND_PROVIDER_SENTENCES, DatabendProvider } from "@/lib/db/providers/sql/databend/index";
@@ -208,6 +211,7 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_ERROR_SENTENCES.warehouseRequired,
       DATABEND_ERROR_SENTENCES.hostRefused,
       DATABEND_ERROR_SENTENCES.middlewareRefused("[server text]"),
+      DATABEND_ERROR_SENTENCES.middlewareRefused(""),
       DATABEND_ERROR_SENTENCES.nothingRan,
       DATABEND_ERROR_SENTENCES.resuming("[warehouse]", "[seconds]"),
       DATABEND_ERROR_SENTENCES.unavailable("[cause]", "[seconds]"),
@@ -421,7 +425,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       `| A 503 or 429 on a GET past its retries, with no warehouse named | ${DATABEND_ERROR_SENTENCES.unavailable("[cause]", "[seconds]")} |`,
     );
     expect(flat(errors)).toContain(
-      `With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), an outcome-unknown sentence adds "${DATABEND_ERROR_SENTENCES.warehouseStarting}", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.`,
+      `With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), the no-answer sentence of the POST, of a dropped connection and of a stop before the first answer adds "${DATABEND_ERROR_SENTENCES.warehouseStarting}", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.`,
     );
     expect(flat(sectionOf(DOC, "### 4.4 Databend Cloud: warehouse, cold start and billing"))).toContain(
       "For such a host the sentences of this section and of section 10 name the warehouse the host carries, as they name a Warehouse,",
@@ -450,6 +454,18 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(refusalError(refusal(503), { ...ctx, request: "get" }).message).toBe(
       DATABEND_ERROR_SENTENCES.resuming("eric", "60"),
     );
+    // Only the no-answer sentence adds it: a dropped connection and a stop before the first answer do, and the
+    // outcome-unknown sentences of a stop after it do not (Z1).
+    const unanswered = { answered: false, killAcknowledged: false };
+    const answered = { answered: true, killAcknowledged: false };
+    expect(transportFailure(new TransportError("network", "reset"), unanswered, ctx).message).toBe(
+      `${DATABEND_ERROR_SENTENCES.noAnswer("reset")} ${DATABEND_ERROR_SENTENCES.warehouseStarting}`,
+    );
+    expect(stopError("cancel", unanswered, ctx).message).toBe(
+      `${DATABEND_ERROR_SENTENCES.noAnswer(DATABEND_ERROR_SENTENCES.cancelledBeforeAnswer)} ${DATABEND_ERROR_SENTENCES.warehouseStarting}`,
+    );
+    expect(stopError("cancel", answered, ctx).message).toBe(DATABEND_ERROR_SENTENCES.cancelUnanswered);
+    expect(stopError("deadline", answered, ctx).message).toBe(DATABEND_ERROR_SENTENCES.deadlineUnacknowledged("60"));
   });
 
   test("the sign-in latch is promised for one Studio process, wherever it is promised", () => {

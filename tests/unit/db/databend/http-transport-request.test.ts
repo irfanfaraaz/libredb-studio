@@ -495,9 +495,10 @@ describe("every later page, checked as the first answer is (design 3.4)", () => 
     ]);
   });
 
-  test("every captured later page is for its statement's id and session, with its schema, so Databend passes", () => {
+  test("every captured later page carries its first answer's query id and schema, in captures taken with no client session", () => {
     const root = join(import.meta.dir, "../../../fixtures/databend");
     interface Captured {
+      readonly clientSession: boolean;
       readonly exchanges: readonly {
         readonly request: { readonly method: string; readonly path: string };
         readonly response: { readonly status: number; readonly body: unknown };
@@ -505,13 +506,12 @@ describe("every later page, checked as the first answer is (design 3.4)", () => 
     }
     interface Answer {
       readonly id: string;
-      readonly session_id: string;
       readonly schema: readonly unknown[];
     }
     let pages = 0;
     for (const run of readdirSync(root).filter((name) => /^(local|cloud)-/.test(name))) {
       for (const file of readdirSync(join(root, run)).filter((name) => name !== "manifest.json")) {
-        const { exchanges } = JSON.parse(readFileSync(join(root, run, file), "utf8")) as Captured;
+        const { clientSession, exchanges } = JSON.parse(readFileSync(join(root, run, file), "utf8")) as Captured;
         const firsts = new Map<string, Answer>();
         for (const { request, response } of exchanges) {
           const answer = response.body as Answer;
@@ -520,9 +520,11 @@ describe("every later page, checked as the first answer is (design 3.4)", () => 
           }
           const page = /^\/v1\/query\/([^/]+)\/page\/\d+$/.exec(request.path);
           if (page === null || response.status !== 200) continue;
+          // Without a client session no answer echoes Studio's, so these pages show nothing of the session rule:
+          // section 3.3 names where the echo on a later page was measured.
+          expect(clientSession, `${run}/${file}`).toBe(false);
           const first = firsts.get(page[1]) as Answer;
           expect(answer.id, `${run}/${file}`).toBe(first.id);
-          expect(answer.session_id, `${run}/${file}`).toBe(first.session_id);
           if (answer.schema.length > 0) expect(answer.schema, `${run}/${file}`).toEqual(first.schema);
           pages += 1;
         }

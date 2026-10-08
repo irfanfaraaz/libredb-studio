@@ -44,7 +44,7 @@ import { quoteLiteral } from "@/lib/sql/values";
 import type { ColumnSchema, IndexSchema } from "@/lib/types";
 import { decodeOutcome } from "./decode";
 import { serverWords } from "./errors";
-import type { DatabendTruncation, StatementOutcome } from "./transport";
+import { DatabendError, type DatabendTruncation, type StatementOutcome } from "./transport";
 
 const PROVIDER = "databend";
 
@@ -91,6 +91,9 @@ const SOURCE_COLUMN = "Create Table";
 
 /** The one part a definition document holds. */
 const DATABEND_SOURCE_PART_ID = "definition";
+
+/** Databend's code for a statement the user's grants do not cover (`PermissionDenied`, `exception_code.rs`). */
+const PERMISSION_DENIED_CODE = 1063;
 
 const BOUND_UNITS: Readonly<Record<DatabendTruncation["bound"], string>> = {
   rows: "rows",
@@ -440,25 +443,44 @@ export async function describeObjects(
 
 /**
  * One object's DDL as one part: the engine's re-rendering, which runs as given, so `complete`, and stays so under a
- * caller's bound, which marks the part as it does across the fleet. The statement budget keeps or drops the answer's
- * one row whole and never cuts the text inside it, so a read the budget reached is refused naming the bound, as the
- * other reads are [X05], rather than handed over. An object Databend does not hold is Databend's own error (1025,
- * 1003), and an answer with no definition text is raised naming the object, never a part (`ADDING_A_PROVIDER.md`).
+ * caller's bound, which only marks the part. The statement budget keeps or drops the answer's one row whole and never
+ * cuts the text inside it, so a read the budget reached is refused naming the bound, as the other reads are [X05],
+ * rather than handed over. Databend lists an object for any grant on it, but `SHOW CREATE` needs SELECT on the object,
+ * or for a materialized view on its source table (`visibility_checker.rs`, `privilege_access.rs`), so a listed
+ * object's definition can be refused with 1063: that refusal is the part, Databend's own words through `serverWords`,
+ * never a raise. An object Databend does not hold is Databend's own error (1025, 1003), and an answer with no
+ * definition text is raised naming the object, never a part (`ADDING_A_PROVIDER.md`).
  */
 export async function readObjectSource(
   runner: DatabendStatementRunner,
   container: DatabendContainer,
   kind: string,
   object: string,
+  secretForms: readonly string[],
   limit?: number,
 ): Promise<ObjectSourceDocument> {
   const sql = databendSourceSql(container, kind, object);
-  const rows = await readCompleteRows(runner, sql, "definition");
+  const path = [container.catalog, container.database, object];
+  let rows: Record<string, unknown>[];
+  try {
+    rows = await readCompleteRows(runner, sql, "definition");
+  } catch (error) {
+    // Only the statement's own error is the server's words alone; every other failure says nothing about the object.
+    if (error instanceof DatabendError && error.category === "statement" && error.code === PERMISSION_DENIED_CODE) {
+      const unavailable = serverWords(error.message, secretForms);
+      return {
+        path,
+        kind,
+        parts: [{ id: DATABEND_SOURCE_PART_ID, label: DATABEND_OBJECT_SENTENCES.sourceLabel, unavailable }],
+      };
+    }
+    throw error;
+  }
   const text = readText(rows[0]?.[SOURCE_COLUMN]);
   if (text.trim() === "") throw new QueryError(DATABEND_OBJECT_SENTENCES.noDefinition(object), PROVIDER, sql);
   const bounded = applySourceBound(text, limit);
   return {
-    path: [container.catalog, container.database, object],
+    path,
     kind,
     parts: [
       {

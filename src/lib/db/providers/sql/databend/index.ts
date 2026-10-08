@@ -618,7 +618,8 @@ export class DatabendProvider extends SQLBaseProvider {
 
   public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
     const { container, name } = this.object(path, kind);
-    return this.surface((run) => readOneObjectSource(run, container, kind, name, limit));
+    const { secretForms } = this.requireSession().options;
+    return this.surface((run) => readOneObjectSource(run, container, kind, name, secretForms, limit));
   }
 
   // ==========================================================================

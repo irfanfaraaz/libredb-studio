@@ -23,8 +23,8 @@
  *
  * `"user"` is the editor's statement, sent with the user's own dialect settings. `"provider"` is a statement Studio
  * writes itself (the object tree, describe, source, monitoring, the connect probe), which also pins `sql_dialect`,
- * `quoted_ident_case_sensitive` and `timezone` (design 3.3), and whose network failure is `network` where a user
- * statement's is `outcome-unknown` (design 3.11).
+ * `quoted_ident_case_sensitive` and `timezone` (design 3.3), whose network failure is `network` where a user
+ * statement's is `outcome-unknown` (design 3.11), and whose deadline is `timeout` whatever the kill answered.
  */
 export type StatementOrigin = "user" | "provider";
 
@@ -84,7 +84,9 @@ export type DatabendAffect =
  * - `close-failed`: a best-effort final, ROLLBACK or logout that did not answer within its 5 s; a failed final of a
  *   complete result is this notice and never an error, which would report a committed write as failed.
  * - `close-refused`: a final, ROLLBACK or logout answered with something other than its acknowledgment: an error
- *   status, a gateway's refusal over HTTP 200, or a 200 of the ROLLBACK's chain that could not be read.
+ *   status, a gateway's refusal over HTTP 200, an answer the node transport refused to read (past the cap, under
+ *   another content-encoding, a redirect, or cut short once it began), or a 200 of the ROLLBACK's chain that could not
+ *   be read.
  * - `close-skipped`: a close that was never sent, because Databend had refused the sign-in on an earlier request of
  *   the statement and the run sends nothing after that (design 3.5).
  * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4), the mode

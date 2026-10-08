@@ -19,7 +19,8 @@
  *
  * The evidence harness's run arguments and expectation checks are held too, and the last block holds the captures
  * the replay reads to the plan: each was sent as the plan's local scenario of its name sends it, and shows what that
- * scenario expects.
+ * scenario expects. Every local capture also renders again through the evidence scrub with the fixture's secrets,
+ * refused nowhere and written back unchanged.
  *
  * Each rule is a pure function from the parsed fixtures to a list of findings, so it is proven both ways: the real
  * tree gives none, and a planted copy with one fault gives the finding that names it.
@@ -29,6 +30,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import { parse as parseYaml } from "yaml";
+import { EvidenceLeakError, EvidenceScrubber, type EvidenceSecrets } from "../../../helpers/databend-evidence-scrub";
 import {
   DATABEND_CAPTURE_RUNS,
   type DatabendCapture,
@@ -46,6 +48,7 @@ import {
 const ROOT = path.resolve(import.meta.dir, "../../../..");
 const DATABEND_DIR = path.join(ROOT, "docker/databend");
 const LIVE_DIR = path.join(ROOT, "tests/live");
+const CAPTURES_DIR = path.join(ROOT, "tests/fixtures/databend");
 
 interface ComposeLimits {
   readonly cpus?: string;
@@ -78,6 +81,8 @@ interface DatabendFixtures {
   readonly scenarios: readonly EvidenceScenario[];
   /** The captures the replay reads, every file of every run of `DATABEND_CAPTURE_RUNS`. */
   readonly captures: readonly DatabendCapture[];
+  /** Every committed capture run under tests/fixtures/databend: its directory to each file's name and text. */
+  readonly runs: Readonly<Record<string, Readonly<Record<string, string>>>>;
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: Mutable<T[K]> };
@@ -97,7 +102,16 @@ function loadFixtures(): DatabendFixtures {
       .map((name) => [name, readFileSync(path.join(LIVE_DIR, name), "utf8")]),
   );
   const captures = DATABEND_CAPTURE_RUNS.flatMap((run) => databendCaptureFiles(run)).map(loadDatabendCapture);
-  return { services, files, live, scenarios: EVIDENCE_SCENARIOS, captures };
+  const runs = Object.fromEntries(
+    readdirSync(CAPTURES_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const directory = path.join(CAPTURES_DIR, entry.name);
+        const texts = readdirSync(directory).map((name) => [name, readFileSync(path.join(directory, name), "utf8")]);
+        return [entry.name, Object.fromEntries(texts)];
+      }),
+  );
+  return { services, files, live, scenarios: EVIDENCE_SCENARIOS, captures, runs };
 }
 
 /** A deep copy with one change, for the planted half of each rule. */
@@ -1056,7 +1070,75 @@ function captureFindings({ scenarios, captures }: DatabendFixtures): string[] {
   return findings;
 }
 
+/**
+ * The secrets tests/live/databend-evidence.ts hands its scrub for the local target, read where its `readCredentials`
+ * reads them: the compose file's default user, `studio_reader` from fixture.jsonl, and the default user with the
+ * harness's wrong password, in that order.
+ */
+function localSecrets({ services, files, live }: DatabendFixtures): EvidenceSecrets {
+  const environment = services[SERVER]?.environment ?? {};
+  const user = environment.QUERY_DEFAULT_USER;
+  const password = environment.QUERY_DEFAULT_PASSWORD;
+  const reader = /USER studio_reader IDENTIFIED BY '([^']+)'/.exec(files["fixture.jsonl"] ?? "")?.[1];
+  const wrong = /^const WRONG_PASSWORD = "([^"]+)";$/m.exec(live["databend-evidence.ts"] ?? "")?.[1];
+  if (user === undefined || password === undefined || reader === undefined || wrong === undefined)
+    throw new Error("the local secrets are not where tests/live/databend-evidence.ts reads them");
+  return {
+    users: [
+      { user, password },
+      { user: "studio_reader", password: reader },
+      { user, password: wrong },
+    ],
+  };
+}
+
+/**
+ * Every local capture run, rendered again through today's scrub with the fixture's secrets (C23): a file the scrub
+ * refuses, or one its render does not write back byte for byte, is a finding, so a scrub made stricter than a committed
+ * capture fails here and not first on the next capture run.
+ */
+function scrubFindings(fixtures: DatabendFixtures): string[] {
+  const findings: string[] = [];
+  const secrets = localSecrets(fixtures);
+  const local = Object.entries(fixtures.runs).filter(
+    ([, texts]) => JSON.parse(texts["manifest.json"]).target === "local",
+  );
+  if (local.length === 0) findings.push("no local capture run is committed");
+  for (const [run, texts] of local) {
+    const files = Object.fromEntries(Object.entries(texts).map(([name, text]) => [name, JSON.parse(text)]));
+    try {
+      const rendered = new EvidenceScrubber(secrets).render(files);
+      for (const [name, text] of Object.entries(texts))
+        if (rendered[name] !== text) findings.push(`${run}/${name} is not what the scrub writes`);
+    } catch (error) {
+      if (!(error instanceof EvidenceLeakError)) throw error;
+      findings.push(...error.findings.map((finding) => `${run}: ${finding}`));
+    }
+  }
+  return findings;
+}
+
 describe("the captures under tests/fixtures/databend", () => {
+  test("every local capture renders again through today's scrub with the fixture's secrets, refused nowhere and unchanged", () => {
+    clean(scrubFindings(real));
+    const [run] = DATABEND_CAPTURE_RUNS;
+    const { password } = localSecrets(real).users[1];
+    // The scrub reads a key as it reads a value.
+    const keyed = planted(real, (draft) => {
+      draft.runs[run]["planted.json"] = `${JSON.stringify({ [password]: true }, null, 2)}\n`;
+    });
+    finds(scrubFindings(keyed), `${run}: planted.json holds the password`);
+    const unwritten = planted(real, (draft) => {
+      draft.runs[run]["version.json"] = draft.runs[run]["version.json"].trimEnd();
+    });
+    finds(scrubFindings(unwritten), `${run}/version.json is not what the scrub writes`);
+    const none = planted(real, (draft) => {
+      for (const [name, texts] of Object.entries(draft.runs))
+        if (JSON.parse(texts["manifest.json"]).target === "local") delete draft.runs[name];
+    });
+    finds(scrubFindings(none), "no local capture run is committed");
+  });
+
   test("each manifest names the Studio commit and the harness files that commit did not hold", () => {
     const captures = path.join(ROOT, "tests/fixtures/databend");
     const manifests = readdirSync(captures, { withFileTypes: true })

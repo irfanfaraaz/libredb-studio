@@ -1,8 +1,9 @@
 /**
  * Cancel, deadline, kill and close (design 3.10; C9; X02, X16, X31): one kill per stop, a hanging kill cut by its own
  * 5 s, a kill answered 404 before the first answer sent again at 250, 500 and 1000 ms, and after a Running answer a
- * cancel that is `cancelled`, and a deadline that is `timeout`, only on a kill 200 or a 1043 answer. Every timer is
- * the injected `deadline`.
+ * cancel that is `cancelled`, and a user statement's deadline that is `timeout`, only on a kill 200 or a 1043 answer,
+ * while Studio's own read is `timeout` at its deadline whatever the kill answered. Every timer is the injected
+ * `deadline`.
  */
 import { describe, expect, test } from "bun:test";
 import { DATABEND_ERROR_SENTENCES as S } from "@/lib/db/providers/sql/databend/errors";
@@ -269,6 +270,38 @@ describe("before the first answer (design 3.10)", () => {
     run.expire();
     expect((await running).category).toBe("timeout");
     script.expectDone();
+  });
+});
+
+describe("the statement deadline by origin, with a kill Databend did not acknowledge (Z5)", () => {
+  test.each([
+    ["a user statement", "before", "outcome-unknown", "user", S.noAnswer(S.deadlineBeforeAnswer("60"))],
+    ["a user statement", "after", "outcome-unknown", "user", S.deadlineUnacknowledged("60")],
+    ["Studio's own read", "before", "timeout", "provider", S.deadline("10")],
+    ["Studio's own read", "after", "timeout", "provider", S.deadline("10")],
+  ] as const)("%s %s its first answer is %s", async (_label, when, category, origin, message) => {
+    const before = when === "before";
+    const refused = { status: 500, body: "panic", contentType: "text/plain" };
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: before ? { hang: true } : RUNNING },
+      ...(before
+        ? [
+            { method: "GET" as const, path: P.kill, reply: refused },
+            { method: "POST" as const, path: LOGOUT, reply: { status: 200 } },
+          ]
+        : [
+            { method: "GET" as const, path: P.page(0), reply: { hang: true as const } },
+            { method: "GET" as const, path: P.kill, reply: refused },
+          ]),
+    ]);
+    const run = runSignal();
+    const running = failure(transport.run(statement("SELECT 1", { origin, signal: run.signal })));
+    await script.received(before ? 1 : 2);
+    run.expire();
+    const error = await running;
+    script.expectDone();
+    expect(error.category).toBe(category);
+    expect(error.message).toBe(message);
   });
 });
 

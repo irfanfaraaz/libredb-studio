@@ -227,6 +227,14 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
     const cut = refusalError(refusal({ status: 401, text: "x".repeat(400) }), context());
     expect(cut.message).toBe(S.middlewareRefused(`${"x".repeat(300)}...`));
   });
+
+  test("another 401 on the POST with no server text ends the sentence with no colon (Z4)", () => {
+    const error = refusalError(refusal({ status: 401, contentType: null, text: "" }), context());
+    expectRow(error, "protocol", ConnectionError, "Databend refused the request before running it.");
+    expect(error.message).toBe(S.middlewareRefused(""));
+    // The middleware's 400 reads the same sentence, so it reads the same with no text.
+    expect(refusalError(refusal({ status: 400, code: 400, text: "" }), context()).message).toBe(error.message);
+  });
 });
 
 describe("the gateway's statement and sign-in kinds (I19)", () => {
@@ -682,15 +690,22 @@ describe("our cancel and our deadline (X02, X07)", () => {
     );
   });
 
-  test("a provider statement's deadline after an answer needs an acknowledged kill too", () => {
+  test.each([
+    ["a user statement's", "before", "outcome-unknown", "user", unanswered, S.noAnswer(S.deadlineBeforeAnswer("10"))],
+    ["a user statement's", "after", "outcome-unknown", "user", answered, S.deadlineUnacknowledged("10")],
+    ["Studio's own read's", "before", "timeout", "provider", unanswered, S.deadline("10")],
+    ["Studio's own read's", "after", "timeout", "provider", answered, S.deadline("10")],
+  ] as const)(
+    "%s deadline %s its first answer, with a kill Databend did not acknowledge, is %s (Z5)",
+    (_label, _when, category, origin, state, message) => {
+      const ctx = context({ origin, timeoutMs: 10_000 });
+      const houseClass = category === "timeout" ? TimeoutError : ConnectionError;
+      expectRow(stopError("deadline", state, ctx), category, houseClass, message, ctx);
+    },
+  );
+
+  test("Studio's own read with the kill acknowledged is timeout too", () => {
     const ctx = context({ origin: "provider", timeoutMs: 10_000 });
-    expectRow(
-      stopError("deadline", answered, ctx),
-      "outcome-unknown",
-      ConnectionError,
-      S.deadlineUnacknowledged("10"),
-      ctx,
-    );
     expectRow(stopError("deadline", acknowledged, ctx), "timeout", TimeoutError, S.deadline("10"), ctx);
   });
 
@@ -849,12 +864,31 @@ describe("an in-body error", () => {
     expect(error.message).toBe(`${"y".repeat(1000)}...`);
   });
 
-  test("1003 adds the current-database hint", () => {
+  test("1003 on a user statement adds the current-database hint", () => {
     expectRow(
       answerError({ id: "q", error: { code: 1003, message: "Unknown database 'x'", detail: null } }, context(), null),
       "statement",
       QueryError,
       `Unknown database 'x' ${S.currentDatabase}`,
+    );
+  });
+
+  // Measured on the pinned image: the tree's read of a path under a database Databend does not hold.
+  test("1003 on a provider statement, which names its full path, is the server's text alone", () => {
+    const ctx = context({
+      origin: "provider",
+      sql: "SHOW CREATE TABLE `default`.`no_such_db`.`t` WITH QUOTED_IDENTIFIERS",
+    });
+    expectRow(
+      answerError(
+        { id: "q", error: { code: 1003, message: "Unknown database 'no_such_db'", detail: null } },
+        ctx,
+        null,
+      ),
+      "statement",
+      QueryError,
+      "Unknown database 'no_such_db'",
+      ctx,
     );
   });
 });

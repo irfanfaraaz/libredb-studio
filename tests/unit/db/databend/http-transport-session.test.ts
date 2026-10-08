@@ -2,8 +2,9 @@
  * The client session and the end-open of design 3.4 and 3.7 (C11; X13): only the statement's own session is ever
  * sent, an `Active` transaction is rolled back under a new query id with its links followed inside the same 5 s and no
  * second end-open, a ROLLBACK link answered with a 200 it cannot read is a refused close and one with no answer a
- * failed one, `Fail` sends nothing, a session that still needs keep-alive is logged out, and a POST with no answer
- * gets one kill and one logout with our session id.
+ * failed one, a close whose answer the node transport refused to read is a refused one too, `Fail` sends nothing, a
+ * session that still needs keep-alive is logged out, and a POST with no answer gets one kill and one logout with our
+ * session id.
  */
 import { describe, expect, test } from "bun:test";
 import { DATABEND_ERROR_SENTENCES as S, DATABEND_PROTOCOL_FAULTS as F } from "@/lib/db/providers/sql/databend/errors";
@@ -262,6 +263,41 @@ describe("an Active transaction (design 3.4; X13)", () => {
     expect((await transport.run(statement("SELECT 1"))).notices).toEqual([]);
     script.expectDone();
   });
+});
+
+describe("a close whose answer the node transport refused to read (Z3)", () => {
+  test.each([
+    ["an answer past the cap", { fail: "too-large" as const }, 1],
+    ["an answer under a content-encoding other than identity", { fail: "encoding" as const }, 1],
+    ["a redirect", { fail: "redirect" as const }, 1],
+    // A network failure is a GET's to retry, so the final is asked for three times.
+    ["an answer cut short once it began", { fail: "network" as const, truncated: true }, 3],
+  ])(
+    "%s to the final, a ROLLBACK link and the logout arrived, so each is a refused close, never an unanswered one",
+    async (_label, reply, finals) => {
+      const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
+      const final = { method: "GET" as const, path: P.final, reply };
+      const { script, transport } = transportHarness([
+        { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE, next_uri: P.final }) },
+        ...Array.from({ length: finals }, () => final),
+        {
+          method: "POST",
+          path: "/v1/query",
+          reply: ok(rollback, { session: echo({ need_keep_alive: true }), next_uri: R.page(0) }),
+        },
+        { method: "GET", path: R.page(0), reply },
+        { method: "POST", path: LOGOUT, reply },
+      ]);
+      const outcome = await transport.run(statement("BEGIN"));
+      script.expectDone();
+      expect(outcome.notices).toEqual([
+        { kind: "close-refused", step: "final" },
+        { kind: "transaction-ended" },
+        { kind: "close-refused", step: "rollback" },
+        { kind: "close-refused", step: "logout" },
+      ]);
+    },
+  );
 });
 
 describe("an echoed session nested past what an answer may have (REV-T-1)", () => {

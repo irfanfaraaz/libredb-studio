@@ -209,17 +209,17 @@ describe("the design 5.4 statements, exactly, as each surface sends them", () =>
   test("readObjectSource: SHOW CREATE TABLE WITH QUOTED_IDENTIFIERS, and SHOW CREATE MATERIALIZED VIEW (L6)", async () => {
     const kinds = ["table", "view", "dynamic_table"];
     const sent = await Promise.all(
-      kinds.map((kind) => statementsOf((runner) => readObjectSource(runner, CONTAINER, kind, OBJECT))),
+      kinds.map((kind) => statementsOf((runner) => readObjectSource(runner, CONTAINER, kind, OBJECT, []))),
     );
     expect(sent).toEqual(kinds.map(() => [`SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`]));
-    expect(await statementsOf((runner) => readObjectSource(runner, CONTAINER, "materialized_view", OBJECT))).toEqual([
-      `SHOW CREATE MATERIALIZED VIEW ${C}.${D}.${O}`,
-    ]);
+    expect(
+      await statementsOf((runner) => readObjectSource(runner, CONTAINER, "materialized_view", OBJECT, [])),
+    ).toEqual([`SHOW CREATE MATERIALIZED VIEW ${C}.${D}.${O}`]);
   });
 
   test("readObjectSource refuses an undeclared kind by name, with nothing sent", async () => {
     const { runner, calls } = scripted();
-    await expect(readObjectSource(runner, CONTAINER, "stream", OBJECT)).rejects.toThrow(
+    await expect(readObjectSource(runner, CONTAINER, "stream", OBJECT, [])).rejects.toThrow(
       DATABEND_OBJECT_SENTENCES.unknownKind("stream"),
     );
     expect(calls).toEqual([]);
@@ -561,10 +561,11 @@ describe("readObjectSource", () => {
     ["Create Table", "String"],
   ] as const;
   const DDL = 'CREATE TABLE "o" ("id" INT NULL) ENGINE=FUSE';
+  const FORMS = secretForms([TEST_PASSWORD, `reader:${TEST_PASSWORD}`]);
 
   test("one complete, regenerated SQL part", async () => {
     const { runner, calls } = scripted(outcome(SOURCE_SCHEMA, [["o", DDL]]));
-    expect(await readObjectSource(runner, CONTAINER, "table", OBJECT)).toEqual({
+    expect(await readObjectSource(runner, CONTAINER, "table", OBJECT, FORMS)).toEqual({
       path: [CATALOG, DATABASE, OBJECT],
       kind: "table",
       parts: [
@@ -581,9 +582,9 @@ describe("readObjectSource", () => {
     expect(calls[0].sql).toBe(`SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`);
   });
 
-  test("a caller's bound marks the part and leaves it complete, as in every provider", async () => {
+  test("a caller's bound marks the part and leaves it complete", async () => {
     const { runner } = scripted(outcome(SOURCE_SCHEMA, [["o", DDL]]));
-    const [part] = (await readObjectSource(runner, CONTAINER, "table", OBJECT, 6)).parts;
+    const [part] = (await readObjectSource(runner, CONTAINER, "table", OBJECT, FORMS, 6)).parts;
     expect(part).toMatchObject({
       text: "CREATE",
       form: "complete",
@@ -598,7 +599,7 @@ describe("readObjectSource", () => {
     await Promise.all(
       [[["o", DDL]], []].map(async (rows) => {
         const { runner } = scripted(outcome(SOURCE_SCHEMA, rows, cut));
-        const read = readObjectSource(runner, CONTAINER, "materialized_view", OBJECT, 6);
+        const read = readObjectSource(runner, CONTAINER, "materialized_view", OBJECT, FORMS, 6);
         await expect(read).rejects.toBeInstanceOf(QueryError);
         await expect(read).rejects.toThrow(DATABEND_OBJECT_SENTENCES.incomplete("definition", cut));
       }),
@@ -609,12 +610,61 @@ describe("readObjectSource", () => {
     await Promise.all(
       [[], [["o", "  "]], [["o", null]]].map(async (rows) => {
         const { runner } = scripted(outcome(SOURCE_SCHEMA, rows));
-        const read = readObjectSource(runner, CONTAINER, "view", OBJECT);
+        const read = readObjectSource(runner, CONTAINER, "view", OBJECT, FORMS);
         await expect(read).rejects.toBeInstanceOf(QueryError);
         await expect(read).rejects.toThrow(`Databend answered no definition for "${OBJECT}".`);
       }),
     );
     expect(DATABEND_OBJECT_SENTENCES.noDefinition(OBJECT)).toBe(`Databend answered no definition for "${OBJECT}".`);
+  });
+
+  // The 1063 Databend answered on the pinned image when `studio_reader` read `studio_demo.notes`, for another user and
+  // object. `SHOW CREATE` needs SELECT on the object, or for a materialized view on its source table, while a grant of
+  // any other privilege lists the object in the tree (Databend's `privilege_access.rs` and `visibility_checker.rs`).
+  const denied = (on: string) =>
+    `Permission denied: privilege [Select] is required on ${on} for user 'analyst'@'%' with roles [public,analyst]`;
+
+  test("a definition Databend refuses with 1063 is a part holding Databend's own words, never a raise [ADDING_A_PROVIDER]", async () => {
+    await Promise.all(
+      [
+        ["table", "'default'.'d'.'o'"],
+        ["materialized_view", "'default'.'d'.'its_source'"],
+      ].map(async ([kind, on]) => {
+        const { runner } = scripted(new DatabendError("statement", denied(on), { code: 1063 }));
+        const document = await readObjectSource(runner, CONTAINER, kind, OBJECT, FORMS, 6);
+        expect(document).toEqual({
+          path: [CATALOG, DATABASE, OBJECT],
+          kind,
+          parts: [{ id: SOURCE_PART_ID, label: DATABEND_OBJECT_SENTENCES.sourceLabel, unavailable: denied(on) }],
+        });
+        expect(Object.keys(document.parts[0]).sort()).toEqual(["id", "label", "unavailable"]);
+      }),
+    );
+  });
+
+  test("a 1063's words pass serverText with the connection's forms and are cut as a refusal's text is", async () => {
+    const refusal = async (message: string) => {
+      const { runner } = scripted(new DatabendError("statement", message, { code: 1063 }));
+      const [part] = (await readObjectSource(runner, CONTAINER, "view", OBJECT, FORMS)).parts;
+      return "unavailable" in part ? part.unavailable : part.text;
+    };
+    expect(await refusal(denied(`'${TEST_PASSWORD}'`))).toBe(serverText(TEST_PASSWORD, FORMS));
+    expect(await refusal("D".repeat(400))).toBe(`${"D".repeat(300)}...`);
+  });
+
+  test("every other failure of the read raises: an object Databend does not hold, and a 1063 that is not its in-body error", async () => {
+    await Promise.all(
+      [
+        new DatabendError("statement", "Unknown table 'o'", { code: 1025 }),
+        new DatabendError("server", "Databend answered HTTP 500 before the statement finished: denied.", {
+          code: 1063,
+          status: 500,
+        }),
+      ].map(async (error) => {
+        const { runner } = scripted(error);
+        await expect(readObjectSource(runner, CONTAINER, "table", OBJECT, FORMS)).rejects.toBe(error);
+      }),
+    );
   });
 });
 

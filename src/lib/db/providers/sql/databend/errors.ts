@@ -52,7 +52,10 @@ export const DATABEND_ERROR_SENTENCES = Object.freeze({
     `Databend Cloud refused the warehouse "${name}": check Warehouse against the DSN on the warehouse's Connect page.`,
   warehouseRequired: "Databend Cloud needs a warehouse: set Warehouse from the DSN on the warehouse's Connect page.",
   hostRefused: "Databend Cloud does not know this host: check Host against the DSN on the warehouse's Connect page.",
-  middlewareRefused: (text: string) => `Databend refused the request before running it: ${text}.`,
+  middlewareRefused: (text: string) =>
+    text === ""
+      ? "Databend refused the request before running it."
+      : `Databend refused the request before running it: ${text}.`,
   nothingRan: "Nothing ran.",
   resuming: (name: string, seconds: string) =>
     `Warehouse "${name}" did not answer within ${seconds} seconds; it may be resuming. Try again in a minute, or resume it in the Databend Cloud console.`,
@@ -357,9 +360,10 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
 
 /**
  * Studio's own cancel or deadline, with what the run knew when it stopped (design 3.10; X02, X07). After the first
- * answer either one stopped the statement only when Databend acknowledged the kill; otherwise the statement may
- * still finish, and the failure is `outcome-unknown`. A probe or surface read on a named warehouse keeps X07's
- * resuming sentence for its deadline.
+ * answer a cancel, and a user statement's deadline, stopped the statement only when Databend acknowledged the kill;
+ * otherwise it may still finish, and the failure is `outcome-unknown`. A statement Studio sends itself is `timeout` at
+ * its deadline whatever the kill answered, since checking before running it again means nothing for Studio's own
+ * reads: X07's resuming sentence on a named warehouse, the deadline sentence otherwise.
  */
 export function stopError(stop: DatabendStop, state: DatabendStopState, ctx: DatabendFailureContext): DatabendError {
   const provider = ctx.origin === "provider";
@@ -377,8 +381,8 @@ export function stopError(stop: DatabendStop, state: DatabendStopState, ctx: Dat
   // A probe or surface read that outlasts its budget on a named warehouse is most likely a resume (X07).
   const wait = seconds(ctx.timeoutMs);
   if (provider && ctx.warehouse) return new DatabendError("timeout", sentences.resuming(ctx.warehouse, wait));
-  // After the first answer the deadline stopped the statement only when Databend acknowledged the kill [X02].
-  if (state.answered && !state.killAcknowledged) {
+  // After the first answer a user statement's deadline stopped it only when Databend acknowledged the kill [X02].
+  if (!provider && state.answered && !state.killAcknowledged) {
     return new DatabendError("outcome-unknown", sentences.deadlineUnacknowledged(wait));
   }
   return new DatabendError("timeout", sentences.deadline(wait));
@@ -411,7 +415,9 @@ export function answerError(
     const category = code === SETTING_CODE ? "config" : "statement";
     return new DatabendError(category, `${text} ${sentences.nothingRan}`, { code, detail });
   }
-  const message = code === UNKNOWN_DATABASE_CODE ? `${text} ${sentences.currentDatabase}` : text;
+  // Only a user statement can miss the connection's Database: a provider statement names the database it reads.
+  const message =
+    code === UNKNOWN_DATABASE_CODE && ctx.origin === "user" ? `${text} ${sentences.currentDatabase}` : text;
   return new DatabendError("statement", message, { code, detail, position: positionOf(raw, ctx.sql) });
 }
 

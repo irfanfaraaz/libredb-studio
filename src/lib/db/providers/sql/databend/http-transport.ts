@@ -31,11 +31,13 @@
  *   apart from one unanswered.
  * - The end-open reads the server's flags, never SQL text: an `Active` transaction is rolled back under a new query
  *   id with its links followed inside the same 5 s, and a session still needing keep-alive is logged out, which drops
- *   its temporary tables. A ROLLBACK link answered with a 200 it cannot read was answered, so it is a refused close,
- *   never an unanswered one. The echoed session never leaves `run()`.
+ *   its temporary tables. A ROLLBACK link answered with a 200 it cannot read was answered, and so was a close whose
+ *   answer the node transport refused to read, so each is a refused close, never an unanswered one. The echoed session
+ *   never leaves `run()`.
  * - A cancel before the first answer can miss the statement, so a kill answered 404 is sent again at 250, 500 and
- *   1000 ms; after the first answer a cancel is `cancelled`, and a deadline `timeout`, only when Databend acknowledged
- *   the kill or an answer reported 1043, and otherwise the statement may still finish [X02].
+ *   1000 ms; after the first answer a cancel is `cancelled`, and a user statement's deadline `timeout`, only when
+ *   Databend acknowledged the kill or an answer reported 1043, and otherwise the statement may still finish [X02]; a
+ *   statement Studio sends itself is `timeout` at its deadline whatever the kill answered.
  *
  * Time, sleep, randomness, ids and deadlines are injected deps with production defaults, so no test waits on a real
  * timer [X16]. Every request goes through `createNodeTransport`, the one socket path.
@@ -239,13 +241,26 @@ class StoppedBetweenAttempts extends Error {
 }
 
 /**
- * A 200 a read close (the ROLLBACK and its links) could not read, malformed or past a bound of design 3.12: an answer
- * arrived, so the close was refused, never left unanswered.
+ * An answer a close got and could not read: a 200 a read close (the ROLLBACK and its links) could not read, malformed
+ * or past a bound of design 3.12, or one the node transport refused to read. An answer arrived, so the close was
+ * refused, never left unanswered.
  */
 const UNREADABLE = "unreadable";
 
-/** What one close got: what it was answered, a 200 it could not read, or null when nothing arrived. */
+/** What one close got: what it was answered, an answer it could not read, or null when nothing arrived. */
 type CloseAnswer = Exchanged | typeof UNREADABLE | null;
+
+/** The node transport's failures that come after an answer arrived, which it refused to read. */
+const UNREAD_ANSWER_KINDS: ReadonlySet<TransportError["kind"]> = new Set(["too-large", "encoding", "redirect"]);
+
+/**
+ * Whether a close's failure still proves an answer arrived: a read close's 200 that threw `protocol`, or an answer the
+ * node transport refused to read, past the cap, under another content-encoding, a redirect, or cut short once it began.
+ */
+function answerArrived(error: unknown): boolean {
+  if (error instanceof DatabendError) return true;
+  return error instanceof TransportError && (UNREAD_ANSWER_KINDS.has(error.kind) || error.truncated);
+}
 
 /** A close Databend acknowledged: answered 200, and not with a gateway's refusal over HTTP 200. */
 function acknowledged(answer: CloseAnswer): boolean {
@@ -662,7 +677,7 @@ class StatementRun {
   }
 
   /**
-   * One close under its budget: what it was answered, `UNREADABLE` for a 200 a read close could not read, or null when
+   * One close under its budget: what it was answered, `UNREADABLE` for an answer it could not read, or null when
    * nothing arrived or the run's sign-in was refused, which sends nothing. A refusal of the close is reported to the
    * latch like one of the POST.
    */
@@ -688,10 +703,7 @@ class StatementRun {
       signal: budget.signal,
       endsAt: budget.endsAt,
       read: extra.read ?? false,
-    }).catch(
-      // Only a read close reads its 200 as an answer, which throws `protocol` when it cannot; it still arrived.
-      (error: unknown): CloseAnswer => (error instanceof DatabendError ? UNREADABLE : null),
-    );
+    }).catch((error: unknown): CloseAnswer => (answerArrived(error) ? UNREADABLE : null));
     if (answer !== UNREADABLE && answer?.reading?.kind === "refusal") this.refused(answer.reading.refusal);
     return answer;
   }

@@ -31,7 +31,9 @@ Query, session and node ids become `<query-N>`, `<session-N>` and `<node-N>`, th
 IP addresses become `<ip-N>`, user names `<user-N>` and a Cloud tenant `<tenant>`.
 Locally `<user-1>` is the default user `libredb` and `<user-2>` is `studio_reader`; on Cloud `<user-1>` is `studio`, `<user-2>` is `studio_reader` and `<user-3>` is `studio_scratch`, the user the wrong password is sent for.
 The `x-databend-warehouse` request header shows what each Cloud request named: the tenant's own warehouse becomes `<warehouse>`, while the stock name `default` and the plan's unknown `studio_no_such_wh` are kept as sent, and `no-warehouse` sends none.
-The harness writes nothing at all while any file holds a password or a `user:password`, raw, percent-encoded in either case, form-encoded or in standard or URL-safe base64 with or without padding, the host, the tenant, the warehouse, the region, an email address or the egress IP, decoded base64 included.
+The harness writes nothing at all while any file holds a password or a `user:password`, raw, percent-encoded in either case, form-encoded, in standard or URL-safe base64 with or without padding, or escaped inside a JSON text, the host, the tenant, the warehouse, the region, an email address or the egress IP.
+Keys are read as well as values, and a string that reads as base64, or one of up to 64 KiB that is a JSON text, is read decoded too, up to four layers deep.
+`tests/unit/db/databend/live-environment.test.ts` renders every local capture again through the scrub with the fixture's secrets, so a scrub that a committed capture would fail, or would write differently, fails the suite.
 A warehouse named `default`, Databend Cloud's stock name, is not looked for, since every catalog a capture shows is named so; the host still carries the tenant and the region, and they are.
 An error the harness stops on is printed with the same names replaced, so a DNS or TLS failure does not show the host on the terminal either.
 
