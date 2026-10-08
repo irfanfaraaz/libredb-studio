@@ -12,6 +12,10 @@
  *
  * - a run that never closes, which hides whatever is written inside it;
  * - a form feed, which ends a `--` comment in Databend (`--[^\n\f]*`) and not in the span reader;
+ * - a dollar run tagged other than `$$`: the span reader reads `$a$ ... $a$` as one dollar string, while Databend lexes
+ *   `$a$` as a variable (`\$[_a-zA-Z][_$a-zA-Z0-9]*`) and reads what lies between two of them as code;
+ * - a `$$` run straight after an identifier character: Databend's identifier tail takes `$` (`is_ident_continue`), so
+ *   `a$$` is one name there and what the span reader reads as a dollar string is code;
  * - a code-level `@` stage token holding a backslash: `@([^\s,`;'"()]|\\\s|\\'|\\"|\\\\)+` takes `\'` into the name,
  *   so `@s\'; DROP TABLE t; --'` is a stage, a `;` and a DROP there and one statement here;
  * - a `/*+` hint holding a `;`: Databend tokenizes a hint body where the span reader sees a block comment, and no hint
@@ -25,7 +29,7 @@
  */
 
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
-import { hasUnterminatedSpan, readSqlSpan } from "@/lib/sql/spans";
+import { hasUnterminatedSpan, IDENTIFIER_PART, readSqlSpan } from "@/lib/sql/spans";
 import { countCodeStatements } from "@/lib/sql/statement-splitter";
 
 export const DATABEND_MULTIPLE_STATEMENTS =
@@ -39,6 +43,12 @@ export const DATABEND_UNTERMINATED_SPAN =
 export const DATABEND_FORM_FEED =
   "This text holds a form feed, which ends a -- comment in Databend but not in Studio's reading. Remove it and run again.";
 
+export const DATABEND_TAGGED_DOLLAR =
+  "A dollar-quoted run in this text is tagged ($name$), which Databend reads as a variable and not a quote, so the text between two tags is code there and Studio cannot tell where the statement ends. Use $$ quoting and run again.";
+
+export const DATABEND_IDENTIFIER_DOLLAR =
+  "A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again.";
+
 export const DATABEND_STAGE_BACKSLASH =
   "A stage name (@...) in this text holds a backslash, which Databend reads as part of the name together with the quote after it, so Studio cannot tell where the statement ends. Remove the backslash and run again.";
 
@@ -50,6 +60,9 @@ export const DATABEND_HINT_TOKEN =
 
 const GRAMMAR = resolveSqlGrammar("databend");
 
+/** Databend's only dollar literal; any other tag opens a variable token there. */
+const DOLLAR_LITERAL_OPENER = "$$";
+
 /** The characters that end a stage token, from the lexer's `[^\s,`;'"()]`. */
 const STAGE_END = /[\s,`;'"()]/;
 
@@ -59,6 +72,11 @@ function stageHoldsBackslash(sql: string, index: number): boolean {
     if (sql[i] === "\\") return true;
   }
   return false;
+}
+
+/** Whether the character before `index` continues a Databend identifier, which takes `$` into its tail. */
+function continuesIdentifier(sql: string, index: number): boolean {
+  return index > 0 && (IDENTIFIER_PART.test(sql[index - 1]) || sql[index - 1] === "$");
 }
 
 /** A quoted value with no backslash, which Databend's string token and a plain pairing of quotes end at the same place. */
@@ -82,6 +100,8 @@ function lexerDisagreement(sql: string): string | null {
       i++;
       continue;
     }
+    if (span.kind === "dollar-string" && !sql.startsWith(DOLLAR_LITERAL_OPENER, i)) return DATABEND_TAGGED_DOLLAR;
+    if (span.kind === "dollar-string" && continuesIdentifier(sql, i)) return DATABEND_IDENTIFIER_DOLLAR;
     if (span.kind === "block-comment" && sql.startsWith("/*+", i)) {
       if (sql.slice(i, span.end).includes(";")) return DATABEND_HINT_SEMICOLON;
       if (HINT_RUN_ON.test(sql.slice(i + 3, span.end - 2).replace(HINT_PLAIN_LITERAL, ""))) return DATABEND_HINT_TOKEN;

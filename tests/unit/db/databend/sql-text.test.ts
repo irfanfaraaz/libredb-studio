@@ -3,9 +3,11 @@ import {
   DATABEND_FORM_FEED,
   DATABEND_HINT_SEMICOLON,
   DATABEND_HINT_TOKEN,
+  DATABEND_IDENTIFIER_DOLLAR,
   DATABEND_MULTIPLE_STATEMENTS,
   DATABEND_NO_STATEMENT,
   DATABEND_STAGE_BACKSLASH,
+  DATABEND_TAGGED_DOLLAR,
   DATABEND_UNTERMINATED_SPAN,
   databendStatementRefusal,
 } from "@/lib/db/providers/sql/databend/sql-text";
@@ -44,6 +46,26 @@ describe("databendStatementRefusal", () => {
     ],
     ["a hint holding a -- comment", "/*+ -- */ SELECT 1 AS shown\n*/ SELECT 2 AS hidden", DATABEND_HINT_TOKEN],
     ["a hint holding a nested block comment", "/*+ /* */ SELECT 1 AS shown */ SELECT 2 AS hidden", DATABEND_HINT_TOKEN],
+    // D9-1: Databend lexes `$a$` as a variable (`\$[_a-zA-Z][_$a-zA-Z0-9]*`) and reads what lies between two of them as
+    // code, while Studio reads one dollar string. Measured on v1.2.951 as studio_reader: this text is 1005 "unexpected
+    // `SELECT`" at column 25, the second SELECT, so Databend parsed the `;` and the statement after it as code.
+    [
+      "a tagged dollar run that hides a second statement",
+      "SELECT $a$, 1 AS shown; SELECT 2 AS hidden; -- $a$",
+      DATABEND_TAGGED_DOLLAR,
+    ],
+    ["a tagged dollar run with nothing hidden in it", "SELECT $tag$ x $tag$", DATABEND_TAGGED_DOLLAR],
+    // D6b-1: Databend's identifier tail takes `$` (`is_ident_continue`), so `a$$` is one name there and what Studio reads
+    // as a dollar string is code. Measured on v1.2.951 as studio_reader: `SELECT 1 AS a$$, 2 AS b -- $$` answered the
+    // columns `a$$` and `b`, and `SELECT 1 AS a$$; SELECT 2 AS hidden; -- $$` is 1005 "unexpected `SELECT`" at column 18.
+    [
+      "a $$ run straight after an identifier that hides a second statement",
+      "SELECT 1 AS a$$; SELECT 2 AS hidden; -- $$",
+      DATABEND_IDENTIFIER_DOLLAR,
+    ],
+    ["a $$ run straight after an underscore", "SELECT 1 AS _$$; SELECT 2; -- $$", DATABEND_IDENTIFIER_DOLLAR],
+    ["a $$ run straight after a non-ASCII letter", "SELECT 1 AS é$$; SELECT 2; -- $$", DATABEND_IDENTIFIER_DOLLAR],
+    ["a $$ run straight after a digit in a name", "SELECT 1 AS x9$$, 2 AS b -- $$", DATABEND_IDENTIFIER_DOLLAR],
   ])("refuses %s", (_, sql, sentence) => {
     expect(databendStatementRefusal(sql)).toBe(sentence);
   });
@@ -59,6 +81,13 @@ describe("databendStatementRefusal", () => {
     ["an optimizer hint with no semicolon", "SELECT /*+ SET_VAR(max_threads=1) */ 1"],
     ["an optimizer hint holding a plain quoted value", "SELECT /*+ SET_VAR(timezone='Asia/Shanghai') */ 1"],
     ["a plain comment holding a semicolon", "SELECT /* a; b */ 1"],
+    // D6b-2: a tag that is only mentioned inside a comment, a literal or a $$ string is no code-level dollar run.
+    ["a tag inside a line comment", "SELECT 1 -- $a$ x $a$"],
+    ["a tag inside a block comment", "SELECT 1 /* $a$ */"],
+    ["a tag inside a quoted literal", "SELECT '$a$' AS v"],
+    ["a tag inside a quoted identifier", 'SELECT 1 AS "$a$"'],
+    ["a tag inside a $$ string", "SELECT $$ $a$ $$"],
+    ["a $$ string after a space", "SELECT 1 AS a, $$x$$ AS b"],
   ])("passes %s", (_, sql) => {
     expect(databendStatementRefusal(sql)).toBeNull();
   });

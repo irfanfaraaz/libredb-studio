@@ -133,24 +133,21 @@ export interface DatabendTransport {
  * cancel the server acknowledged), `statement` (an in-body error) and `server` (a non-200 answer before the end). The
  * last five are the node transport's `TransportError` kinds a provider statement surfaces as they are.
  */
-export const DATABEND_ERROR_CATEGORIES = Object.freeze([
-  "auth",
-  "config",
-  "protocol",
-  "unavailable",
-  "outcome-unknown",
-  "timeout",
-  "cancelled",
-  "statement",
-  "server",
-  "network",
-  "tls",
-  "redirect",
-  "encoding",
-  "too-large",
-] as const);
-
-export type DatabendErrorCategory = (typeof DATABEND_ERROR_CATEGORIES)[number];
+export type DatabendErrorCategory =
+  | "auth"
+  | "config"
+  | "protocol"
+  | "unavailable"
+  | "outcome-unknown"
+  | "timeout"
+  | "cancelled"
+  | "statement"
+  | "server"
+  | "network"
+  | "tls"
+  | "redirect"
+  | "encoding"
+  | "too-large";
 
 /** What a failure carries besides its category and sentence, each absent where the failure has none. */
 export interface DatabendErrorDetails {

@@ -1,0 +1,25 @@
+{
+  "target": "local",
+  "studioCommit": "f4cb8c2a7346aaa7451b57665e9b131995532405",
+  "uncommitted": [
+    "tests/live/databend-evidence-plan.ts",
+    "tests/live/databend-evidence.ts"
+  ],
+  "image": "datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b",
+  "serverVersion": "Databend Query v1.2.951-nightly-9b7eeff9a8(rust-1.100.0-nightly-2026-10-04T22:27:10.143409266Z)",
+  "capturedAt": "2026-10-08",
+  "scenarios": [
+    {
+      "name": "insert",
+      "result": "pass",
+      "ms": 35,
+      "exchanges": 2
+    },
+    {
+      "name": "final-kill",
+      "result": "pass",
+      "ms": 9,
+      "exchanges": 4
+    }
+  ]
+}

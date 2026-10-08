@@ -2,22 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { QueryError } from "@/lib/db/errors";
 import { callerBoundTruncationReason, sourceBoundTruncationReason } from "@/lib/db/object-kinds";
 import {
-  DATABEND_CATALOG_LIST_SQL,
-  DATABEND_OBJECT_KINDS,
   DATABEND_OBJECT_SENTENCES,
-  DATABEND_SOURCE_PART_ID,
   DATABEND_SURFACE_ROW_CUT,
   DATABEND_VERSION_SQL,
   countObjects,
-  databendAuthTypeSql,
-  databendBulkColumnsSql,
-  databendColumnsSql,
-  databendDatabaseListSql,
-  databendIndexesSql,
-  databendObjectCountsSql,
-  databendObjectListSql,
-  databendObjectNamesSql,
-  databendSourceSql,
   describeObject,
   describeObjects,
   type DatabendStatementRunner,
@@ -104,85 +92,135 @@ describe("the quoted forms the statements are built from", () => {
   });
 });
 
-describe("the design 5.4 statements, exactly", () => {
+/** Each object kind and its `system.tables.table_type` spelling, in the order the count lists them. */
+const SPELLINGS: Readonly<Record<string, string>> = {
+  table: "BASE TABLE",
+  view: "VIEW",
+  materialized_view: "MATERIALIZED VIEW",
+  dynamic_table: "DYNAMIC TABLE",
+};
+/** The one part id a definition document holds. */
+const SOURCE_PART_ID = "definition";
+
+/** The design 5.4 statements, written out for the names above; the tests below hold each surface to them. */
+const TABLES = `FROM ${C}.system.tables WHERE catalog = ${c} AND database = ${d}`;
+const INTERNAL = " AND name <> '_mv_source_row_id'";
+const SQL = {
+  catalogs: "SELECT name AS catalog_name FROM system.catalogs ORDER BY name",
+  databases: `SELECT name AS database_name FROM ${C}.system.databases WHERE catalog = ${c} AND name NOT IN ('system', 'information_schema') ORDER BY name`,
+  counts:
+    "SELECT kind, count(*) AS object_count FROM (SELECT CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'MATERIALIZED VIEW' THEN 'materialized_view' WHEN 'DYNAMIC TABLE' THEN 'dynamic_table' ELSE concat('unknown:', table_type) END AS kind " +
+    `${TABLES}) AS objects GROUP BY kind`,
+  objects: (kind: string) =>
+    `SELECT name AS object_name, num_rows, data_compressed_size, comment ${TABLES} AND table_type = '${SPELLINGS[kind]}' ORDER BY name`,
+  columns: (catalog: string, internal = "") =>
+    `SELECT name AS column_name, data_type, is_nullable, default_kind, default_expression, comment FROM ${catalog}.system.columns WHERE database = ${d} AND \`table\` = ${o}${internal}`,
+  indexes: `SELECT name AS index_name, \`type\` AS index_type, definition FROM default.system.indexes WHERE database = ${d} AND \`table\` = ${o} ORDER BY name`,
+  names: (kind: string, bound?: number) =>
+    `SELECT name AS object_name ${TABLES} AND table_type = '${SPELLINGS[kind]}' ORDER BY name${bound === undefined ? "" : ` LIMIT ${bound}`}`,
+  bulk: (kind: string, bound?: number, internal = "") =>
+    `SELECT \`table\` AS object_name, name AS column_name, data_type, is_nullable, default_kind, default_expression FROM ${C}.system.columns WHERE database = ${d}${internal} AND \`table\` IN (SELECT name ${TABLES} AND table_type = '${SPELLINGS[kind]}'${bound === undefined ? "" : ` ORDER BY name LIMIT ${bound}`})`,
+};
+
+/** The statements a read sends before its runner refuses the one after `answers`, whether or not the read fails. */
+async function statementsOf(
+  read: (runner: DatabendStatementRunner) => Promise<unknown>,
+  ...answers: StatementOutcome[]
+): Promise<string[]> {
+  const { runner, calls } = scripted(...answers, new Error("no answer scripted"));
+  await read(runner).catch(() => undefined);
+  return calls.map((call) => call.sql);
+}
+
+describe("the design 5.4 statements, exactly, as each surface sends them", () => {
   test("the connect probe", () => {
     expect(DATABEND_VERSION_SQL).toBe("SELECT version() AS server_version");
   });
 
-  test("the no_password caution read [X12]", () => {
-    expect(databendAuthTypeSql("u`'\\")).toBe("SELECT auth_type FROM default.system.users WHERE name = 'u`''\\\\'");
+  test("the no_password caution read [X12]", async () => {
+    expect(await statementsOf((runner) => readNoPasswordCaution(runner, "u`'\\"))).toEqual([
+      "SELECT auth_type FROM default.system.users WHERE name = 'u`''\\\\'",
+    ]);
   });
 
-  test("listContainers at the top and under a catalog", () => {
-    expect(DATABEND_CATALOG_LIST_SQL).toBe("SELECT name AS catalog_name FROM system.catalogs ORDER BY name");
-    expect(databendDatabaseListSql(CATALOG)).toBe(
-      `SELECT name AS database_name FROM ${C}.system.databases WHERE catalog = ${c} AND name NOT IN ('system', 'information_schema') ORDER BY name`,
+  test("listContainers at the top and under a catalog", async () => {
+    expect(await statementsOf(listCatalogs)).toEqual([SQL.catalogs]);
+    expect(await statementsOf((runner) => listDatabases(runner, CATALOG))).toEqual([SQL.databases]);
+  });
+
+  test("countObjects: one statement, the four spellings and an ELSE that keeps the unknown one", async () => {
+    expect(await statementsOf((runner) => countObjects(runner, CONTAINER))).toEqual([SQL.counts]);
+  });
+
+  test("listObjects for each kind's table_type spelling", async () => {
+    const kinds = Object.keys(SPELLINGS);
+    const sent = await Promise.all(kinds.map((kind) => statementsOf((runner) => listObjects(runner, CONTAINER, kind))));
+    expect(sent).toEqual(kinds.map((kind) => [SQL.objects(kind)]));
+  });
+
+  test("an undeclared kind is refused by name, with nothing sent", async () => {
+    const { runner, calls } = scripted();
+    await expect(listObjects(runner, CONTAINER, "stream")).rejects.toThrow(
+      DATABEND_OBJECT_SENTENCES.unknownKind("stream"),
     );
+    expect(calls).toEqual([]);
   });
 
-  test("countObjects: one statement, the four spellings and an ELSE that keeps the unknown one", () => {
-    expect(databendObjectCountsSql(CONTAINER)).toBe(
-      "SELECT kind, count(*) AS object_count FROM (SELECT CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'MATERIALIZED VIEW' THEN 'materialized_view' WHEN 'DYNAMIC TABLE' THEN 'dynamic_table' ELSE concat('unknown:', table_type) END AS kind " +
-        `FROM ${C}.system.tables WHERE catalog = ${c} AND database = ${d}) AS objects GROUP BY kind`,
+  test("describeObject: the columns, and the indexes of the default catalog", async () => {
+    expect(await statementsOf((runner) => describeObject(runner, CONTAINER, "table", OBJECT))).toEqual([
+      SQL.columns(C),
+    ]);
+    const defaults = { catalog: "default", database: DATABASE };
+    expect(
+      await statementsOf(
+        (runner) => describeObject(runner, defaults, "table", OBJECT),
+        outcome(COLUMN_SCHEMA, [["id", "INT", "NO", "", "", ""]]),
+      ),
+    ).toEqual([SQL.columns("`default`"), SQL.indexes]);
+  });
+
+  test("describeObjects keeps the one-statement form L1 and L2 passed [X19], after the names it must describe", async () => {
+    const view = outcome([["object_name", "String"]], [["v"]]);
+    expect(await statementsOf((runner) => describeObjects(runner, CONTAINER, "view"), view)).toEqual([
+      SQL.names("view"),
+      SQL.bulk("view"),
+    ]);
+    expect(await statementsOf((runner) => describeObjects(runner, CONTAINER, "view", 5), view)).toEqual([
+      SQL.names("view", 6),
+      SQL.bulk("view", 6),
+    ]);
+  });
+
+  test("a materialized view's internal _mv_source_row_id column is not described; a table's column of that name is", async () => {
+    const one = outcome([["object_name", "String"]], [["m"]]);
+    expect(await statementsOf((runner) => describeObject(runner, CONTAINER, "materialized_view", OBJECT))).toEqual([
+      SQL.columns(C, INTERNAL),
+    ]);
+    expect(await statementsOf((runner) => describeObjects(runner, CONTAINER, "materialized_view", 2), one)).toEqual([
+      SQL.names("materialized_view", 3),
+      SQL.bulk("materialized_view", 3, INTERNAL),
+    ]);
+    expect(SQL.columns(C)).not.toContain(INTERNAL);
+    expect(SQL.bulk("table")).not.toContain(INTERNAL);
+  });
+
+  test("readObjectSource: SHOW CREATE TABLE WITH QUOTED_IDENTIFIERS, and SHOW CREATE MATERIALIZED VIEW (L6)", async () => {
+    const kinds = ["table", "view", "dynamic_table"];
+    const sent = await Promise.all(
+      kinds.map((kind) => statementsOf((runner) => readObjectSource(runner, CONTAINER, kind, OBJECT))),
     );
-  });
-
-  test("listObjects for each kind's table_type spelling", () => {
-    const spellings: Record<string, string> = {
-      table: "BASE TABLE",
-      view: "VIEW",
-      materialized_view: "MATERIALIZED VIEW",
-      dynamic_table: "DYNAMIC TABLE",
-    };
-    expect([...DATABEND_OBJECT_KINDS]).toEqual(Object.keys(spellings));
-    for (const [kind, spelling] of Object.entries(spellings)) {
-      expect(databendObjectListSql(CONTAINER, kind)).toBe(
-        `SELECT name AS object_name, num_rows, data_compressed_size, comment FROM ${C}.system.tables WHERE catalog = ${c} AND database = ${d} AND table_type = '${spelling}' ORDER BY name`,
-      );
-    }
-  });
-
-  test("an undeclared kind is refused by name", () => {
-    expect(() => databendObjectListSql(CONTAINER, "stream")).toThrow(DATABEND_OBJECT_SENTENCES.unknownKind("stream"));
-  });
-
-  test("describeObject: the columns, and the indexes of the default catalog", () => {
-    expect(databendColumnsSql(CONTAINER, "table", OBJECT)).toBe(
-      `SELECT name AS column_name, data_type, is_nullable, default_kind, default_expression, comment FROM ${C}.system.columns WHERE database = ${d} AND \`table\` = ${o}`,
-    );
-    expect(databendIndexesSql(DATABASE, OBJECT)).toBe(
-      `SELECT name AS index_name, \`type\` AS index_type, definition FROM default.system.indexes WHERE database = ${d} AND \`table\` = ${o} ORDER BY name`,
-    );
-  });
-
-  test("describeObjects keeps the one-statement form L1 and L2 passed [X19], after the names it must describe", () => {
-    const head = `SELECT \`table\` AS object_name, name AS column_name, data_type, is_nullable, default_kind, default_expression FROM ${C}.system.columns WHERE database = ${d} AND \`table\` IN (SELECT name FROM ${C}.system.tables WHERE catalog = ${c} AND database = ${d} AND table_type = 'VIEW'`;
-    expect(databendBulkColumnsSql(CONTAINER, "view")).toBe(`${head})`);
-    expect(databendBulkColumnsSql(CONTAINER, "view", 6)).toBe(`${head} ORDER BY name LIMIT 6)`);
-    const names = `SELECT name AS object_name FROM ${C}.system.tables WHERE catalog = ${c} AND database = ${d} AND table_type = 'VIEW' ORDER BY name`;
-    expect(databendObjectNamesSql(CONTAINER, "view")).toBe(names);
-    expect(databendObjectNamesSql(CONTAINER, "view", 6)).toBe(`${names} LIMIT 6`);
-  });
-
-  test("a materialized view's internal _mv_source_row_id column is not described; a table's column of that name is", () => {
-    const internal = "AND name <> '_mv_source_row_id'";
-    expect(databendColumnsSql(CONTAINER, "materialized_view", OBJECT)).toContain(`AND \`table\` = ${o} ${internal}`);
-    expect(databendBulkColumnsSql(CONTAINER, "materialized_view", 3)).toContain(
-      `WHERE database = ${d} ${internal} AND`,
-    );
-    expect(databendColumnsSql(CONTAINER, "table", OBJECT)).not.toContain(internal);
-    expect(databendBulkColumnsSql(CONTAINER, "table")).not.toContain(internal);
-  });
-
-  test("readObjectSource: SHOW CREATE TABLE WITH QUOTED_IDENTIFIERS, and SHOW CREATE MATERIALIZED VIEW (L6)", () => {
-    for (const kind of ["table", "view", "dynamic_table"]) {
-      expect(databendSourceSql(CONTAINER, kind, OBJECT)).toBe(
-        `SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`,
-      );
-    }
-    expect(databendSourceSql(CONTAINER, "materialized_view", OBJECT)).toBe(
+    expect(sent).toEqual(kinds.map(() => [`SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`]));
+    expect(await statementsOf((runner) => readObjectSource(runner, CONTAINER, "materialized_view", OBJECT))).toEqual([
       `SHOW CREATE MATERIALIZED VIEW ${C}.${D}.${O}`,
+    ]);
+  });
+
+  test("readObjectSource refuses an undeclared kind by name, with nothing sent", async () => {
+    const { runner, calls } = scripted();
+    await expect(readObjectSource(runner, CONTAINER, "stream", OBJECT)).rejects.toThrow(
+      DATABEND_OBJECT_SENTENCES.unknownKind("stream"),
     );
+    expect(calls).toEqual([]);
   });
 });
 
@@ -190,7 +228,9 @@ describe("the no_password caution [X12]", () => {
   test("a no_password user gets the caution sentence", async () => {
     const { runner, calls } = scripted(outcome([["auth_type", "String"]], [["no_password"]]));
     expect(await readNoPasswordCaution(runner, "np")).toBe(DATABEND_OBJECT_SENTENCES.noPassword("np"));
-    expect(calls).toEqual([{ sql: databendAuthTypeSql("np"), rowCut: DATABEND_SURFACE_ROW_CUT }]);
+    expect(calls).toEqual([
+      { sql: "SELECT auth_type FROM default.system.users WHERE name = 'np'", rowCut: DATABEND_SURFACE_ROW_CUT },
+    ]);
   });
 
   test("a password user, a missing row and a failed read are all no caution", async () => {
@@ -210,7 +250,7 @@ describe("containers", () => {
       { path: ["default"], name: "default", level: 0, isSessionDefault: true },
       { path: ["iceberg"], name: "iceberg", level: 0, isSessionDefault: false },
     ]);
-    expect(calls[0].sql).toBe(DATABEND_CATALOG_LIST_SQL);
+    expect(calls[0].sql).toBe(SQL.catalogs);
   });
 
   test("databases are level 1 under their catalog, and the connection's database is the session default", async () => {
@@ -219,7 +259,7 @@ describe("containers", () => {
       { path: [CATALOG, "a"], name: "a", level: 1, isSessionDefault: false },
       { path: [CATALOG, "b"], name: "b", level: 1, isSessionDefault: true },
     ]);
-    expect(calls[0].sql).toBe(databendDatabaseListSql(CATALOG));
+    expect(calls[0].sql).toBe(SQL.databases);
   });
 
   test("a cut container list is refused, never handed over as complete", async () => {
@@ -251,7 +291,7 @@ describe("countObjects", () => {
       materialized_view: { count: 1 },
       dynamic_table: { count: 0 },
     });
-    expect(calls[0].sql).toBe(databendObjectCountsSql(CONTAINER));
+    expect(calls[0].sql).toBe(SQL.counts);
   });
 
   test("an unknown table_type is raised by name, never dropped", async () => {
@@ -289,7 +329,7 @@ describe("listObjects", () => {
       { path: [CATALOG, DATABASE, "every_type"], name: "every_type", kind: "view", rowCount: 4, sizeBytes: 6127 },
       { path: [CATALOG, DATABASE, OBJECT], name: OBJECT, kind: "view" },
     ]);
-    expect(calls).toEqual([{ sql: databendObjectListSql(CONTAINER, "view"), rowCut: DATABEND_SURFACE_ROW_CUT }]);
+    expect(calls).toEqual([{ sql: SQL.objects("view"), rowCut: DATABEND_SURFACE_ROW_CUT }]);
   });
 
   test("a NULL num_rows is undefined, not zero", async () => {
@@ -348,8 +388,8 @@ describe("describeObject", () => {
       foreignKeys: [],
     });
     expect(calls).toEqual([
-      { sql: databendColumnsSql(container, "table", OBJECT), rowCut: DATABEND_SURFACE_ROW_CUT },
-      { sql: databendIndexesSql(DATABASE, OBJECT), rowCut: DATABEND_SURFACE_ROW_CUT },
+      { sql: SQL.columns("`default`"), rowCut: DATABEND_SURFACE_ROW_CUT },
+      { sql: SQL.indexes, rowCut: DATABEND_SURFACE_ROW_CUT },
     ]);
   });
 
@@ -418,8 +458,8 @@ describe("describeObjects", () => {
       ],
     });
     expect(calls).toEqual([
-      { sql: databendObjectNamesSql(CONTAINER, "table"), rowCut: DATABEND_SURFACE_ROW_CUT },
-      { sql: databendBulkColumnsSql(CONTAINER, "table"), rowCut: DATABEND_SURFACE_ROW_CUT },
+      { sql: SQL.names("table"), rowCut: DATABEND_SURFACE_ROW_CUT },
+      { sql: SQL.bulk("table"), rowCut: DATABEND_SURFACE_ROW_CUT },
     ]);
   });
 
@@ -428,10 +468,7 @@ describe("describeObjects", () => {
     const batch = await describeObjects(runner, CONTAINER, "table", 2);
     expect(batch.details.map((detail) => detail.path[2])).toEqual(["a", "b"]);
     expect(batch.truncated).toEqual({ limit: 2, reason: callerBoundTruncationReason(2) });
-    expect(calls.map((call) => call.sql)).toEqual([
-      databendObjectNamesSql(CONTAINER, "table", 3),
-      databendBulkColumnsSql(CONTAINER, "table", 3),
-    ]);
+    expect(calls.map((call) => call.sql)).toEqual([SQL.names("table", 3), SQL.bulk("table", 3)]);
   });
 
   test("a limit the kind fits under is not truncated", async () => {
@@ -494,7 +531,7 @@ describe("readObjectSource", () => {
       kind: "table",
       parts: [
         {
-          id: DATABEND_SOURCE_PART_ID,
+          id: SOURCE_PART_ID,
           label: DATABEND_OBJECT_SENTENCES.sourceLabel,
           text: DDL,
           language: "sql",
@@ -503,7 +540,7 @@ describe("readObjectSource", () => {
         },
       ],
     });
-    expect(calls[0].sql).toBe(databendSourceSql(CONTAINER, "table", OBJECT));
+    expect(calls[0].sql).toBe(`SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`);
   });
 
   test("a caller's bound marks the part", async () => {
@@ -527,7 +564,7 @@ describe("readObjectSource", () => {
       const { runner } = scripted(outcome(SOURCE_SCHEMA, rows));
       const [part] = (await readObjectSource(runner, CONTAINER, "view", OBJECT)).parts;
       expect(part).toEqual({
-        id: DATABEND_SOURCE_PART_ID,
+        id: SOURCE_PART_ID,
         label: DATABEND_OBJECT_SENTENCES.sourceLabel,
         unavailable: DATABEND_OBJECT_SENTENCES.noDefinition,
       });

@@ -1,35 +1,41 @@
 import { describe, expect, test } from "bun:test";
 import {
-  DATABEND_ERROR_CATEGORIES,
   DatabendError,
+  type DatabendErrorCategory,
   type DatabendTransport,
   type StatementOutcome,
   type StatementRequest,
 } from "@/lib/db/providers/sql/databend/transport";
 
+/** The nine categories of design 3.13 and the five transport kinds a provider statement surfaces. */
+const CATEGORIES = [
+  "auth",
+  "config",
+  "protocol",
+  "unavailable",
+  "outcome-unknown",
+  "timeout",
+  "cancelled",
+  "statement",
+  "server",
+  "network",
+  "tls",
+  "redirect",
+  "encoding",
+  "too-large",
+] as const satisfies readonly DatabendErrorCategory[];
+
 describe("DatabendError", () => {
-  test("the category union is closed: the nine of design 3.13 and the five transport kinds a provider statement surfaces", () => {
-    expect([...DATABEND_ERROR_CATEGORIES]).toEqual([
-      "auth",
-      "config",
-      "protocol",
-      "unavailable",
-      "outcome-unknown",
-      "timeout",
-      "cancelled",
-      "statement",
-      "server",
-      "network",
-      "tls",
-      "redirect",
-      "encoding",
-      "too-large",
-    ]);
-    expect(Object.isFrozen(DATABEND_ERROR_CATEGORIES)).toBe(true);
+  test("the category union is closed: the list above names every member, which the typecheck holds", () => {
+    // A member the list leaves out makes `Unlisted` that member, and this assignment a type error.
+    type Unlisted = Exclude<DatabendErrorCategory, (typeof CATEGORIES)[number]>;
+    const closed: [Unlisted] extends [never] ? true : false = true;
+    expect(closed).toBe(true);
+    expect(new Set(CATEGORIES).size).toBe(14);
   });
 
   test("carries exactly one category of its closed union, and the message it was given", () => {
-    for (const category of DATABEND_ERROR_CATEGORIES) {
+    for (const category of CATEGORIES) {
       const error = new DatabendError(category, `sentence for ${category}`);
       expect(error).toBeInstanceOf(Error);
       expect(error).toBeInstanceOf(DatabendError);

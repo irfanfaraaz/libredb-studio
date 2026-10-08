@@ -61,3 +61,32 @@ docker compose -f database-compose.yml rm -sf databend-http databend-http-seed
 | user `studio_reader` | Password `Reader123pass!`, a fixed test value; holds `studio_ro` as its default role and no other grant (the `public` role every Databend user has aside), the least-privilege user agent plan mode needs, since it refuses a superuser |
 
 The only writers of this server are `seed.sh` and `tests/live/databend-live-check.ts`, which writes only to `studio_demo` and `libredb_demo`; `tests/unit/db/databend/live-environment.test.ts` holds both rules, and the evidence harness creates nothing but temporary tables that end with their session.
+
+## The live check
+
+`tests/live/databend-live-check.ts` runs scenarios S1 to S16 and S3b of the delivery plan through a real `DatabendProvider`, reads every pinned session setting back from the server's echo, and replays the every-type table through Studio's SQL INSERT export.
+Run it from the repository root with the fixture up and seeded:
+
+```sh
+bun tests/live/databend-live-check.ts --target local
+```
+
+Besides the tables and views it creates and drops in `studio_demo`, it creates the user `studio_scratch` under the password policy `studio_scratch_policy` for its one wrong password, and drops both before S7 ends, so no lockout can reach `libredb` or `studio_reader`.
+
+The floor build runs the same check on another port, by digest, and is removed by name afterwards:
+
+```sh
+DATABEND_PASSWORD='Probe123pass!'
+docker run -d --name databend-881 --memory 2g -p 127.0.0.1:18009:8000 \
+  -e QUERY_DEFAULT_USER=libredb -e QUERY_DEFAULT_PASSWORD="$DATABEND_PASSWORD" -e QUERY_STORAGE_TYPE=fs \
+  datafuselabs/databend:v1.2.881@sha256:847b20b0cfbadaa8dd87fc5c023db1d07042e9be6231dfc8303e75feefd94bf8
+P="$(mktemp -d)"
+cp docker/databend/seed.sh "$P/"
+grep -v 'MATERIALIZED VIEW' docker/databend/fixture.jsonl >"$P/fixture.jsonl"
+sh "$P/seed.sh" http://127.0.0.1:18009
+bun tests/live/databend-live-check.ts --target v1.2.881
+docker rm -f databend-881
+```
+
+v1.2.881 has no materialized views: `seed.sh` stops at the `DROP MATERIALIZED VIEW` line with 1005, so that build is seeded from a copy of `fixture.jsonl` without its two materialized-view lines, as above.
+The check skips the materialized-view scenario there.

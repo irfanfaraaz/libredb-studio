@@ -74,7 +74,7 @@ const TABLE_TYPES: Readonly<Record<string, string>> = {
 };
 
 /** The object kinds this surface reads, in declaration order. */
-export const DATABEND_OBJECT_KINDS = Object.freeze(Object.keys(TABLE_TYPES));
+const DATABEND_OBJECT_KINDS = Object.freeze(Object.keys(TABLE_TYPES));
 
 /** The kind read through `SHOW CREATE MATERIALIZED VIEW`; every other kind is read through `SHOW CREATE TABLE`. */
 const MATERIALIZED_VIEW_KIND = "materialized_view";
@@ -89,7 +89,7 @@ const MATERIALIZED_VIEW_INTERNAL_COLUMN = "_mv_source_row_id";
 const SOURCE_COLUMN = "Create Table";
 
 /** The one part a definition document holds. */
-export const DATABEND_SOURCE_PART_ID = "definition";
+const DATABEND_SOURCE_PART_ID = "definition";
 
 const BOUND_UNITS: Readonly<Record<DatabendTruncation["bound"], string>> = {
   rows: "rows",
@@ -148,24 +148,24 @@ function tablesIn(container: DatabendContainer): string {
 export const DATABEND_VERSION_SQL = "SELECT version() AS server_version";
 
 /** The best-effort read behind the `no_password` caution [X12]: `system.users` needs no grant for one's own row (UC2). */
-export function databendAuthTypeSql(user: string): string {
+function databendAuthTypeSql(user: string): string {
   return `SELECT auth_type FROM default.system.users WHERE name = ${literal(user)}`;
 }
 
-export const DATABEND_CATALOG_LIST_SQL = "SELECT name AS catalog_name FROM system.catalogs ORDER BY name";
+const DATABEND_CATALOG_LIST_SQL = "SELECT name AS catalog_name FROM system.catalogs ORDER BY name";
 
 /** One catalog's databases, without the two every catalog generates. */
-export function databendDatabaseListSql(catalog: string): string {
+function databendDatabaseListSql(catalog: string): string {
   return `SELECT name AS database_name FROM ${ident(catalog)}.system.databases WHERE catalog = ${literal(catalog)} AND name NOT IN ('system', 'information_schema') ORDER BY name`;
 }
 
 /** Every kind's count in one statement; projecting only `table_type` keeps the statistics off. */
-export function databendObjectCountsSql(container: DatabendContainer): string {
+function databendObjectCountsSql(container: DatabendContainer): string {
   const arms = Object.entries(TABLE_TYPES).map(([kind, spelling]) => `WHEN ${literal(spelling)} THEN ${literal(kind)}`);
   return `SELECT kind, count(*) AS object_count FROM (SELECT CASE table_type ${arms.join(" ")} ELSE concat('${UNKNOWN_KIND_PREFIX}', table_type) END AS kind ${tablesIn(container)}) AS objects GROUP BY kind`;
 }
 
-export function databendObjectListSql(container: DatabendContainer, kind: string): string {
+function databendObjectListSql(container: DatabendContainer, kind: string): string {
   return `SELECT name AS object_name, num_rows, data_compressed_size, comment ${tablesIn(container)} AND table_type = ${literal(tableTypeOf(kind))} ORDER BY name`;
 }
 
@@ -175,12 +175,12 @@ function internalColumnFilter(kind: string): string {
 }
 
 /** One object's columns; no ORDER BY, since the rows come in declared order (L1). */
-export function databendColumnsSql(container: DatabendContainer, kind: string, object: string): string {
+function databendColumnsSql(container: DatabendContainer, kind: string, object: string): string {
   return `SELECT name AS column_name, data_type, is_nullable, default_kind, default_expression, comment FROM ${ident(container.catalog)}.system.columns WHERE database = ${literal(container.database)} AND \`table\` = ${literal(object)}${internalColumnFilter(kind)}`;
 }
 
 /** One object's search indexes, which `default.system.indexes` holds for the default catalog only. */
-export function databendIndexesSql(database: string, object: string): string {
+function databendIndexesSql(database: string, object: string): string {
   return `SELECT name AS index_name, \`type\` AS index_type, definition FROM default.system.indexes WHERE database = ${literal(database)} AND \`table\` = ${literal(object)} ORDER BY name`;
 }
 
@@ -188,18 +188,18 @@ export function databendIndexesSql(database: string, object: string): string {
  * Every object's columns for one kind in one statement [03 7.1], bounded by `bound` objects in name order when given.
  * The bound is interpolated: the caller's value is a checked positive whole number.
  */
-export function databendBulkColumnsSql(container: DatabendContainer, kind: string, bound?: number): string {
+function databendBulkColumnsSql(container: DatabendContainer, kind: string, bound?: number): string {
   const order = bound === undefined ? "" : ` ORDER BY name LIMIT ${bound}`;
   return `SELECT \`table\` AS object_name, name AS column_name, data_type, is_nullable, default_kind, default_expression FROM ${ident(container.catalog)}.system.columns WHERE database = ${literal(container.database)}${internalColumnFilter(kind)} AND \`table\` IN (SELECT name ${tablesIn(container)} AND table_type = ${literal(tableTypeOf(kind))}${order})`;
 }
 
 /** The names the bulk column read must describe, in its subquery's order and bound. */
-export function databendObjectNamesSql(container: DatabendContainer, kind: string, bound?: number): string {
+function databendObjectNamesSql(container: DatabendContainer, kind: string, bound?: number): string {
   const cap = bound === undefined ? "" : ` LIMIT ${bound}`;
   return `SELECT name AS object_name ${tablesIn(container)} AND table_type = ${literal(tableTypeOf(kind))} ORDER BY name${cap}`;
 }
 
-export function databendSourceSql(container: DatabendContainer, kind: string, object: string): string {
+function databendSourceSql(container: DatabendContainer, kind: string, object: string): string {
   tableTypeOf(kind);
   const name = `${ident(container.catalog)}.${ident(container.database)}.${ident(object)}`;
   return kind === MATERIALIZED_VIEW_KIND

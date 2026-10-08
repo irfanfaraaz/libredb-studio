@@ -16,11 +16,11 @@
  * 7. A value is imported from outside this directory only from `@/lib/db/http/*`, `@/lib/db/errors`,
  *    `@/lib/db/utils/*`, `@/lib/sql/*`, `@/lib/types`, the base classes, `@/lib/db/object-kinds`, `tunnelRoute` of
  *    `@/lib/db/connection-fingerprint`, `@/lib/app-version` (I15) and the runtime's `node:crypto`; types are free.
- * 8. Every value export has an importer under `src/` other than its own file, so nothing is exported only for a test
- *    [12 #15]. A sentence a person reads is exported for the provider doc to quote, so an export whose initializer is
- *    a string, or whose name ends in `_SENTENCES`, is exempt; a type is part of the contract of the values that use
- *    it, so only values are held. The exports that broke the rule when it landed are named in `UNIMPORTED_AT_D12`,
- *    each one a defect to remove rather than a permission, and the list may only shrink.
+ * 8. Every value export has an importer other than its own file, so nothing is exported only for a test [12 #15].
+ *    An importer is a module under `src/`, or `tests/unit/db/databend/provider-doc.test.ts`, which reads back what
+ *    `docs/providers/databend.md` quotes (design section 10); no other test file counts. The doc test reaches only
+ *    the names it imports, so a namespace import of it reaches none. A type is part of the contract of the values
+ *    that use it, so only values are held.
  *
  * Rules 1 and 2 count a type-only import too: they keep modules apart, not values. Module names are resolved as
  * TypeScript resolves them, so an alias counts; a planted module that does not exist yet resolves by its spelling.
@@ -240,14 +240,9 @@ interface Exported {
   readonly name: string;
   /** An interface or a type alias, which rule 8 does not hold. */
   readonly type: boolean;
-  /** A sentence a person reads: a string initializer, or a name ending in `_SENTENCES`. */
-  readonly sentence: boolean;
 }
 
-/**
- * The names a module exports, with whether each is a sentence (rule 8): each declaration, and each name of a local
- * `export { ... }` read as the declaration it names.
- */
+/** The names a module exports (rule 8): each declaration, and each name of a local `export { ... }`. */
 function exportsOf(file: string, text: string): Exported[] {
   const declared = new Map(declarationsOf(file, text, false).map((entry) => [entry.name, entry]));
   const found = declarationsOf(file, text, true);
@@ -257,13 +252,13 @@ function exportsOf(file: string, text: string): Exported[] {
     for (const element of statement.exportClause.elements) {
       const local = declared.get((element.propertyName ?? element.name).getText());
       const type = statement.isTypeOnly || element.isTypeOnly || local?.type === true;
-      found.push({ name: element.name.getText(), type, sentence: local?.sentence === true });
+      found.push({ name: element.name.getText(), type });
     }
   }
   return found;
 }
 
-/** The top-level declarations of a module, the exported ones or every one, with whether each is a sentence. */
+/** The top-level declarations of a module, the exported ones or every one. */
 function declarationsOf(file: string, text: string, exportedOnly: boolean): Exported[] {
   const found: Exported[] = [];
   const exported = (node: ts.Node) =>
@@ -272,12 +267,7 @@ function declarationsOf(file: string, text: string, exportedOnly: boolean): Expo
     if (exportedOnly && !exported(statement)) continue;
     if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
-        const init = declaration.initializer;
-        const sentence =
-          init !== undefined &&
-          (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init) || ts.isTemplateExpression(init));
-        const name = declaration.name.getText();
-        found.push({ name, type: false, sentence: sentence || name.endsWith("_SENTENCES") });
+        found.push({ name: declaration.name.getText(), type: false });
       }
     } else if (
       (ts.isFunctionDeclaration(statement) ||
@@ -288,38 +278,48 @@ function declarationsOf(file: string, text: string, exportedOnly: boolean): Expo
       statement.name !== undefined
     ) {
       const type = ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement);
-      found.push({ name: statement.name.text, type, sentence: false });
+      found.push({ name: statement.name.text, type });
     }
   }
   return found;
 }
 
-/** Every `.ts` and `.tsx` file under `src/` whose text names `databend`, the only ones that can import from here. */
-function importersUnderSrc(): { file: string; text: string }[] {
+/** The one test file whose imports count for rule 8: it reads back what the provider doc quotes. */
+const DOC_TEST = "tests/unit/db/databend/provider-doc.test.ts";
+
+interface Importer {
+  readonly file: string;
+  readonly text: string;
+}
+
+/**
+ * The importers rule 8 counts: every `.ts` and `.tsx` file of this directory, every other one under `src/` whose text
+ * names `databend` (the only ones that can import from here), and the provider doc test.
+ */
+function importers(): Importer[] {
   const walk = (dir: string): string[] =>
     readdirSync(join(ROOT, dir), { withFileTypes: true }).flatMap((entry) => {
       const path = `${dir}/${entry.name}`;
       if (entry.isDirectory()) return walk(path);
       return /\.tsx?$/.test(entry.name) ? [path] : [];
     });
-  return walk("src")
+  return [...walk("src"), DOC_TEST]
     .map((file) => ({ file, text: readFileSync(join(ROOT, file), "utf8") }))
-    .filter(({ text }) => text.includes("databend"));
+    .filter(({ file, text }) => inDirectory(file) || text.includes("databend"));
 }
 
-/** Every value export of this directory that no other file under `src/` imports, and that is no sentence (rule 8). */
-function unimportedExports(
-  sources: readonly { file: string; text: string }[],
-  pending: ReadonlySet<string> = UNIMPORTED_AT_D12,
-): string[] {
+/** Every value export of this directory that no reader under `src/`, and not the doc test, imports (rule 8). */
+function unimportedExports(sources: readonly Importer[], readers: readonly Importer[] = importers()): string[] {
   const reached = new Map<string, Set<string>>();
-  for (const { file, text } of importersUnderSrc()) {
+  for (const { file, text } of readers) {
+    if (!file.startsWith("src/") && file !== DOC_TEST) continue;
     for (const reference of references(file, text)) {
       if (reference.specifier === undefined) continue;
       const target = resolved(reference.specifier, file);
       if (!inDirectory(target) || target === file) continue;
       const names = reached.get(target) ?? new Set<string>();
-      for (const name of reference.reaches) names.add(name);
+      // The doc test is held to the names it reads: a namespace import of it would admit every export unread.
+      for (const name of reference.reaches) if (file !== DOC_TEST || name !== "*") names.add(name);
       reached.set(target, names);
     }
   }
@@ -327,52 +327,10 @@ function unimportedExports(
     const names = reached.get(file) ?? new Set<string>();
     if (names.has("*")) return [];
     return exportsOf(file, text)
-      .filter((entry) => !entry.type && !entry.sentence && !names.has(entry.name))
-      .filter((entry) => !pending.has(`${posix.basename(file)} ${entry.name}`))
-      .map((entry) => `rule 8: ${file} exports ${entry.name}, which nothing under src/ imports`);
+      .filter((entry) => !entry.type && !names.has(entry.name))
+      .map((entry) => `rule 8: ${file} exports ${entry.name}, which nothing under src/ or the doc test imports`);
   });
 }
-
-/**
- * The value exports of the wave D-1 modules that nothing under `src/` imported when rule 8 landed (task D12): bounds,
- * statement builders and tables their own tests read. Each is a defect against design 2.5 to resolve by dropping the
- * `export` (the test then reads the behaviour through the module's real entry) or by a reader under `src/`; the
- * staleness test below fails once an entry is fixed, so the list shrinks with the fix.
- */
-const UNIMPORTED_AT_D12: ReadonlySet<string> = new Set([
-  "auth-latch.ts AUTH_LATCH_MAX_ENTRIES",
-  "auth-latch.ts AUTH_LATCH_TTL_MS",
-  "auth-latch.ts createAuthLatch",
-  "connection-options.ts DATABEND_CELL_BUDGET",
-  "connection-options.ts DATABEND_CLOSE_TIMEOUT_MS",
-  "connection-options.ts DATABEND_MAX_SOCKETS",
-  "connection-options.ts DATABEND_REQUEST_HEADER_NAMES",
-  "connection-options.ts DATABEND_RESPONSE_CAP_BYTES",
-  "connection-options.ts DATABEND_STATEMENT_BYTES",
-  "connection-options.ts DATABEND_SURFACE_TIMEOUT_MS",
-  "introspect.ts DATABEND_DEFAULT_SESSION_LIMIT",
-  "introspect.ts DATABEND_DEFAULT_SLOW_QUERY_LIMIT",
-  "introspect.ts DATABEND_DEGRADE_CODES",
-  "introspect.ts DATABEND_KILL_ID_PATTERN",
-  "introspect.ts DATABEND_MAX_MONITORING_LIMIT",
-  "introspect.ts clampMonitoringLimit",
-  "introspect.ts databendIndexStatsSql",
-  "introspect.ts databendKillSql",
-  "introspect.ts databendSessionsSql",
-  "introspect.ts databendSlowQueriesSql",
-  "introspect.ts databendTableStatsSql",
-  "objects.ts DATABEND_OBJECT_KINDS",
-  "objects.ts databendAuthTypeSql",
-  "objects.ts databendBulkColumnsSql",
-  "objects.ts databendColumnsSql",
-  "objects.ts databendDatabaseListSql",
-  "objects.ts databendIndexesSql",
-  "objects.ts databendObjectCountsSql",
-  "objects.ts databendObjectListSql",
-  "objects.ts databendObjectNamesSql",
-  "objects.ts databendSourceSql",
-  "transport.ts DATABEND_ERROR_CATEGORIES",
-]);
 
 const read = (file: string): string => readFileSync(join(ROOT, file), "utf8");
 const SOURCES = readdirSync(join(ROOT, DIR))
@@ -385,16 +343,8 @@ describe("the Databend directory holds its seams", () => {
     expect(SOURCES.flatMap((file) => seamFindings(file, read(file)))).toEqual([]);
   });
 
-  test("every value export has an importer under src/ (rule 8)", () => {
+  test("every value export has an importer under src/ or the doc test (rule 8)", () => {
     expect(unimportedExports(SOURCES.map((file) => ({ file, text: read(file) })))).toEqual([]);
-  });
-
-  test("every entry of UNIMPORTED_AT_D12 is still an unimported value export, so a fixed one leaves the list", () => {
-    const unimported = unimportedExports(
-      SOURCES.map((file) => ({ file, text: read(file) })),
-      new Set(),
-    ).map((finding) => finding.replace(/^rule 8: .*\/([a-z-]+\.ts) exports (\w+),.*$/, "$1 $2"));
-    expect([...UNIMPORTED_AT_D12].filter((entry) => !unimported.includes(entry))).toEqual([]);
   });
 
   test("the detector reads real code", () => {
@@ -415,8 +365,12 @@ describe("the Databend directory holds its seams", () => {
     expect(exportsOf(`${DIR}/sql-text.ts`, read(`${DIR}/sql-text.ts`))).toContainEqual({
       name: "DATABEND_MULTIPLE_STATEMENTS",
       type: false,
-      sentence: true,
     });
+    const readers = importers().map((importer) => importer.file);
+    expect(readers).toContain(DOC_TEST);
+    // A file of this directory counts though its text never spells the name in lower case.
+    expect(read(`${DIR}/auth-latch.ts`)).not.toContain("databend");
+    expect(readers).toContain(`${DIR}/auth-latch.ts`);
   });
 });
 
@@ -571,31 +525,71 @@ describe("planted violations fail by name", () => {
 
 describe("rule 8 fails by name", () => {
   const sources = (file: string, extra: string) => [{ file: `${DIR}/${file}`, text: read(`${DIR}/${file}`) + extra }];
-
-  test("an export nothing under src/ imports fails", () => {
-    expect(
-      unimportedExports(sources("decode.ts", "\nexport function onlyForATest(): number {\n  return 1;\n}\n")),
-    ).toEqual([`rule 8: ${DIR}/decode.ts exports onlyForATest, which nothing under src/ imports`]);
+  const finding = (file: string, name: string) =>
+    `rule 8: ${DIR}/${file} exports ${name}, which nothing under src/ or the doc test imports`;
+  const ONLY_FOR_A_TEST = "\nexport function onlyForATest(): number {\n  return 1;\n}\n";
+  const readerOf = (file: string) => ({
+    file,
+    text: 'import { onlyForATest } from "@/lib/db/providers/sql/databend/decode";\n',
   });
 
-  test("an export by name and an enum nothing under src/ imports fail", () => {
+  test("an export nothing imports fails", () => {
+    expect(unimportedExports(sources("decode.ts", ONLY_FOR_A_TEST))).toEqual([finding("decode.ts", "onlyForATest")]);
+  });
+
+  test("an export by name and an enum nothing imports fail", () => {
     const extra =
       "\nfunction exportedLater(): number {\n  return 1;\n}\nexport { exportedLater };\nexport enum Probe {\n  A,\n}\n";
     expect(unimportedExports(sources("decode.ts", extra))).toEqual([
-      `rule 8: ${DIR}/decode.ts exports Probe, which nothing under src/ imports`,
-      `rule 8: ${DIR}/decode.ts exports exportedLater, which nothing under src/ imports`,
+      finding("decode.ts", "Probe"),
+      finding("decode.ts", "exportedLater"),
     ]);
   });
 
-  test("a sentence, a frozen sentence table and a type pass without an importer", () => {
-    const exempt =
-      '\nexport const DATABEND_UNREAD = "A sentence the doc quotes.";\nexport const DATABEND_TABLE_SENTENCES = Object.freeze({});\nexport interface Unread {\n  readonly a: number;\n}\n';
-    expect(unimportedExports(sources("decode.ts", exempt))).toEqual([]);
+  test("a sentence and a frozen sentence table nothing imports fail like any other value", () => {
+    const extra =
+      '\nexport const DATABEND_UNREAD = "A sentence nobody quotes.";\nexport const DATABEND_TABLE_SENTENCES = Object.freeze({});\n';
+    expect(unimportedExports(sources("decode.ts", extra))).toEqual([
+      finding("decode.ts", "DATABEND_UNREAD"),
+      finding("decode.ts", "DATABEND_TABLE_SENTENCES"),
+    ]);
   });
 
-  test("an entry of UNIMPORTED_AT_D12 fails once the list no longer exempts it", () => {
-    expect(unimportedExports(sources("objects.ts", ""), new Set())).toContain(
-      `rule 8: ${DIR}/objects.ts exports databendSourceSql, which nothing under src/ imports`,
-    );
+  test("a type passes without an importer", () => {
+    const extra = "\nexport interface Unread {\n  readonly a: number;\n}\nexport type Alias = Unread;\n";
+    expect(unimportedExports(sources("decode.ts", extra))).toEqual([]);
+  });
+
+  test("a bound only the doc test reads passes, and fails once the doc test is no reader", () => {
+    const real = sources("auth-latch.ts", "");
+    expect(unimportedExports(real)).toEqual([]);
+    const srcOnly = importers().filter((importer) => importer.file !== DOC_TEST);
+    expect(unimportedExports(real, srcOnly)).toEqual([
+      finding("auth-latch.ts", "AUTH_LATCH_TTL_MS"),
+      finding("auth-latch.ts", "AUTH_LATCH_MAX_ENTRIES"),
+    ]);
+  });
+
+  test("a function planted in sql-text.ts fails by name", () => {
+    expect(unimportedExports(sources("sql-text.ts", ONLY_FOR_A_TEST))).toEqual([
+      finding("sql-text.ts", "onlyForATest"),
+    ]);
+  });
+
+  test("a namespace import of the doc test reaches no name", () => {
+    const planted = sources("decode.ts", ONLY_FOR_A_TEST);
+    const namespace = {
+      file: DOC_TEST,
+      text: 'import * as decode from "@/lib/db/providers/sql/databend/decode";\n',
+    };
+    expect(unimportedExports(planted, [...importers(), namespace])).toEqual([finding("decode.ts", "onlyForATest")]);
+  });
+
+  test("the doc test counts as an importer, and no other test file does", () => {
+    const planted = sources("decode.ts", ONLY_FOR_A_TEST);
+    expect(unimportedExports(planted, [...importers(), readerOf(DOC_TEST)])).toEqual([]);
+    expect(unimportedExports(planted, [...importers(), readerOf("tests/unit/db/databend/decode.test.ts")])).toEqual([
+      finding("decode.ts", "onlyForATest"),
+    ]);
   });
 });

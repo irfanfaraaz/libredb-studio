@@ -6,8 +6,11 @@ const MODES: ExplainMode[] = ["estimate", "analyze"];
 
 /**
  * The names whose mere presence in the code declines both modes: the two binder
- * constructs that execute under plain EXPLAIN, the sequence function, and the six table
- * functions that write from a SELECT shape (design 5.6 and 5.7, triage X06).
+ * constructs that execute under plain EXPLAIN, the sequence function, the six table
+ * functions that write from a SELECT shape (design 5.6 and 5.7, triage X06), and the
+ * four more that a release build registers and that act when read: the two that panic
+ * the query on purpose, and the two task functions that cancel task runs or enable
+ * dependent tasks.
  */
 const DECLINED_NAMES = [
   "MATERIALIZED",
@@ -19,6 +22,10 @@ const DECLINED_NAMES = [
   "fuse_vacuum_temporary_table",
   "fuse_vacuum_drop_aggregating_index",
   "fuse_vacuum_drop_inverted_index",
+  "sync_crash_me",
+  "async_crash_me",
+  "user_task_cancel_ongoing_executions",
+  "task_dependents_enable",
 ];
 
 // Databend v1.2.951-nightly, the local fixture, 2026-10-08, as studio_reader over

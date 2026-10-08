@@ -7,15 +7,18 @@
 import { describe, expect, test } from "bun:test";
 import { AUTH_LATCH_TTL_MS, createAuthLatch } from "@/lib/db/providers/sql/databend/auth-latch";
 import { DATABEND_ERROR_SENTENCES as S } from "@/lib/db/providers/sql/databend/errors";
+import { createDatabendHttpTransport } from "@/lib/db/providers/sql/databend/http-transport";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
 import {
   idsOf,
   ok,
   pathsOf,
   runSignal,
+  scriptedNodeTransport,
   statement,
   TEST_START,
   testOptions,
+  transportDeps,
   transportHarness,
 } from "../../../helpers/databend-node-transport";
 
@@ -88,6 +91,24 @@ describe("a refused sign-in", () => {
 
     shared.advance(AUTH_LATCH_TTL_MS);
     await two.transport.run(statement("SELECT 1"));
+    two.script.expectDone();
+  });
+
+  test("two transports built without a latch share the process's one latch: the second sends nothing", async () => {
+    // A user no other test signs in as, so the process latch holds no key of another test.
+    const options = testOptions({ user: "process-latch" });
+    const built = (steps: Parameters<typeof scriptedNodeTransport>[0]) => {
+      const script = scriptedNodeTransport(steps);
+      // Every injection but the latch, so the transport takes the production one.
+      const { createNodeTransport, sleep, random, now, newId, deadline } = transportDeps(script).deps;
+      const deps = { createNodeTransport, sleep, random, now, newId, deadline };
+      return { script, transport: createDatabendHttpTransport(options, deps) };
+    };
+    const one = built([{ method: "POST", path: "/v1/query", reply: WRONG_PASSWORD }]);
+    const two = built([]);
+    await failure(one.transport.run(statement("SELECT 1")));
+    expect((await failure(two.transport.run(statement("SELECT 1")))).category).toBe("auth");
+    expect(two.script.requests).toHaveLength(0);
     two.script.expectDone();
   });
 

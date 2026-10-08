@@ -65,7 +65,7 @@ const HEALTH_LIMIT = 10;
 export const DATABEND_DEGRADE_CODES = Object.freeze([1003, 1025, 1063, 1112, 1119, 1002]);
 
 /** A session id as `system.processes.id` spells it; anything else is refused before a statement is built. */
-export const DATABEND_KILL_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+const DATABEND_KILL_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 
 /** Every sentence this module shows, so the provider doc can quote them and a test read them back. */
 export const DATABEND_MONITORING_SENTENCES = Object.freeze({
@@ -83,13 +83,13 @@ const BASE_TABLES =
 // Statements
 // ============================================================================
 
-export const DATABEND_OVERVIEW_TABLES_SQL = `SELECT count(*) AS table_count, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES}`;
+const DATABEND_OVERVIEW_TABLES_SQL = `SELECT count(*) AS table_count, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES}`;
 
 /** `command` is `Query`, `Aborting` or `Idle` (`table_context.rs:137-151`) [X35]; the reading statement is not counted. */
-export const DATABEND_ACTIVE_QUERIES_SQL =
+const DATABEND_ACTIVE_QUERIES_SQL =
   "SELECT count(*) AS active_queries FROM default.system.processes WHERE command = 'Query' AND id <> connection_id()";
 
-export const DATABEND_INDEX_COUNT_SQL = "SELECT count(*) AS index_count FROM default.system.indexes";
+const DATABEND_INDEX_COUNT_SQL = "SELECT count(*) AS index_count FROM default.system.indexes";
 
 export function databendSessionsSql(limit: number): string {
   return `SELECT id AS session_id, \`user\` AS user_name, host, database AS database_name, status, extra_info AS query_text, current_query_id, created_time, time AS elapsed_seconds FROM default.system.processes WHERE command <> 'Idle' AND id <> connection_id() ORDER BY created_time LIMIT ${limit}`;
@@ -100,20 +100,20 @@ export function databendSlowQueriesSql(limit: number): string {
   return `SELECT query_id, query_text, query_duration_ms, result_rows FROM system_history.query_history WHERE log_type = 2 AND event_time >= subtract_hours(now(), 24) ORDER BY query_duration_ms DESC LIMIT ${limit}`;
 }
 
-export function databendTableStatsSql(database?: string): string {
+function databendTableStatsSql(database?: string): string {
   const scope = database === undefined ? "" : ` AND database = ${quoteLiteral(database, PROVIDER)}`;
   return `SELECT database AS schema_name, name AS table_name, num_rows, data_compressed_size, index_size ${BASE_TABLES}${scope} ORDER BY data_compressed_size DESC`;
 }
 
-export const DATABEND_STORAGE_SQL = `SELECT database AS database_name, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES} GROUP BY database ORDER BY database`;
+const DATABEND_STORAGE_SQL = `SELECT database AS database_name, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES} GROUP BY database ORDER BY database`;
 
-export function databendIndexStatsSql(database?: string): string {
+function databendIndexStatsSql(database?: string): string {
   const scope = database === undefined ? "" : ` WHERE database = ${quoteLiteral(database, PROVIDER)}`;
   return `SELECT database AS schema_name, \`table\` AS table_name, name AS index_name, \`type\` AS index_type, definition FROM default.system.indexes${scope} ORDER BY database, \`table\`, name`;
 }
 
 /** The kill of one session's current statement; the id is checked against {@link DATABEND_KILL_ID_PATTERN} first. */
-export function databendKillSql(pid: string): string {
+function databendKillSql(pid: string): string {
   if (pid === "") throw new QueryError(DATABEND_MONITORING_SENTENCES.killNeedsId, PROVIDER);
   if (!DATABEND_KILL_ID_PATTERN.test(pid)) throw new QueryError(DATABEND_MONITORING_SENTENCES.killIdRefused, PROVIDER);
   return `KILL QUERY ${quoteLiteral(pid, PROVIDER)}`;
@@ -140,7 +140,7 @@ function readInstant(value: unknown): Date | undefined {
 }
 
 /** A requested limit clamped to 1..500, or `fallback` when none or no finite number was given. */
-export function clampMonitoringLimit(limit: number | undefined, fallback: number): number {
+function clampMonitoringLimit(limit: number | undefined, fallback: number): number {
   if (limit === undefined || !Number.isFinite(limit)) return fallback;
   return Math.min(DATABEND_MAX_MONITORING_LIMIT, Math.max(1, Math.trunc(limit)));
 }

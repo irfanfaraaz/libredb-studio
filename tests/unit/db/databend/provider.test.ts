@@ -23,30 +23,13 @@ import { DATABEND_PROVIDER_SENTENCES, DatabendProvider } from "@/lib/db/provider
 import { DATABEND_ANSWER_SENTENCES } from "@/lib/db/providers/sql/databend/answer";
 import { DATABEND_ERROR_SENTENCES } from "@/lib/db/providers/sql/databend/errors";
 import {
-  DATABEND_ACTIVE_QUERIES_SQL,
   DATABEND_DEFAULT_SESSION_LIMIT,
-  DATABEND_INDEX_COUNT_SQL,
   DATABEND_MONITORING_SENTENCES,
-  DATABEND_OVERVIEW_TABLES_SQL,
-  DATABEND_STORAGE_SQL,
-  databendIndexStatsSql,
-  databendKillSql,
   databendSessionsSql,
   databendSlowQueriesSql,
-  databendTableStatsSql,
 } from "@/lib/db/providers/sql/databend/introspect";
 import { DATABEND_KILL_SPEC, DATABEND_LABELS } from "@/lib/db/providers/sql/databend/labels";
-import {
-  DATABEND_CATALOG_LIST_SQL,
-  DATABEND_OBJECT_SENTENCES,
-  DATABEND_VERSION_SQL,
-  databendAuthTypeSql,
-  databendColumnsSql,
-  databendDatabaseListSql,
-  databendObjectCountsSql,
-  databendObjectListSql,
-  databendSourceSql,
-} from "@/lib/db/providers/sql/databend/objects";
+import { DATABEND_OBJECT_SENTENCES, DATABEND_VERSION_SQL } from "@/lib/db/providers/sql/databend/objects";
 import {
   globalSettingsChangedWarning,
   ROLE_NOT_CARRIED,
@@ -91,6 +74,37 @@ function abortFailure(signal: AbortSignal): TransportError {
     : new TransportError("aborted", "The request was cancelled");
 }
 
+/**
+ * The statements the surfaces send for the plain names this file uses, written out: `objects.test.ts` and
+ * `introspect.test.ts` hold each surface to its text, and this file holds the provider to sending it.
+ */
+const DEMO = "FROM `default`.system.tables WHERE catalog = 'default' AND database = 'libredb_demo'";
+const BASE_TABLES =
+  "FROM default.system.tables WHERE catalog = 'default' AND table_type = 'BASE TABLE' AND database NOT IN ('system', 'information_schema')";
+const SQL = {
+  authType: `SELECT auth_type FROM default.system.users WHERE name = '${TEST_USER}'`,
+  catalogs: "SELECT name AS catalog_name FROM system.catalogs ORDER BY name",
+  databases: (catalog: string) =>
+    `SELECT name AS database_name FROM \`${catalog}\`.system.databases WHERE catalog = '${catalog}' AND name NOT IN ('system', 'information_schema') ORDER BY name`,
+  counts:
+    "SELECT kind, count(*) AS object_count FROM (SELECT CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'MATERIALIZED VIEW' THEN 'materialized_view' WHEN 'DYNAMIC TABLE' THEN 'dynamic_table' ELSE concat('unknown:', table_type) END AS kind " +
+    `${DEMO}) AS objects GROUP BY kind`,
+  views: `SELECT name AS object_name, num_rows, data_compressed_size, comment ${DEMO} AND table_type = 'VIEW' ORDER BY name`,
+  columns: (object: string) =>
+    `SELECT name AS column_name, data_type, is_nullable, default_kind, default_expression, comment FROM \`default\`.system.columns WHERE database = 'libredb_demo' AND \`table\` = '${object}'`,
+  materializedSource: (object: string) => `SHOW CREATE MATERIALIZED VIEW \`default\`.\`libredb_demo\`.\`${object}\``,
+  overviewTables: `SELECT count(*) AS table_count, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES}`,
+  activeQueries:
+    "SELECT count(*) AS active_queries FROM default.system.processes WHERE command = 'Query' AND id <> connection_id()",
+  indexCount: "SELECT count(*) AS index_count FROM default.system.indexes",
+  tableStats: (database: string) =>
+    `SELECT database AS schema_name, name AS table_name, num_rows, data_compressed_size, index_size ${BASE_TABLES} AND database = '${database}' ORDER BY data_compressed_size DESC`,
+  indexStats:
+    "SELECT database AS schema_name, `table` AS table_name, name AS index_name, `type` AS index_type, definition FROM default.system.indexes ORDER BY database, `table`, name",
+  storage: `SELECT database AS database_name, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES} GROUP BY database ORDER BY database`,
+  kill: (pid: string) => `KILL QUERY '${pid}'`,
+};
+
 const EMPTY_OK: NodeResponse = { status: 200, contentType: "application/json", retryAfter: null, text: "{}" };
 
 const column = (name: string, type = "String") => ({ name, type });
@@ -98,8 +112,8 @@ const column = (name: string, type = "String") => ({ name, type });
 /** The answers a connect reads: the probe, the `auth_type` caution, and the default catalog's databases. */
 function connectAnswer(sql: string): Reply | undefined {
   if (sql === DATABEND_VERSION_SQL) return { schema: [column("server_version")], data: [["v1.2.951-nightly"]] };
-  if (sql === databendAuthTypeSql(TEST_USER)) return { schema: [column("auth_type")], data: [["sha256_password"]] };
-  if (sql === databendDatabaseListSql("default")) {
+  if (sql === SQL.authType) return { schema: [column("auth_type")], data: [["sha256_password"]] };
+  if (sql === SQL.databases("default")) {
     return { schema: [column("database_name")], data: [["default"], ["libredb_demo"]] };
   }
   return undefined;
@@ -384,11 +398,7 @@ describe("connect", () => {
     const { provider, time } = build(fake, { database: "libredb_demo" });
     await provider.connect();
     expect(provider.isConnected()).toBe(true);
-    expect(fake.sqls()).toEqual([
-      DATABEND_VERSION_SQL,
-      databendDatabaseListSql("default"),
-      databendAuthTypeSql(TEST_USER),
-    ]);
+    expect(fake.sqls()).toEqual([DATABEND_VERSION_SQL, SQL.databases("default"), SQL.authType]);
     expect(time.deadlines.filter((deadline) => deadline.ms === 10_000)).toHaveLength(3);
     expect(provider.connectWarnings()).toEqual([]);
   });
@@ -404,9 +414,7 @@ describe("connect", () => {
   });
 
   test("a database read that fails is no caution and no failed connect", async () => {
-    const answers = withConnect((sql) =>
-      sql === databendDatabaseListSql("default") ? failed(1063, "denied") : undefined,
-    );
+    const answers = withConnect((sql) => (sql === SQL.databases("default") ? failed(1063, "denied") : undefined));
     const { provider } = build(fakeDatabend({ answer: answers }), { database: "libredb_demo" });
     await provider.connect();
     expect(provider.connectWarnings()).toEqual([]);
@@ -414,15 +422,13 @@ describe("connect", () => {
 
   test("names a no_password user from the auth_type read, and omits it when that read fails [X12]", async () => {
     const noPassword = withConnect((sql) =>
-      sql === databendAuthTypeSql(TEST_USER) ? { schema: [column("auth_type")], data: [["no_password"]] } : undefined,
+      sql === SQL.authType ? { schema: [column("auth_type")], data: [["no_password"]] } : undefined,
     );
     const named = build(fakeDatabend({ answer: noPassword })).provider;
     await named.connect();
     expect(named.connectWarnings()).toEqual([{ message: DATABEND_OBJECT_SENTENCES.noPassword(TEST_USER) }]);
 
-    const refused = withConnect((sql) =>
-      sql === databendAuthTypeSql(TEST_USER) ? failed(1063, "Permission denied") : undefined,
-    );
+    const refused = withConnect((sql) => (sql === SQL.authType ? failed(1063, "Permission denied") : undefined));
     const quiet = build(fakeDatabend({ answer: refused })).provider;
     await quiet.connect();
     expect(quiet.isConnected()).toBe(true);
@@ -672,7 +678,7 @@ describe("the limiter over every statement", () => {
   test("eight concurrent surface calls on two instances never have more than two statements in flight [X04]", async () => {
     const held: Array<() => void> = [];
     const answers = withConnect((sql) => {
-      if (sql !== DATABEND_CATALOG_LIST_SQL) return undefined;
+      if (sql !== SQL.catalogs) return undefined;
       const wait = gate();
       held.push(() => wait.open({ schema: [column("catalog_name")], data: [["default"]] }));
       return wait.promise;
@@ -775,7 +781,7 @@ describe("the limiter over every statement", () => {
 
   test("a statement queued behind two permits expires on the injected deadline, unsent [X16]", async () => {
     const fake = fakeDatabend({
-      answer: withConnect((sql) => (sql === DATABEND_CATALOG_LIST_SQL ? "hang" : undefined)),
+      answer: withConnect((sql) => (sql === SQL.catalogs ? "hang" : undefined)),
     });
     const { provider, time } = build(fake);
     await provider.connect();
@@ -796,7 +802,7 @@ describe("the limiter over every statement", () => {
 
   test("with Warehouse set, a surface read queued past its deadline is not the resuming sentence [X07] [X16]", async () => {
     const fake = fakeDatabend({
-      answer: withConnect((sql) => (sql === DATABEND_CATALOG_LIST_SQL ? "hang" : undefined)),
+      answer: withConnect((sql) => (sql === SQL.catalogs ? "hang" : undefined)),
     });
     const { provider, time } = build(fake, { warehouse: "wh-1" });
     await provider.connect();
@@ -813,7 +819,7 @@ describe("the limiter over every statement", () => {
     expect(failure).toBeInstanceOf(TimeoutError);
     expect((failure as Error).message).toBe(DATABEND_PROVIDER_SENTENCES.slotsBusy("10"));
     // The two sent reads are killed; the queued third never posts.
-    expect(fake.sqls().filter((sql) => sql === DATABEND_CATALOG_LIST_SQL)).toHaveLength(2);
+    expect(fake.sqls().filter((sql) => sql === SQL.catalogs)).toHaveLength(2);
     for (const held of await Promise.all(holding)) {
       expect((held as Error).message).toBe(DATABEND_ERROR_SENTENCES.resuming("wh-1", "10"));
     }
@@ -860,8 +866,7 @@ describe("a statement budget cut on the object surface [X05]", () => {
   });
 
   test("an over-budget describe refuses, naming the bound", async () => {
-    const container = { catalog: "default", database: "libredb_demo" };
-    const sql = databendColumnsSql(container, "table", "wide");
+    const sql = SQL.columns("wide");
     const fake = fakeDatabend({
       answer: withConnect((sent) =>
         sent === sql
@@ -923,8 +928,6 @@ describe("disconnect", () => {
 // ============================================================================
 
 describe("the object surface and monitoring delegate to objects.ts and introspect.ts", () => {
-  const container = { catalog: "default", database: "libredb_demo" };
-
   async function connected(answers?: (sql: string) => Reply | Promise<Reply> | undefined, overrides = {}) {
     const fake = fakeDatabend({ answer: withConnect(answers) });
     const { provider } = build(fake, overrides);
@@ -934,32 +937,20 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
   }
 
   test.each([
-    ["listContainers()", (p: DatabendProvider) => p.listContainers(), [DATABEND_CATALOG_LIST_SQL]],
-    [
-      "listContainers([catalog])",
-      (p: DatabendProvider) => p.listContainers(["default"]),
-      [databendDatabaseListSql("default")],
-    ],
+    ["listContainers()", (p: DatabendProvider) => p.listContainers(), [SQL.catalogs]],
+    ["listContainers([catalog])", (p: DatabendProvider) => p.listContainers(["default"]), [SQL.databases("default")]],
     ["listContainers([catalog, database])", (p: DatabendProvider) => p.listContainers(["default", "x"]), []],
-    [
-      "countObjects",
-      (p: DatabendProvider) => p.countObjects(["default", "libredb_demo"]),
-      [databendObjectCountsSql(container)],
-    ],
-    [
-      "listObjects",
-      (p: DatabendProvider) => p.listObjects(["default", "libredb_demo"], "view"),
-      [databendObjectListSql(container, "view")],
-    ],
+    ["countObjects", (p: DatabendProvider) => p.countObjects(["default", "libredb_demo"]), [SQL.counts]],
+    ["listObjects", (p: DatabendProvider) => p.listObjects(["default", "libredb_demo"], "view"), [SQL.views]],
     [
       "readObjectSource",
       (p: DatabendProvider) => p.readObjectSource(["default", "libredb_demo", "t"], "materialized_view"),
-      [databendSourceSql(container, "materialized_view", "t")],
+      [SQL.materializedSource("t")],
     ],
     [
       "getOverview",
       (p: DatabendProvider) => p.getOverview(),
-      [DATABEND_VERSION_SQL, DATABEND_OVERVIEW_TABLES_SQL, DATABEND_ACTIVE_QUERIES_SQL, DATABEND_INDEX_COUNT_SQL],
+      [DATABEND_VERSION_SQL, SQL.overviewTables, SQL.activeQueries, SQL.indexCount],
     ],
     ["getSlowQueries", (p: DatabendProvider) => p.getSlowQueries({ limit: 5 }), [databendSlowQueriesSql(5)]],
     [
@@ -967,9 +958,9 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
       (p: DatabendProvider) => p.getActiveSessions(),
       [databendSessionsSql(DATABEND_DEFAULT_SESSION_LIMIT)],
     ],
-    ["getTableStats", (p: DatabendProvider) => p.getTableStats({ schema: "x" }), [databendTableStatsSql("x")]],
-    ["getIndexStats", (p: DatabendProvider) => p.getIndexStats(), [databendIndexStatsSql(undefined)]],
-    ["getStorageStats", (p: DatabendProvider) => p.getStorageStats(), [DATABEND_STORAGE_SQL]],
+    ["getTableStats", (p: DatabendProvider) => p.getTableStats({ schema: "x" }), [SQL.tableStats("x")]],
+    ["getIndexStats", (p: DatabendProvider) => p.getIndexStats(), [SQL.indexStats]],
+    ["getStorageStats", (p: DatabendProvider) => p.getStorageStats(), [SQL.storage]],
   ])("%s sends exactly its module's statements", async (_name, call, expected) => {
     const { provider, sent } = await connected();
     await call(provider);
@@ -980,12 +971,7 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
     const { provider, sent } = await connected();
     const health = await provider.getHealth();
     expect(health.cacheHitRatio).toBe("N/A");
-    expect(sent().slice(0, 4)).toEqual([
-      DATABEND_VERSION_SQL,
-      DATABEND_OVERVIEW_TABLES_SQL,
-      DATABEND_ACTIVE_QUERIES_SQL,
-      DATABEND_INDEX_COUNT_SQL,
-    ]);
+    expect(sent().slice(0, 4)).toEqual([DATABEND_VERSION_SQL, SQL.overviewTables, SQL.activeQueries, SQL.indexCount]);
     expect(sent()).toHaveLength(6);
   });
 
@@ -997,7 +983,7 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
 
   test("the session database is marked in the default catalog only", async () => {
     const answers = (sql: string): Reply | undefined =>
-      sql === databendDatabaseListSql("other")
+      sql === SQL.databases("other")
         ? { schema: [column("database_name")], data: [["default"], ["libredb_demo"]] }
         : undefined;
     const pinned = await connected(answers, { database: "libredb_demo" });
@@ -1010,7 +996,7 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
   });
 
   test("describeObject reads its columns, and its indexes in the default catalog", async () => {
-    const sql = databendColumnsSql(container, "table", "t");
+    const sql = SQL.columns("t");
     const { provider, sent } = await connected((sent) =>
       sent === sql
         ? {
@@ -1040,12 +1026,12 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
 
   test("a surface statement's failure is mapped to the house class, naming its statement", async () => {
     const { provider } = await connected((sql) =>
-      sql === DATABEND_CATALOG_LIST_SQL ? failed(1006, "catalogs unreadable") : undefined,
+      sql === SQL.catalogs ? failed(1006, "catalogs unreadable") : undefined,
     );
     const failure = (await provider.listContainers().catch((error: unknown) => error)) as QueryError;
     expect(failure).toBeInstanceOf(QueryError);
     expect(failure.message).toContain("catalogs unreadable");
-    expect(failure.query).toBe(DATABEND_CATALOG_LIST_SQL);
+    expect(failure.query).toBe(SQL.catalogs);
   });
 
   test("runMaintenance sends the kill of one session, and refuses every other operation unsent", async () => {
@@ -1053,7 +1039,7 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
     const result = await provider.runMaintenance("kill", "abc-1");
     expect(result.success).toBe(true);
     expect(result.message).toBe(DATABEND_MONITORING_SENTENCES.killAsked("abc-1"));
-    expect(sent()).toEqual([databendKillSql("abc-1")]);
+    expect(sent()).toEqual([SQL.kill("abc-1")]);
     await expect(provider.runMaintenance("kill")).rejects.toThrow(DATABEND_MONITORING_SENTENCES.killNeedsId);
     await expect(provider.runMaintenance("vacuum", "t")).rejects.toThrow(
       DATABEND_PROVIDER_SENTENCES.maintenanceRefused("vacuum"),

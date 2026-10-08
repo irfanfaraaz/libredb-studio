@@ -11,7 +11,6 @@ import {
   type AuthLatchIdentity,
   authLatchKey,
   createAuthLatch,
-  databendAuthLatch,
 } from "@/lib/db/providers/sql/databend/auth-latch";
 import { latchedError } from "@/lib/db/providers/sql/databend/errors";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
@@ -135,12 +134,6 @@ describe("the latch", () => {
     expect(error.message).toBe(latchedError(new Date(START), new Date(START + AUTH_LATCH_TTL_MS)).message);
     expect(error.message).toStartWith("Databend refused this sign-in at 2026-10-08 01:00");
     expect(error.message).toContain("again before 2026-10-08 01:15");
-  });
-
-  test("two instances on one key share the latch: the process singleton is one latch", async () => {
-    const key = authLatchKey({ ...IDENTITY, host: "singleton.test" });
-    (await databendAuthLatch.acquire(key, live())).settle(WRONG_PASSWORD);
-    expect((await refusal(databendAuthLatch.acquire(key, live()))).category).toBe("auth");
   });
 
   test("an in-body 2215 does not latch, and proves the key", async () => {

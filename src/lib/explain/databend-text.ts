@@ -38,9 +38,13 @@ const EXPLAIN_PREFIX = "EXPLAIN ";
  * `NEXTVAL` takes a sequence value, and the other six are the table functions that write
  * from a SELECT shape (`table_function_factory.rs`): `FUSE_VACUUM2` vacuums tables, and
  * `SET_CACHE_CAPACITY` really moved a cache's capacity under
- * plain EXPLAIN when nested in an argument subquery. A name is matched as a word and as
- * a quoted identifier, so a writer nested in an argument subquery never runs on an
- * Explain click.
+ * plain EXPLAIN when nested in an argument subquery. Four more act when read and are
+ * registered in a release build: `SYNC_CRASH_ME` and `ASYNC_CRASH_ME` panic the query on
+ * purpose and carry no build condition, `USER_TASK_CANCEL_ONGOING_EXECUTIONS` cancels a
+ * task's open runs under the default `task-support` feature when tasks are on, and
+ * `TASK_DEPENDENTS_ENABLE` enables a task's dependents when they are off. A name is
+ * matched as a word and as a quoted identifier, so a writer nested in an argument
+ * subquery never runs on an Explain click.
  */
 const DECLINED_NAMES = new Set([
   "MATERIALIZED",
@@ -52,6 +56,10 @@ const DECLINED_NAMES = new Set([
   "FUSE_VACUUM_TEMPORARY_TABLE",
   "FUSE_VACUUM_DROP_AGGREGATING_INDEX",
   "FUSE_VACUUM_DROP_INVERTED_INDEX",
+  "SYNC_CRASH_ME",
+  "ASYNC_CRASH_ME",
+  "USER_TASK_CANCEL_ONGOING_EXECUTIONS",
+  "TASK_DEPENDENTS_ENABLE",
 ]);
 
 /**

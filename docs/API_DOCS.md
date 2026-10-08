@@ -27,12 +27,12 @@
 
 ## Overview
 
-LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant and Oxia.
+LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia and Databend.
 
 ### Key Features
 
 - **JWT Authentication** - Secure token-based authentication stored in HTTP-only cookies
-- **Multi-Database Support** - Twenty-six engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia
+- **Multi-Database Support** - Twenty-seven engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, Apache Cassandra, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia, Databend
 - **AI-Powered Insights** - EXPLAIN explanations, query-safety analysis and schema docs, streamed
 - **Real-time Health Monitoring** - Database metrics and performance insights
 
@@ -808,6 +808,39 @@ carries a plain statement. Four things differ from the other SQL providers:
 - `POST /api/db/cancel` works: cancelling is `DELETE /v1/query/{id}` and abandoning a request does
   **not** stop the work on the cluster.
 - Full reference: [`docs/providers/trino.md`](providers/trino.md).
+
+---
+
+##### Databend Query Format
+
+Databend speaks SQL over its own HTTP query API (`POST /v1/query`, port `8000` by default), so the `sql` field carries a plain statement.
+Four things differ from the other SQL providers:
+
+- **`database` is the default database** of every statement, and a statement may still name any other database in full.
+  `warehouse` names the compute every statement runs on, sent as the `X-DATABEND-WAREHOUSE` header; Databend Cloud requires one and resumes a suspended warehouse on the first statement, billing while it runs.
+- **A password needs TLS.** It travels in a Basic `Authorization` header on every request, so a connection with a password and no SSL mode to a host that is not this machine, and not reached through an SSH tunnel, is refused before any socket unless it sets `allowInsecureAuth`.
+- **No positional parameters.** A request carrying `params` is refused with "Databend's HTTP API takes no bound parameters from Studio; write the value in the statement."
+- **Each statement runs in its own session.** A transaction or a temporary table a statement leaves open ends with it: Studio rolls the transaction back and the response carries a `warning` saying so.
+
+```json
+{
+  "connection": {
+    "type": "databend",
+    "host": "localhost",
+    "port": 8000,
+    "user": "libredb",
+    "database": "libredb_demo"
+  },
+  "sql": "SELECT number, number * 2 AS doubled FROM numbers(3)"
+}
+```
+
+**Notes:**
+- `columnTypes` are Databend's declared type strings verbatim, such as `UInt64` or `Nullable(String)`; an integer past 2^53 and every decimal, date and timestamp value arrive as the server's text.
+- A duplicate output name is disambiguated rather than dropped: `fields` carries `id` and `id (2)`.
+- `POST /api/db/maintenance` accepts `kill` only, and its target is a query id from the sessions panel.
+- `POST /api/db/cancel` works: cancelling a running statement sends the server a kill for it.
+- Full reference: [`docs/providers/databend.md`](providers/databend.md).
 
 ---
 

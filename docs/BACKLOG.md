@@ -28,10 +28,10 @@ None of it is a GitHub issue.
 **Sections**
 
 - [SQL statement reading](#sql-statement-reading) — S2–S7 · 5
-- [Drivers and connections](#drivers-and-connections) — D1-D245, U17 · 149
+- [Drivers and connections](#drivers-and-connections) — D1-D249, U17 · 153
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U96 · 87
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U97 · 88
 - [Dependencies](#dependencies) — P1-P9 · 7
 - [Documentation](#documentation) — DOC3-DOC18 · 15
 - [Release pipeline](#release-pipeline) — REL1-REL8 · 8
@@ -41,7 +41,7 @@ None of it is a GitHub issue.
 - [Security Phase 3 deferrals](#security-phase-3-deferrals) — K4-K8 · 5
 - [Security scanner triage](#security-scanner-triage) — SCAN1 · 1
 - [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A8 · 7
-- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2-B102 · 38
+- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2-B103 · 39
 - [Passkey deferrals (#785)](#passkey-deferrals-785) — PK1-PK9 · 8
 - [MCP server deferrals (#246)](#mcp-server-deferrals-246)
 
@@ -52,18 +52,18 @@ None of it is a GitHub issue.
 The readers in `src/lib/sql/` decide where a statement starts, where it ends, and what it operates
 on. `src/lib/sql/grammar.ts` gave them a dialect (#292). These are the gaps that channel leaves.
 
-### S2. No shipped dialect declares backslash escaping
+### S2. No shipped dialect but Databend declares backslash escaping
 
 Whether `\` escapes inside a string literal differs by dialect, and in MySQL by session mode.
 The fact now exists: `SqlGrammar.backslashAlwaysEscapes`, and where it is true `spans.ts` reads a backslash and the character after it as one escaped pair inside `'…'` and `"…"`, except a backslash before a line feed, which leaves the literal unterminated (Databend's `\\.` does not match a line feed).
-Every shipped row declares it `false`, so every dialect keeps the undeterminable reading of a quote behind an odd backslash run.
+Every shipped row but Databend's declares it `false`, so every other dialect keeps the undeterminable reading of a quote behind an odd backslash run.
 MySQL is not set `true` because `NO_BACKSLASH_ESCAPES` in `sql_mode` turns the escape off per session, so the row cannot state it for every connection.
 Setting it where a dialect always escapes would narrow the false confirmation prompts #297 introduced there.
 The fact says only that a backslash always escapes, so it cannot say that one never does (SQL Server, PostgreSQL's standard strings), and S4's MSSQL decline needs that second value before it can go.
 
 Declaring it `true` on a row retypes that dialect's literals only, and no other dialect changes.
 It also destroys, for that dialect, the premise of two fixtures maintainer-sweep-5 required (the "end cannot be cut" case and the "genuinely unresolvable text still has to ask" case).
-Those fixtures need shapes that stay unresolvable once `\` is understood before any shipped row turns the fact on.
+Those fixtures need shapes that stay unresolvable once `\` is understood before another shipped row turns the fact on.
 
 ### S3. Comment and escape forms no reader models
 
@@ -1823,7 +1823,7 @@ Not fixed there: the change is to the adapter's log-dir read, whose error table 
 
 ### D126. Concurrent first acquisitions of one connection and profile each open a provider
 
-`acquireExecutionProfileProvider` (`src/lib/db/factory.ts:969-1075`) checks the profiled cache, and on a miss constructs and connects a provider, then stores it (`:1071`).
+`acquireExecutionProfileProvider` (`src/lib/db/factory.ts:1010-1121`) checks the profiled cache, and on a miss constructs and connects a provider, then stores it (`:1117`).
 Two callers that miss at the same time each construct one, and the later store overwrites the earlier entry, so the earlier provider stays connected with nothing left to close it.
 The editor and agent paths reach this function the same way.
 `/api/mcp` avoids it on its own side, with an in-flight map keyed on the exported `profiledCacheKey` (`src/lib/mcp/context.ts`).
@@ -2640,6 +2640,47 @@ Because that call runs before the `ALLOW_CUSTOM_CONNECTIONS` check, a server wit
 Found in the review of #1572; both predate it.
 
 **Done when:** `resolveConnection` answers an inline connection whose `id` is present and not a string with 400 `CONFIG_ERROR` before the policy check, so the policy still answers 403 for every string or absent id, `withOneShotTunnel` refuses a missing `id` before the tunnel as the pooled paths do, and each has a failing route test first under `tests/api/db/`.
+
+### D246. The confirmation gate does not know Databend's destructive forms
+
+`isDangerousQuery` in `src/components/QuerySafetyDialog.tsx` asks first for a statement whose operative keyword is in `DANGEROUS_KEYWORDS` (`DELETE`, `DROP`, `TRUNCATE`, `ALTER`, `GRANT`, `REVOKE`, `UPDATE`), or whose code holds an `UPDATE` followed by `SET`, and that one set serves every SQL engine.
+Databend has destructive forms the set does not name: `INSERT OVERWRITE`, `REPLACE INTO`, `MERGE INTO`, `OPTIMIZE TABLE ... PURGE`, the `VACUUM` forms, `FLASHBACK TABLE`, `COPY INTO ... PURGE = true`, `REMOVE @stage`, `EXECUTE IMMEDIATE`, `CALL` and a `SETTINGS (...)` clause.
+Some write from a SELECT shape: `nextval` and the table functions `fuse_amend`, `set_cache_capacity`, `fuse_vacuum2`, `fuse_vacuum_temporary_table` and the two `fuse_vacuum_drop_*_index` (`table_function_factory.rs` in Databend's source).
+So Run sends each of them with no confirmation unless its text also holds an `UPDATE ... SET` pair; `docs/providers/databend.md` states the list under its known limitations.
+
+Found 2026-10-07 while designing the Databend provider (design 8, C20); the gate predates it.
+
+**Done when:** the gate prompts for each of these forms on a Databend connection, through a fact of the Databend grammar row or the destructive vocabulary rather than a type test in the gate, with a test per form in `tests/components/QuerySafetyDialog.test.tsx`, and the Databend doc's list shrinks to what the gate still misses.
+
+### D247. Driver-based SQL providers hold a whole result with no cell or byte budget
+
+An unlimited editor statement is cut at `MAX_UNLIMITED_ROWS` (100,000, `src/lib/db/utils/query-limiter.ts`), and that row count is the only bound most SQL providers put on a result: the providers built on a driver hand the driver's whole answer to Studio, however wide its rows or long its values.
+The Databend provider bounds each statement at 250,000 cells and 16 MiB of answer text, and measured the cost on the 384 MiB heap the container image sets (`NODE_OPTIONS` in `Dockerfile`): two of its largest results at once peaked at 149.7 MiB used (L9, `docs/providers/databend.md`).
+No other provider's worst shape was measured, so two concurrent wide results on such a provider may exhaust the heap.
+
+Found 2026-10-07 while designing the Databend provider (its memory bounds); pre-existing.
+
+**Done when:** the worst result shape of each driver-based SQL provider is measured on the 384 MiB heap, a cell or byte budget is added where two concurrent results pass it, and each budget is pinned by a test.
+
+### D248. The connection pulse and the fleet check resend a refused password every 60 seconds
+
+`useConnectionPulse` (`src/hooks/use-connection-pulse.ts`, `CONNECTION_PULSE_INTERVAL_MS`) posts the active connection to `/api/db/health` every 60 seconds, and the admin Overview (`refreshFleetHealth` in `src/components/admin/tabs/OverviewTab.tsx`) posts every connection to `/api/admin/fleet-health` on the same interval.
+Both reach `getOrCreateProvider` in `src/lib/db/factory.ts`, which caches a provider only after `connect()` succeeds, so a stored password the server refuses is sent again on every tick.
+On an engine whose password policy locks an account after a number of failed sign-ins, a wrong password left in a connection therefore locks that user for everyone, and keeps it locked.
+Databend is the one engine that does not: its provider latches a refused sign-in for 15 minutes before any socket (`auth-latch.ts`, measured with `PASSWORD_MAX_RETRIES = 5` on the local fixture, L10), and with a Warehouse set the pulse sends nothing at all.
+
+Found 2026-10-07 while designing the Databend provider (review 11 #3); pre-existing.
+
+**Done when:** each shipped engine with an account lockout is measured against a wrong stored password under both timers, and either latches a refused sign-in the way Databend does or is left out of the timers, with a test per engine.
+
+### D249. No SQL provider bounds the statement text it is handed
+
+A route body is bounded only by the proxy's 10 MB buffer (`src/lib/api/bounded-json.ts`), and only non-SQL types declare a text bound: `maxTextBytes` in `NON_SQL_DESTRUCTIVE_VOCABULARY`, read by `consoleTextByteLimit` and `statementRefusal` in `src/lib/db/destructive-commands.ts` (InfluxQL, Milvus, Oxia, Qdrant).
+So every SQL provider hands its driver or its server whatever statement text the route accepted, up to that buffer, and the Databend provider's memory measurement had to assume two 9.9 MB statements at once (L9).
+
+Found 2026-10-07 by the external review of the Databend design (X04); pre-existing.
+
+**Done when:** every SQL provider declares a statement text bound the gate and the routes read before any request, with a test per provider that a text one byte over its bound is refused unsent.
 
 ## Value interpolation
 
@@ -4067,6 +4108,18 @@ The other sets ran, and the grid gives no sign that they exist; a MySQL `CALL` t
 Found 2026-10-07 by the external review of the result column names fix; pre-existing.
 
 **Done when:** a statement or a transaction batch that returns several sets is shown by the same rule as a script batch (or lets the user choose the set), the result says how many sets came back, and route tests pin `EXEC`, `CALL` and the transaction path.
+
+### U97. A managed refresh keeps the active connection's stale copy
+
+`applyManagedRefresh` in `src/hooks/use-connection-manager.ts` keeps the active connection's object, and its list entry, when a managed refresh brings a new version of it, so the connection-change effect does not reset an open transaction, discard edits or read the schema again.
+Picking the connection again hands back the same stale object.
+Queries are not affected, because the payload sends the seed id and the server resolves the current descriptor, but the client-side metadata read key and the pulse key (`useConnectionPulse`) never see the change.
+So a seed edited while it is open to add a Databend Warehouse keeps its pulse, which then resumes billed compute every 60 seconds until the page is reloaded.
+Proven with a throwaway test on PR B of the Databend provider: after a refresh that changes a seed's host and database, the active object and its list entry are the old ones.
+
+Found 2026-10-08 by the red-team round of the Databend precursors (I14); pre-existing, and the Databend provider makes it reachable.
+
+**Done when:** a managed refresh that changes a field the connection resolves through (host, port, database, warehouse, credentials) replaces the active copy and a cosmetic change (name, colour) keeps it, with a hook test for each, or `docs/SEED_CONNECTIONS.md` states that an edit to an open seed takes effect after a reload.
 
 ## Dependencies
 
@@ -5810,6 +5863,15 @@ The warning is a hint, not a refusal (Apply to editor still works), but it marks
 Found 2026-10-07 by the browser pass of PR #1570 (Spec A seed sources); pre-existing.
 
 **Done when:** a `FROM` inside a call's parentheses is not read as a table position; a name qualified by a schema the provider declares as its engine's own catalog, through a capability built from the lists the providers already hold and no per-engine list in `src/lib/agent`, is reported as not checked rather than unknown; `docs/AGENT_DEMO.md` says what the check covers, including that an unqualified catalog name such as `pg_class` still gets the warning; and tests in `tests/unit/lib/agent/plan-statement.test.ts` pin both cases while an invented `sales.orders` is still reported.
+
+### B103. Databend has no agent execution and no MCP `run_read_query`
+
+The Databend provider implements no `queryReadOnly`, so `AGENT_EXECUTION_ENGINES` does not name it, agent auto mode refuses it, and MCP `run_read_query` answers that the engine is not served; plan mode and the MCP metadata tools work (`MCP_EXPOSABLE.databend` is true).
+No statement classifier can be the boundary there: `nextval`, `EXECUTE IMMEDIATE`, `CALL`, a `SETTINGS (...)` clause and six table functions (`fuse_amend`, `set_cache_capacity`, `fuse_vacuum2`, `fuse_vacuum_temporary_table` and the two `fuse_vacuum_drop_*_index`) write from a SELECT shape, and Databend has no read-only session the provider can open.
+
+Found 2026-10-07 while designing the Databend provider (design 5.7).
+
+**Done when:** a statement contract for Databend is measured and `queryReadOnly` implements it, `AGENT_EXECUTION_ENGINES` and `RUN_READ_QUERY_ENGINES` name Databend, and an agent run and an MCP call each drive a SELECT-shaped writer to its refusal in a test.
 
 ## Passkey deferrals (#785)
 

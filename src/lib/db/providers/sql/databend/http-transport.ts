@@ -45,12 +45,11 @@ import {
   type DatabendAnswer,
   type DatabendAnswerError,
   type DatabendReading,
-  type DatabendRefusal,
   type DatabendSessionEcho,
   readAnswer,
   resultModeNotice,
 } from "./answer";
-import { type AuthAttempt, type AuthLatch, databendAuthLatch } from "./auth-latch";
+import { type AuthAttempt, type AuthLatch, createAuthLatch } from "./auth-latch";
 import type { DatabendConnectionOptions } from "./connection-options";
 import {
   answerError,
@@ -153,7 +152,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 const PRODUCTION_DEPS: DatabendHttpTransportDeps = {
   createNodeTransport,
-  latch: databendAuthLatch,
+  // The process's one latch, shared by every Databend provider (design 3.5).
+  latch: createAuthLatch({ now: Date.now }),
   sleep,
   random: Math.random,
   now: Date.now,

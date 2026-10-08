@@ -170,6 +170,3 @@ export function createAuthLatch(deps: { readonly now: () => number }): AuthLatch
     },
   };
 }
-
-/** The process's one latch, shared by every Databend provider. */
-export const databendAuthLatch: AuthLatch = createAuthLatch({ now: Date.now });

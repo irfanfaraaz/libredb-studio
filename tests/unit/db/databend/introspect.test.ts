@@ -1,24 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { QueryError } from "@/lib/db/errors";
 import {
-  DATABEND_ACTIVE_QUERIES_SQL,
   DATABEND_DEFAULT_SESSION_LIMIT,
   DATABEND_DEFAULT_SLOW_QUERY_LIMIT,
   DATABEND_DEGRADE_CODES,
-  DATABEND_INDEX_COUNT_SQL,
-  DATABEND_KILL_ID_PATTERN,
   DATABEND_MAX_MONITORING_LIMIT,
   DATABEND_MONITORING_SENTENCES,
-  DATABEND_OVERVIEW_TABLES_SQL,
-  DATABEND_STORAGE_SQL,
   DATABEND_UNAVAILABLE_TEXT,
   DATABEND_UNKNOWN_TEXT,
-  clampMonitoringLimit,
-  databendIndexStatsSql,
-  databendKillSql,
   databendSessionsSql,
   databendSlowQueriesSql,
-  databendTableStatsSql,
   getActiveSessions,
   getHealth,
   getIndexStats,
@@ -106,9 +97,32 @@ const SLOW_SCHEMA = [
   ["result_rows", "UInt64"],
 ] as const;
 
+/** The design 5.5 statements, written out; the tests below hold each panel to them. */
+const BASE_TABLES =
+  "FROM default.system.tables WHERE catalog = 'default' AND table_type = 'BASE TABLE' AND database NOT IN ('system', 'information_schema')";
+const OVERVIEW_TABLES_SQL = `SELECT count(*) AS table_count, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES}`;
+const ACTIVE_QUERIES_SQL =
+  "SELECT count(*) AS active_queries FROM default.system.processes WHERE command = 'Query' AND id <> connection_id()";
+const INDEX_COUNT_SQL = "SELECT count(*) AS index_count FROM default.system.indexes";
+const STORAGE_SQL = `SELECT database AS database_name, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes ${BASE_TABLES} GROUP BY database ORDER BY database`;
+const tableStatsSql = (scope = "") =>
+  `SELECT database AS schema_name, name AS table_name, num_rows, data_compressed_size, index_size ${BASE_TABLES}${scope} ORDER BY data_compressed_size DESC`;
+const indexStatsSql = (scope = "") =>
+  `SELECT database AS schema_name, \`table\` AS table_name, name AS index_name, \`type\` AS index_type, definition FROM default.system.indexes${scope} ORDER BY database, \`table\`, name`;
+
+/** The statements a read sends to a runner that answers every one with no rows. */
+async function sentBy(read: (runner: DatabendStatementRunner) => Promise<unknown>): Promise<string[]> {
+  const sent: string[] = [];
+  await read(async (sql) => {
+    sent.push(sql);
+    return outcome([], []);
+  });
+  return sent;
+}
+
 const OVERVIEW_ANSWERS = {
   [DATABEND_VERSION_SQL]: outcome([["server_version", "String"]], [["8.0.26-v1.2.951-nightly"]]),
-  [DATABEND_OVERVIEW_TABLES_SQL]: outcome(
+  [OVERVIEW_TABLES_SQL]: outcome(
     [
       ["table_count", "UInt64"],
       ["compressed_bytes", "Nullable(UInt64)"],
@@ -116,19 +130,23 @@ const OVERVIEW_ANSWERS = {
     ],
     [["2", "14915", "3389"]],
   ),
-  [DATABEND_ACTIVE_QUERIES_SQL]: outcome([["active_queries", "UInt64"]], [["1"]]),
-  [DATABEND_INDEX_COUNT_SQL]: outcome([["index_count", "UInt64"]], [["4"]]),
+  [ACTIVE_QUERIES_SQL]: outcome([["active_queries", "UInt64"]], [["1"]]),
+  [INDEX_COUNT_SQL]: outcome([["index_count", "UInt64"]], [["4"]]),
 };
 
-describe("the design 5.5 statements, exactly", () => {
-  test("the overview reads the default catalog's sums and counts command = 'Query' [X35]", () => {
-    expect(DATABEND_OVERVIEW_TABLES_SQL).toBe(
+describe("the design 5.5 statements, exactly, as each panel sends them", () => {
+  test("the overview reads the default catalog's sums and counts command = 'Query' [X35], one at a time", async () => {
+    expect(OVERVIEW_TABLES_SQL).toBe(
       "SELECT count(*) AS table_count, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes FROM default.system.tables WHERE catalog = 'default' AND table_type = 'BASE TABLE' AND database NOT IN ('system', 'information_schema')",
     );
-    expect(DATABEND_ACTIVE_QUERIES_SQL).toBe(
-      "SELECT count(*) AS active_queries FROM default.system.processes WHERE command = 'Query' AND id <> connection_id()",
-    );
-    expect(DATABEND_INDEX_COUNT_SQL).toBe("SELECT count(*) AS index_count FROM default.system.indexes");
+    const { runner, calls } = routed(OVERVIEW_ANSWERS);
+    await getOverview(runner);
+    expect(calls.map((call) => call.sql)).toEqual([
+      DATABEND_VERSION_SQL,
+      OVERVIEW_TABLES_SQL,
+      ACTIVE_QUERIES_SQL,
+      INDEX_COUNT_SQL,
+    ]);
   });
 
   test("the sessions read covers every non-idle session of the warehouse", () => {
@@ -143,33 +161,33 @@ describe("the design 5.5 statements, exactly", () => {
     );
   });
 
-  test("table, storage and index stats, with the database filter quoted", () => {
-    const base =
-      "SELECT database AS schema_name, name AS table_name, num_rows, data_compressed_size, index_size FROM default.system.tables WHERE catalog = 'default' AND table_type = 'BASE TABLE' AND database NOT IN ('system', 'information_schema')";
-    expect(databendTableStatsSql()).toBe(`${base} ORDER BY data_compressed_size DESC`);
-    expect(databendTableStatsSql("d`b'\\y")).toBe(
-      `${base} AND database = 'd\`b''\\\\y' ORDER BY data_compressed_size DESC`,
-    );
-    expect(DATABEND_STORAGE_SQL).toBe(
-      "SELECT database AS database_name, sum(data_compressed_size) AS compressed_bytes, sum(index_size) AS index_bytes FROM default.system.tables WHERE catalog = 'default' AND table_type = 'BASE TABLE' AND database NOT IN ('system', 'information_schema') GROUP BY database ORDER BY database",
-    );
-    const indexes =
-      "SELECT database AS schema_name, `table` AS table_name, name AS index_name, `type` AS index_type, definition FROM default.system.indexes";
-    expect(databendIndexStatsSql()).toBe(`${indexes} ORDER BY database, \`table\`, name`);
-    expect(databendIndexStatsSql("d'")).toBe(`${indexes} WHERE database = 'd''' ORDER BY database, \`table\`, name`);
+  test("table, storage and index stats, with the database filter quoted", async () => {
+    expect(await sentBy((runner) => getTableStats(runner))).toEqual([tableStatsSql()]);
+    expect(await sentBy((runner) => getTableStats(runner, { schema: "d`b'\\y" }))).toEqual([
+      tableStatsSql(" AND database = 'd`b''\\\\y'"),
+    ]);
+    expect(await sentBy(getStorageStats)).toEqual([STORAGE_SQL]);
+    expect(await sentBy((runner) => getIndexStats(runner))).toEqual([indexStatsSql()]);
+    expect(await sentBy((runner) => getIndexStats(runner, { schema: "d'" }))).toEqual([
+      indexStatsSql(" WHERE database = 'd'''"),
+    ]);
   });
 });
 
 describe("limits", () => {
-  test("clamped to 1..500, the default for none or a non-number", () => {
+  test("clamped to 1..500, the default for none or a non-number", async () => {
     expect(DATABEND_MAX_MONITORING_LIMIT).toBe(500);
-    expect(clampMonitoringLimit(undefined, 20)).toBe(20);
-    expect(clampMonitoringLimit(Number.NaN, 20)).toBe(20);
-    expect(clampMonitoringLimit(0, 20)).toBe(1);
-    expect(clampMonitoringLimit(-5, 20)).toBe(1);
-    expect(clampMonitoringLimit(2.7, 20)).toBe(2);
-    expect(clampMonitoringLimit(501, 20)).toBe(500);
-    expect(clampMonitoringLimit(Number.POSITIVE_INFINITY, 20)).toBe(20);
+    const cases: [number | undefined, number][] = [
+      [undefined, DATABEND_DEFAULT_SLOW_QUERY_LIMIT],
+      [Number.NaN, DATABEND_DEFAULT_SLOW_QUERY_LIMIT],
+      [0, 1],
+      [-5, 1],
+      [2.7, 2],
+      [501, 500],
+      [Number.POSITIVE_INFINITY, DATABEND_DEFAULT_SLOW_QUERY_LIMIT],
+    ];
+    const sent = await Promise.all(cases.map(([limit]) => sentBy((runner) => getSlowQueries(runner, { limit }))));
+    expect(sent).toEqual(cases.map(([, clamped]) => [databendSlowQueriesSql(clamped)]));
   });
 
   test("the panels send the clamped limit", async () => {
@@ -187,10 +205,6 @@ describe("limits", () => {
       databendSessionsSql(DATABEND_DEFAULT_SESSION_LIMIT),
       databendSlowQueriesSql(DATABEND_DEFAULT_SLOW_QUERY_LIMIT),
     ]);
-
-    const slow = routed({ [databendSlowQueriesSql(1)]: outcome(SLOW_SCHEMA, []) });
-    await getSlowQueries(slow.runner, { limit: 0 });
-    expect(slow.calls[0].sql).toBe(databendSlowQueriesSql(1));
   });
 });
 
@@ -226,21 +240,24 @@ describe("sessions and the kill [X08]", () => {
 
   test("the kill sends KILL QUERY with the session id as a literal", async () => {
     const pid = "5c00e52f-34c2-4cab-8ba8-c1f1121157bf";
-    expect(databendKillSql(pid)).toBe(`KILL QUERY '${pid}'`);
     const { runner, calls } = routed({ [`KILL QUERY '${pid}'`]: outcome([], []) });
     await killSession(runner, pid);
     expect(calls).toEqual([{ sql: `KILL QUERY '${pid}'`, rowCut: DATABEND_SURFACE_ROW_CUT }]);
   });
 
-  test("the kill id pattern: 1 to 64 letters, digits and hyphens", () => {
-    expect(DATABEND_KILL_ID_PATTERN.source).toBe("^[A-Za-z0-9-]{1,64}$");
-    for (const id of ["a", "A-9", "x".repeat(64), "01a11896a18d7ae399fb6947927521b2"]) {
-      expect(databendKillSql(id)).toBe(`KILL QUERY '${id}'`);
-    }
-    for (const id of ["x".repeat(65), "a'b", "a b", "a\\b", "a_b", "é"]) {
-      expect(() => databendKillSql(id)).toThrow(DATABEND_MONITORING_SENTENCES.killIdRefused);
-    }
-    expect(() => databendKillSql("")).toThrow(DATABEND_MONITORING_SENTENCES.killNeedsId);
+  test("the kill id pattern: 1 to 64 letters, digits and hyphens; anything else sends nothing", async () => {
+    const accepted = ["a", "A-9", "x".repeat(64), "01a11896a18d7ae399fb6947927521b2"];
+    const sent = await Promise.all(accepted.map((id) => sentBy((runner) => killSession(runner, id))));
+    expect(sent).toEqual(accepted.map((id) => [`KILL QUERY '${id}'`]));
+    const refused = routed({});
+    const refusals = ["x".repeat(65), "a'b", "a b", "a\\b", "a_b", "é"].map((id) =>
+      killSession(refused.runner, id).catch((error: unknown) => (error as Error).message),
+    );
+    expect(await Promise.all(refusals)).toEqual(refusals.map(() => DATABEND_MONITORING_SENTENCES.killIdRefused));
+    expect(refused.calls).toEqual([]);
+    const empty = routed({});
+    await expect(killSession(empty.runner, "")).rejects.toThrow(DATABEND_MONITORING_SENTENCES.killNeedsId);
+    expect(empty.calls).toEqual([]);
   });
 
   test("a refused kill sends nothing, and a failed one propagates", async () => {
@@ -293,7 +310,7 @@ describe("each panel degrades to empty on the unavailable codes and propagates t
   test("a cut table list is refused, not shown in part", async () => {
     const cut = { bound: "rows", limit: 100_000 } as const;
     const { runner } = routed({
-      [databendTableStatsSql()]: outcome([["schema_name", "String"]], [["a"]], cut),
+      [tableStatsSql()]: outcome([["schema_name", "String"]], [["a"]], cut),
     });
     await expect(getTableStats(runner)).rejects.toThrow(DATABEND_OBJECT_SENTENCES.incomplete("table statistics", cut));
   });
@@ -317,7 +334,7 @@ describe("the panels", () => {
   test("an empty catalog sums to NULL, which is zero bytes", async () => {
     const { runner } = routed({
       ...OVERVIEW_ANSWERS,
-      [DATABEND_OVERVIEW_TABLES_SQL]: outcome(
+      [OVERVIEW_TABLES_SQL]: outcome(
         [
           ["table_count", "UInt64"],
           ["compressed_bytes", "Nullable(UInt64)"],
@@ -346,7 +363,7 @@ describe("the panels", () => {
 
   test("table stats: compressed and index bytes, a NULL left out", async () => {
     const { runner } = routed({
-      [databendTableStatsSql("db")]: outcome(
+      [tableStatsSql(" AND database = 'db'")]: outcome(
         [
           ["schema_name", "String"],
           ["table_name", "String"],
@@ -378,7 +395,7 @@ describe("the panels", () => {
 
   test("storage: one row per database", async () => {
     const { runner } = routed({
-      [DATABEND_STORAGE_SQL]: outcome(
+      [STORAGE_SQL]: outcome(
         [
           ["database_name", "String"],
           ["compressed_bytes", "Nullable(UInt64)"],
@@ -398,7 +415,7 @@ describe("the panels", () => {
 
   test("index stats: the definition's columns, no size or scan counters to read", async () => {
     const { runner } = routed({
-      [databendIndexStatsSql()]: outcome(
+      [indexStatsSql()]: outcome(
         [
           ["schema_name", "String"],
           ["table_name", "Nullable(String)"],

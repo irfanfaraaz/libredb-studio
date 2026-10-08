@@ -1,0 +1,868 @@
+/**
+ * `docs/providers/databend.md` quotes sentences and numbers the code owns (design section 10), the shape of
+ * `tests/unit/db/influxdb/provider-doc-influxdb3.test.ts`: one test file per type-id, because the tri-sync invariant
+ * is per type-id.
+ *
+ * A value copied into prose is true only until the code moves, so every exported sentence of the provider, every
+ * field hint, bound, setting, grammar field, capability and label the doc quotes is read back here from the module
+ * that owns it, and the pinned build from the capture manifest. A sentence record is quoted whole: each record's keys
+ * are listed here, so a sentence added to the code fails this file until the doc quotes it. A template is written in
+ * the doc with the bracketed placeholders this file fills.
+ */
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { parse as parseYAML } from "yaml";
+import {
+  DATABEND_DSN_REFUSALS,
+  DATABEND_SSLMODE_NOTICES,
+  databendNotAppliedNotice,
+  parseConnectionString,
+} from "@/lib/connection-string-parser";
+import { DB_UI_CONFIG, DATABEND_FIELD_HINTS } from "@/lib/db-ui-config";
+import {
+  CONNECTION_STRING_ACCEPTED,
+  MCP_EXPOSABLE,
+  READ_ONLY_ENFORCED,
+  READS_FILE_ACCESS_POSTURE,
+} from "@/lib/db/compatibility";
+import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
+import { DATABEND_ANSWER_SENTENCES, RESULT_MODE_FLOOR } from "@/lib/db/providers/sql/databend/answer";
+import { AUTH_LATCH_MAX_ENTRIES, AUTH_LATCH_TTL_MS } from "@/lib/db/providers/sql/databend/auth-latch";
+import {
+  DATABEND_CELL_BUDGET,
+  DATABEND_CLOSE_TIMEOUT_MS,
+  DATABEND_CONNECTION_SENTENCES,
+  DATABEND_DEFAULT_PORT,
+  DATABEND_LIMITER_OPTIONS,
+  DATABEND_MAX_SOCKETS,
+  DATABEND_REQUEST_HEADER_NAMES,
+  DATABEND_RESPONSE_CAP_BYTES,
+  DATABEND_STATEMENT_BYTES,
+  DATABEND_SURFACE_TIMEOUT_MS,
+} from "@/lib/db/providers/sql/databend/connection-options";
+import {
+  answerError,
+  DATABEND_ERROR_SENTENCES,
+  DATABEND_PROTOCOL_FAULTS,
+  type DatabendFailureContext,
+  refusalError,
+} from "@/lib/db/providers/sql/databend/errors";
+import { DATABEND_PAGE_UNANSWERED } from "@/lib/db/providers/sql/databend/http-transport";
+import { DATABEND_PROVIDER_SENTENCES, DatabendProvider } from "@/lib/db/providers/sql/databend/index";
+import {
+  DATABEND_DEFAULT_SESSION_LIMIT,
+  DATABEND_DEFAULT_SLOW_QUERY_LIMIT,
+  DATABEND_DEGRADE_CODES,
+  DATABEND_MAX_MONITORING_LIMIT,
+  DATABEND_MONITORING_SENTENCES,
+  DATABEND_UNAVAILABLE_TEXT,
+  DATABEND_UNKNOWN_TEXT,
+  databendSessionsSql,
+  databendSlowQueriesSql,
+  getHealth,
+} from "@/lib/db/providers/sql/databend/introspect";
+import { DATABEND_KILL_SPEC, DATABEND_LABEL_SENTENCES, DATABEND_LABELS } from "@/lib/db/providers/sql/databend/labels";
+import { DATABEND_OBJECT_SENTENCES, type DatabendStatementRunner } from "@/lib/db/providers/sql/databend/objects";
+import { retryDecision } from "@/lib/db/providers/sql/databend/retry";
+import { LOGOUT_PATH, NEXT_URI_REFUSED, QUERY_PATH } from "@/lib/db/providers/sql/databend/routes";
+import {
+  globalSettingsChangedWarning,
+  ROLE_NOT_CARRIED,
+  SETTINGS_NOT_CARRIED,
+  TEMP_TABLES_DROPPED,
+  TRANSACTION_ENDED,
+  TRANSACTION_MAY_STAY_OPEN,
+  USE_NOT_CARRIED,
+} from "@/lib/db/providers/sql/databend/session";
+import {
+  DATABEND_FORM_FEED,
+  DATABEND_HINT_SEMICOLON,
+  DATABEND_HINT_TOKEN,
+  DATABEND_IDENTIFIER_DOLLAR,
+  DATABEND_MULTIPLE_STATEMENTS,
+  DATABEND_NO_STATEMENT,
+  DATABEND_STAGE_BACKSLASH,
+  DATABEND_TAGGED_DOLLAR,
+  DATABEND_UNTERMINATED_SPAN,
+  databendStatementRefusal,
+} from "@/lib/db/providers/sql/databend/sql-text";
+import { DatabendError, type DatabendTruncation } from "@/lib/db/providers/sql/databend/transport";
+import { MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
+import { databendTextStrategy } from "@/lib/explain/databend-text";
+import { SeedConnectionSchema } from "@/lib/seed/types";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
+import type { DatabaseConnection } from "@/lib/types";
+import { loadDatabendManifest } from "../../../helpers/databend-fixtures";
+import { idsOf, ok, pathsOf, runSignal, statement, transportHarness } from "../../../helpers/databend-node-transport";
+
+const ROOT = path.resolve(import.meta.dir, "../../../..");
+const read = (relative: string): string => readFileSync(path.join(ROOT, relative), "utf8");
+const DOC = read("docs/providers/databend.md");
+const BACKLOG = read("docs/BACKLOG.md");
+const FIXTURE_README = read("docker/databend/README.md");
+
+const CONNECTION: DatabaseConnection = {
+  id: "databend-doc",
+  name: "Databend",
+  type: "databend",
+  host: "localhost",
+  port: DATABEND_DEFAULT_PORT,
+  user: "root",
+  createdAt: new Date(0),
+};
+const provider = new DatabendProvider(CONNECTION);
+const capabilities = provider.getCapabilities();
+const UI = DB_UI_CONFIG.databend;
+
+/** Thousands grouped by commas, the doc's spelling, the same in every locale. */
+const n = (value: number): string => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+/** Prose is one sentence per line, so a sentence that spans lines is compared with its line breaks read as spaces. */
+const flat = (text: string): string => text.replace(/\s*\n\s*/g, " ");
+const FLAT_DOC = flat(DOC);
+const MIB = 1024 * 1024;
+
+/** The section under the heading line `heading`, up to the next heading of its level or above. */
+function sectionOf(text: string, heading: string): string {
+  const lines = text.split("\n");
+  const start = lines.indexOf(heading);
+  if (start < 0) throw new Error(`no heading ${heading}`);
+  const level = heading.indexOf(" ");
+  const inFence = (at: number) => lines.slice(0, at).filter((line) => line.startsWith("```")).length % 2 === 1;
+  const end = lines.findIndex(
+    (line, at) => at > start && /^#{1,6} /.test(line) && line.indexOf(" ") <= level && !inFence(at),
+  );
+  return lines.slice(start, end < 0 ? lines.length : end).join("\n");
+}
+
+/** The table row of `text` whose first cell is exactly `cell`. */
+const rowOf = (text: string, cell: string): string | undefined =>
+  text.split("\n").find((line) => line.startsWith(`| ${cell} |`));
+
+/** A placeholder standing where a template takes a number. */
+const slot = (name: string): number => name as unknown as number;
+
+/** The statement budget's own cut, as a cut result reports it. */
+const BYTES_CUT: DatabendTruncation = { bound: "bytes", limit: DATABEND_STATEMENT_BYTES };
+const CELLS_CUT: DatabendTruncation = { bound: "cells", limit: DATABEND_CELL_BUDGET };
+const ROWS_CUT: DatabendTruncation = { bound: "rows", limit: MAX_UNLIMITED_ROWS };
+
+/**
+ * Every sentence of each exported record, keyed as the record is, each template filled with the doc's placeholders.
+ * A key the code adds and this map lacks fails the key check below.
+ */
+const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readonly quotes: readonly string[] }>> = {
+  DATABEND_CONNECTION_SENTENCES: {
+    keys: Object.keys(DATABEND_CONNECTION_SENTENCES),
+    quotes: [
+      DATABEND_CONNECTION_SENTENCES.userRequired,
+      DATABEND_CONNECTION_SENTENCES.userColon,
+      DATABEND_CONNECTION_SENTENCES.control("User"),
+      DATABEND_CONNECTION_SENTENCES.control("Password"),
+      DATABEND_CONNECTION_SENTENCES.malformed("User"),
+      DATABEND_CONNECTION_SENTENCES.malformed("Password"),
+      DATABEND_CONNECTION_SENTENCES.warehouse,
+      DATABEND_CONNECTION_SENTENCES.plaintext,
+      DATABEND_CONNECTION_SENTENCES.tunnelNotOpened,
+      DATABEND_CONNECTION_SENTENCES.queryTimeout,
+      DATABEND_CONNECTION_SENTENCES.wrongType("[field]", "[type]"),
+    ],
+  },
+  DATABEND_ANSWER_SENTENCES: {
+    keys: Object.keys(DATABEND_ANSWER_SENTENCES),
+    quotes: [DATABEND_ANSWER_SENTENCES.resultMode(""), DATABEND_ANSWER_SENTENCES.resultMode("[mode]")],
+  },
+  DATABEND_ERROR_SENTENCES: {
+    keys: Object.keys(DATABEND_ERROR_SENTENCES),
+    quotes: [
+      DATABEND_ERROR_SENTENCES.latched("[time]", "[until]"),
+      DATABEND_ERROR_SENTENCES.signInRefused,
+      DATABEND_ERROR_SENTENCES.possibleLockout,
+      DATABEND_ERROR_SENTENCES.cloudSqlUser,
+      DATABEND_ERROR_SENTENCES.statementForbidden("[server text]"),
+      DATABEND_ERROR_SENTENCES.signInMissing,
+      DATABEND_ERROR_SENTENCES.followUpRefused,
+      DATABEND_ERROR_SENTENCES.warehouseRefused("[warehouse]"),
+      DATABEND_ERROR_SENTENCES.warehouseRequired,
+      DATABEND_ERROR_SENTENCES.hostRefused,
+      DATABEND_ERROR_SENTENCES.middlewareRefused("[server text]"),
+      DATABEND_ERROR_SENTENCES.nothingRan,
+      DATABEND_ERROR_SENTENCES.resuming("[warehouse]", "[seconds]"),
+      DATABEND_ERROR_SENTENCES.unavailable("[cause]", "[seconds]"),
+      DATABEND_ERROR_SENTENCES.noAnswer("[cause]"),
+      DATABEND_ERROR_SENTENCES.warehouseStarting,
+      DATABEND_ERROR_SENTENCES.cancelledBeforeAnswer,
+      DATABEND_ERROR_SENTENCES.deadlineBeforeAnswer("[seconds]"),
+      DATABEND_ERROR_SENTENCES.cancelUnanswered,
+      DATABEND_ERROR_SENTENCES.deadline("[seconds]"),
+      DATABEND_ERROR_SENTENCES.cancelled,
+      DATABEND_ERROR_SENTENCES.protocol("[fault]"),
+      DATABEND_ERROR_SENTENCES.server(slot("[status]"), "[server text]"),
+      DATABEND_ERROR_SENTENCES.tls("[transport error]"),
+      DATABEND_ERROR_SENTENCES.network("[host]", slot("[port]"), "[cause]"),
+      DATABEND_ERROR_SENTENCES.currentDatabase,
+    ],
+  },
+  DATABEND_PROTOCOL_FAULTS: {
+    keys: Object.keys(DATABEND_PROTOCOL_FAULTS),
+    quotes: [
+      DATABEND_PROTOCOL_FAULTS.notAnswer,
+      DATABEND_PROTOCOL_FAULTS.notJson,
+      DATABEND_PROTOCOL_FAULTS.prototypeKey,
+      DATABEND_PROTOCOL_FAULTS.field("[field]"),
+      DATABEND_PROTOCOL_FAULTS.cell,
+      DATABEND_PROTOCOL_FAULTS.width(slot("[cells]"), slot("[columns]")),
+      DATABEND_PROTOCOL_FAULTS.link,
+      DATABEND_PROTOCOL_FAULTS.queryId,
+      DATABEND_PROTOCOL_FAULTS.sessionId,
+      DATABEND_PROTOCOL_FAULTS.proxySession,
+      DATABEND_PROTOCOL_FAULTS.pollBound,
+    ],
+  },
+  DATABEND_LABEL_SENTENCES: {
+    keys: Object.keys(DATABEND_LABEL_SENTENCES),
+    quotes: Object.values(DATABEND_LABEL_SENTENCES),
+  },
+  DATABEND_PROVIDER_SENTENCES: {
+    keys: Object.keys(DATABEND_PROVIDER_SENTENCES),
+    quotes: [
+      DATABEND_PROVIDER_SENTENCES.params,
+      DATABEND_PROVIDER_SENTENCES.resultCut(BYTES_CUT),
+      DATABEND_PROVIDER_SENTENCES.resultCut(CELLS_CUT),
+      DATABEND_PROVIDER_SENTENCES.resultCut(ROWS_CUT),
+      DATABEND_PROVIDER_SENTENCES.closeFailed("final"),
+      DATABEND_PROVIDER_SENTENCES.closeFailed("kill"),
+      DATABEND_PROVIDER_SENTENCES.closeFailed("rollback"),
+      DATABEND_PROVIDER_SENTENCES.closeFailed("logout"),
+      DATABEND_PROVIDER_SENTENCES.databaseMissing("[database]"),
+      DATABEND_PROVIDER_SENTENCES.unverifiedTls,
+      DATABEND_PROVIDER_SENTENCES.slotsBusy("[seconds]"),
+      DATABEND_PROVIDER_SENTENCES.maintenanceRefused("[operation]"),
+    ],
+  },
+  DATABEND_MONITORING_SENTENCES: {
+    keys: Object.keys(DATABEND_MONITORING_SENTENCES),
+    quotes: [
+      DATABEND_MONITORING_SENTENCES.killNeedsId,
+      DATABEND_MONITORING_SENTENCES.killIdRefused,
+      DATABEND_MONITORING_SENTENCES.killAsked("[session id]"),
+      DATABEND_MONITORING_SENTENCES.sessionState("[status]", "[query id]"),
+    ],
+  },
+  DATABEND_DSN_REFUSALS: {
+    keys: Object.keys(DATABEND_DSN_REFUSALS),
+    quotes: Object.values(DATABEND_DSN_REFUSALS),
+  },
+  DATABEND_SSLMODE_NOTICES: {
+    keys: Object.keys(DATABEND_SSLMODE_NOTICES),
+    quotes: Object.values(DATABEND_SSLMODE_NOTICES),
+  },
+  DATABEND_OBJECT_SENTENCES: {
+    keys: Object.keys(DATABEND_OBJECT_SENTENCES),
+    quotes: [
+      DATABEND_OBJECT_SENTENCES.bound(BYTES_CUT),
+      DATABEND_OBJECT_SENTENCES.incomplete("[surface]", BYTES_CUT),
+      DATABEND_OBJECT_SENTENCES.bulkCut(BYTES_CUT),
+      DATABEND_OBJECT_SENTENCES.sourceCut(BYTES_CUT),
+      DATABEND_OBJECT_SENTENCES.unknownTableType("[type]"),
+      DATABEND_OBJECT_SENTENCES.unknownKind("[kind]"),
+      DATABEND_OBJECT_SENTENCES.badLimit(slot("[limit]")),
+      DATABEND_OBJECT_SENTENCES.noColumns("[object]"),
+      DATABEND_OBJECT_SENTENCES.noColumnsLeftOut(["[object]"]),
+      DATABEND_OBJECT_SENTENCES.noDefinition,
+      DATABEND_OBJECT_SENTENCES.noPassword("[user]"),
+      DATABEND_OBJECT_SENTENCES.sourceLabel,
+    ],
+  },
+};
+
+/** The sentence constants of sql-text.ts, every export of it but the guard function. */
+const GUARD_SENTENCES: readonly string[] = [
+  DATABEND_FORM_FEED,
+  DATABEND_HINT_SEMICOLON,
+  DATABEND_HINT_TOKEN,
+  DATABEND_IDENTIFIER_DOLLAR,
+  DATABEND_MULTIPLE_STATEMENTS,
+  DATABEND_NO_STATEMENT,
+  DATABEND_STAGE_BACKSLASH,
+  DATABEND_TAGGED_DOLLAR,
+  DATABEND_UNTERMINATED_SPAN,
+];
+
+describe("docs/providers/databend.md quotes what the code says", () => {
+  test("the title and the overview name the dialog's label", () => {
+    expect(UI.label).toBe("Databend");
+    expect(DOC.split("\n")[0]).toBe(`# ${UI.label} Provider`);
+    expect(sectionOf(DOC, "## 1. Overview")).toContain(`"${UI.label}"`);
+  });
+
+  test("the header names the egress switch, the pinned build, the floor build and what ran on Databend Cloud", () => {
+    const head = DOC.slice(0, DOC.indexOf("## 1. Overview"));
+    expect(head).toContain(
+      "`DB_HTTP_BLOCK_PRIVATE_HOSTS=true` blocks loopback, private, link-local and other non-public HTTP destinations; it is off by default so local connections work.",
+    );
+    const verified = rowOf(head, "**Verified against**") ?? "";
+    const pin = loadDatabendManifest().image;
+    expect(pin).toMatch(/^datafuselabs\/databend:v1\.2\.951-nightly@sha256:[0-9a-f]{64}$/);
+    expect(verified).toContain(`\`${pin}\``);
+    const floor = /datafuselabs\/databend:(v1\.2\.881@sha256:[0-9a-f]{64})/.exec(FIXTURE_README)?.[1];
+    expect(floor).toBeDefined();
+    expect(verified).toContain(`\`datafuselabs/databend:${floor}\``);
+    // The Cloud probes of 2026-10-08 (I19) ran on a test tenant on the pinned build; the rest of the acceptance did not.
+    expect(verified).toContain(
+      "Databend Cloud: probed on 2026-10-08 on a throwaway test tenant, which runs `1.2.951-nightly-9b7eeff9a8`, the pinned build",
+    );
+    expect(verified).toContain("not run yet");
+    expect(RESULT_MODE_FLOOR).toBe("v1.2.881");
+  });
+
+  test("the programmatic example names the factory's entry point and no line of it", () => {
+    expect(DOC).toMatch(/`createDatabaseProvider\(\)` \(\[`factory\.ts`\]\(\.\.\/\.\.\/src\/lib\/db\/factory\.ts\)\)/);
+    expect(DOC).not.toMatch(/factory\.ts:\d/);
+  });
+
+  test("the field rows are the dialog's hints, and the port is the provider's default", () => {
+    const fields = sectionOf(DOC, "### 4.1 Configuration fields");
+    expect(UI.connectionFields).toEqual([
+      "host",
+      "port",
+      "user",
+      "password",
+      "database",
+      "warehouse",
+      "allowInsecureAuth",
+    ]);
+    expect(rowOf(fields, "Host")).toBe(`| Host | ${DATABEND_FIELD_HINTS.host} |`);
+    expect(rowOf(fields, "Port")).toBe(
+      `| Port | \`${DATABEND_DEFAULT_PORT}\` by default, the query node's HTTP handler; 443 comes from TLS, a DSN or an https:// paste |`,
+    );
+    expect(UI.defaultPort).toBe(String(DATABEND_DEFAULT_PORT));
+    expect(capabilities.defaultPort).toBe(DATABEND_DEFAULT_PORT);
+    expect(rowOf(fields, "User")).toBe(`| User | ${DATABEND_FIELD_HINTS.user} |`);
+    expect(rowOf(fields, "Database")).toBe(`| Database | ${DATABEND_FIELD_HINTS.database} |`);
+    expect(rowOf(fields, UI.fieldLabels?.warehouse ?? "")).toBe(`| Warehouse | ${DATABEND_FIELD_HINTS.warehouse} |`);
+    expect(rowOf(fields, "Send the password without TLS")).toBe(
+      `| Send the password without TLS | ${DATABEND_FIELD_HINTS.allowInsecureAuth} |`,
+    );
+  });
+
+  test("each row of the paste table is what the parser answers, and every refusal and sslmode notice has a row", () => {
+    const paste = sectionOf(DOC, "### 4.1 Configuration fields");
+    const rows = paste.split("\n").filter((line) => /^\| `[^`]*` \| /.test(line));
+    const named = new Set<string>();
+    for (const row of rows) {
+      const [text, message] = row.slice(2, -2).split(" | ");
+      const parsed = parseConnectionString(text.slice(1, -1));
+      expect(parsed?.type, text).toBe("databend");
+      expect(parsed?.refusal ?? parsed?.notice, text).toBe(message);
+      named.add(message);
+    }
+    expect([...named].sort()).toEqual(
+      [...Object.values(DATABEND_DSN_REFUSALS), ...Object.values(DATABEND_SSLMODE_NOTICES)].sort(),
+    );
+    const prose = flat(paste);
+    for (const scheme of ["`databend://`", "`databend+http://`", "`databend+https://`"]) {
+      expect(prose).toContain(scheme);
+      expect(parseConnectionString(`${scheme.slice(1, -1)}root@localhost:8000/`)?.type).toBe("databend");
+    }
+    const ignored = parseConnectionString("databend://root@localhost:8000/?login=disable");
+    expect(ignored?.ignoredParameters).toEqual(["login"]);
+    expect(prose).toContain(`> ${databendNotAppliedNotice(["[names]"])}`);
+  });
+
+  test("every exported sentence record is quoted whole, key for key", () => {
+    const expectedKeys: Readonly<Record<string, readonly string[]>> = {
+      DATABEND_CONNECTION_SENTENCES: [
+        "userRequired",
+        "userColon",
+        "control",
+        "malformed",
+        "warehouse",
+        "plaintext",
+        "tunnelNotOpened",
+        "queryTimeout",
+        "wrongType",
+      ],
+      DATABEND_ANSWER_SENTENCES: ["resultMode"],
+      DATABEND_ERROR_SENTENCES: [
+        "latched",
+        "signInRefused",
+        "possibleLockout",
+        "cloudSqlUser",
+        "statementForbidden",
+        "signInMissing",
+        "followUpRefused",
+        "warehouseRefused",
+        "warehouseRequired",
+        "hostRefused",
+        "middlewareRefused",
+        "nothingRan",
+        "resuming",
+        "unavailable",
+        "noAnswer",
+        "warehouseStarting",
+        "cancelledBeforeAnswer",
+        "deadlineBeforeAnswer",
+        "cancelUnanswered",
+        "deadline",
+        "cancelled",
+        "protocol",
+        "server",
+        "tls",
+        "network",
+        "currentDatabase",
+      ],
+      DATABEND_PROTOCOL_FAULTS: [
+        "notAnswer",
+        "notJson",
+        "prototypeKey",
+        "field",
+        "cell",
+        "width",
+        "link",
+        "queryId",
+        "sessionId",
+        "proxySession",
+        "pollBound",
+      ],
+      DATABEND_LABEL_SENTENCES: [
+        "analyzeGlobalDesc",
+        "vacuumGlobalDesc",
+        "slowQueriesEmptyState",
+        "sessionsEmptyState",
+        "tableStatsCaption",
+      ],
+      DATABEND_PROVIDER_SENTENCES: [
+        "params",
+        "resultCut",
+        "closeFailed",
+        "databaseMissing",
+        "unverifiedTls",
+        "slotsBusy",
+        "maintenanceRefused",
+      ],
+      DATABEND_MONITORING_SENTENCES: ["killNeedsId", "killIdRefused", "killAsked", "sessionState"],
+      DATABEND_DSN_REFUSALS: ["fragment", "signIn", "flight", "jdbc", "shellExport"],
+      DATABEND_SSLMODE_NOTICES: ["require", "enable"],
+      DATABEND_OBJECT_SENTENCES: [
+        "bound",
+        "incomplete",
+        "bulkCut",
+        "sourceCut",
+        "unknownTableType",
+        "unknownKind",
+        "badLimit",
+        "noColumns",
+        "noColumnsLeftOut",
+        "noDefinition",
+        "noPassword",
+        "sourceLabel",
+      ],
+    };
+    for (const [record, { keys, quotes }] of Object.entries(QUOTED)) {
+      expect(keys, record).toEqual([...expectedKeys[record]]);
+      for (const quote of quotes) expect(FLAT_DOC, `${record}: ${quote}`).toContain(quote);
+    }
+  });
+
+  test("the session, routing and paging sentences outside a record are quoted", () => {
+    for (const quote of [
+      USE_NOT_CARRIED,
+      SETTINGS_NOT_CARRIED,
+      globalSettingsChangedWarning(["[setting]"]),
+      ROLE_NOT_CARRIED,
+      TRANSACTION_ENDED,
+      TRANSACTION_MAY_STAY_OPEN,
+      TEMP_TABLES_DROPPED,
+      NEXT_URI_REFUSED,
+      DATABEND_PAGE_UNANSWERED,
+      DATABEND_UNKNOWN_TEXT,
+      DATABEND_UNAVAILABLE_TEXT,
+      databendNotAppliedNotice(["[names]"]),
+    ]) {
+      expect(FLAT_DOC).toContain(quote);
+    }
+    expect(GUARD_SENTENCES).toHaveLength(9);
+    for (const quote of GUARD_SENTENCES) expect(FLAT_DOC).toContain(quote);
+  });
+
+  test("the credential warning for root with no password is quoted", () => {
+    const [warning] = CREDENTIAL_WARNINGS.databend ?? [];
+    expect(warning?.kind).toBe("pair");
+    expect(flat(sectionOf(DOC, "### 4.2 Sign-in"))).toContain(`> Credential warning: ${warning?.message}`);
+  });
+
+  test("each row of the guard table is refused with the sentence it names, and every guard sentence has a row", () => {
+    const guard = sectionOf(DOC, "### 5.2 The statement guard");
+    const rows = guard.split("\n").filter((line) => /^\| `[^`]*` \| /.test(line));
+    const named = new Set<string>();
+    for (const row of rows) {
+      const [text, message] = row.slice(2, -2).split(" | ");
+      // A form feed cannot be written in a table cell, so the doc spells it \f.
+      const sql = text.slice(1, -1).replaceAll("\\f", "\f");
+      expect(databendStatementRefusal(sql), sql).toBe(message);
+      named.add(message);
+    }
+    expect([...named].sort()).toEqual([...GUARD_SENTENCES].sort());
+    expect(flat(guard)).toContain("`SELECT /*+ SET_VAR(timezone='UTC') */ now()` is sent");
+    expect(databendStatementRefusal("SELECT /*+ SET_VAR(timezone='UTC') */ now()")).toBeNull();
+  });
+
+  test("the bound-parameter refusal is the provider's", async () => {
+    let message = "";
+    try {
+      await provider.query("SELECT 1", [1]);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe(DATABEND_PROVIDER_SENTENCES.params);
+    expect(flat(sectionOf(DOC, "### 3.8 Literals, never bound parameters"))).toContain(`> ${message}`);
+  });
+
+  test("the grammar table is the Databend row, every field", () => {
+    const grammar = sectionOf(DOC, "### 5.3 The Databend grammar");
+    const row = resolveSqlGrammar("databend");
+    const documented = grammar.split("\n").filter((line) => /^\| `\w+` \| `/.test(line));
+    expect(documented.map((line) => line.split(" | ").slice(0, 2).join(" | "))).toEqual(
+      Object.entries(row).map(
+        ([key, value]) =>
+          `| \`${key}\` | \`${JSON.stringify(value, (_key, inner: unknown) => (inner instanceof RegExp ? inner.source : inner))}\``,
+      ),
+    );
+  });
+
+  test("every bound the doc quotes is the number the code enforces", () => {
+    const bounds = sectionOf(DOC, "### 3.10 Bounds, and what they were measured against");
+    expect(DATABEND_RESPONSE_CAP_BYTES).toBe(16 * MIB);
+    expect(rowOf(bounds, "One answer")).toContain(
+      `${DATABEND_RESPONSE_CAP_BYTES / MIB} MiB (${n(DATABEND_RESPONSE_CAP_BYTES)} bytes)`,
+    );
+    expect(rowOf(bounds, "Answer text per statement")).toContain(
+      `${DATABEND_STATEMENT_BYTES / MIB} MiB (${n(DATABEND_STATEMENT_BYTES)} bytes)`,
+    );
+    expect(rowOf(bounds, "Cells")).toContain(`${n(DATABEND_CELL_BUDGET)} cells`);
+    expect(rowOf(bounds, "Rows")).toContain(`${n(MAX_UNLIMITED_ROWS)} rows`);
+    expect(rowOf(bounds, "In flight")).toContain(
+      `${DATABEND_LIMITER_OPTIONS.perProvider} statements per connection and ${DATABEND_LIMITER_OPTIONS.perEngine} per server type in this process, with a queue of ${DATABEND_LIMITER_OPTIONS.queueDepth}`,
+    );
+    expect(rowOf(bounds, "Sockets")).toContain(`${DATABEND_MAX_SOCKETS} per connection`);
+    expect(rowOf(bounds, "Tree, connect and monitoring")).toContain(
+      `${DATABEND_SURFACE_TIMEOUT_MS / 1000} seconds, or the query timeout when it is shorter`,
+    );
+    expect(rowOf(bounds, "Kill, final, ROLLBACK and logout")).toContain(
+      `${DATABEND_CLOSE_TIMEOUT_MS / 1000} seconds each`,
+    );
+    expect(rowOf(bounds, "Monitoring lists")).toContain(
+      `${DATABEND_DEFAULT_SESSION_LIMIT} sessions and ${DATABEND_DEFAULT_SLOW_QUERY_LIMIT} slow queries by default, at most ${DATABEND_MAX_MONITORING_LIMIT}`,
+    );
+    expect(rowOf(bounds, "Sign-in latch")).toContain(
+      `${AUTH_LATCH_TTL_MS / 60_000} minutes per refused sign-in, at most ${AUTH_LATCH_MAX_ENTRIES} entries`,
+    );
+  });
+
+  test("the statement request is what the transport sends: its headers, settings and paging", async () => {
+    const request = sectionOf(DOC, "### 5.1 The request");
+    const ids = idsOf(1);
+    const harness = transportHarness([{ method: "POST", path: QUERY_PATH, reply: ok(ids) }]);
+    await harness.transport.run(statement("SELECT 1", { origin: "provider", rowCut: MAX_UNLIMITED_ROWS }));
+    const [sent] = harness.script.requests;
+    const body = JSON.parse(sent.body ?? "{}") as {
+      session: { settings: Record<string, string> };
+      pagination: { wait_time_secs: number; max_rows_per_page: number; max_rows_in_buffer: number };
+    };
+    expect(rowOf(request, "`wait_time_secs`")).toBe(`| \`wait_time_secs\` | \`${body.pagination.wait_time_secs}\` |`);
+    expect(rowOf(request, "`max_rows_per_page`")).toContain(`\`${n(body.pagination.max_rows_per_page)}\``);
+    expect(body.pagination.max_rows_per_page).toBe(10_000);
+    expect(body.pagination.max_rows_in_buffer).toBe(2 * body.pagination.max_rows_per_page);
+    expect(rowOf(request, "`max_rows_in_buffer`")).toBe("| `max_rows_in_buffer` | twice `max_rows_per_page` |");
+    expect(rowOf(request, "`max_rows_per_page`")).toContain("or the row cut plus one when that is smaller");
+    const small = transportHarness([{ method: "POST", path: QUERY_PATH, reply: ok(ids) }]);
+    await small.transport.run(statement("SELECT 1", { origin: "provider", rowCut: 99 }));
+    const smallBody = JSON.parse(small.script.requests[0].body ?? "{}") as typeof body;
+    expect(smallBody.pagination.max_rows_per_page).toBe(99 + 1);
+    expect(smallBody.pagination.max_rows_in_buffer).toBe(2 * (99 + 1));
+    const settings = Object.keys(body.session.settings);
+    expect(settings).toHaveLength(7);
+    for (const key of settings) expect(request).toContain(`\`${key}\``);
+    expect(flat(request)).toContain("all seven of them");
+    for (const name of DATABEND_REQUEST_HEADER_NAMES) expect(request).toContain(`\`${name}\``);
+    for (const name of ["authorization", "user-agent", "x-databend-client-caps", "x-databend-warehouse"]) {
+      expect(request).toContain(`\`${name}\``);
+    }
+    expect(request).toContain(`\`POST ${QUERY_PATH}\``);
+    expect(request).toContain(`\`POST ${LOGOUT_PATH}\``);
+  });
+
+  test("the kill resends the doc quotes are the waits the transport takes", async () => {
+    const ids = idsOf(1);
+    const kill = { method: "GET" as const, path: pathsOf(ids.queryId).kill, reply: { status: 404 } };
+    const { script, time, transport } = transportHarness([
+      { method: "POST", path: QUERY_PATH, reply: { hang: true } },
+      kill,
+      kill,
+      kill,
+      kill,
+      { method: "POST", path: LOGOUT_PATH, reply: { status: 200 } },
+    ]);
+    const run = runSignal();
+    const running = transport.run(statement("SELECT 1", { signal: run.signal })).catch((error: unknown) => error);
+    await script.received(1);
+    run.cancel();
+    expect(await running).toBeInstanceOf(DatabendError);
+    script.expectDone();
+    const waits = time.sleeps.map(n);
+    expect(waits).toHaveLength(3);
+    expect(flat(sectionOf(DOC, "### 5.8 Cancellation and deadlines"))).toContain(
+      `a kill answered 404 is sent again at ${waits[0]}, ${waits[1]} and ${waits[2]} ms`,
+    );
+  });
+
+  test("the server-text cuts the doc quotes are the lengths errors.ts keeps", () => {
+    const ctx: DatabendFailureContext = {
+      request: "post",
+      origin: "user",
+      sql: "SELECT 1",
+      endpoint: { host: "localhost", port: DATABEND_DEFAULT_PORT },
+      timeoutMs: 60_000,
+      secretForms: [],
+    };
+    const long = "x".repeat(5000);
+    const refused = refusalError(
+      { status: 400, contentType: "text/plain", code: 400, gatewayKind: null, text: long },
+      ctx,
+    );
+    const refusalCut = /x+/.exec(refused.message)?.[0].length ?? 0;
+    expect(refused.message).toBe(DATABEND_ERROR_SENTENCES.middlewareRefused(`${"x".repeat(refusalCut)}...`));
+    const failed = answerError({ id: "q", error: { code: 1006, message: long, detail: null } }, ctx, null);
+    const statementCut = /x+/.exec(failed.message)?.[0].length ?? 0;
+    expect(failed.message).toBe(`${"x".repeat(statementCut)}...`);
+    expect(flat(sectionOf(DOC, "## 10. Error handling"))).toContain(
+      `${n(refusalCut)} characters of a refusal, ${n(statementCut)} of a statement error`,
+    );
+  });
+
+  test("the health panel's counts are the limits getHealth reads with", async () => {
+    const health = flat(sectionOf(DOC, "## 7. Monitoring & health"));
+    const quoted = /Health: the overview, the (\d+) slowest queries and (\d+) sessions/.exec(health);
+    expect(quoted).not.toBeNull();
+    const sent: string[] = [];
+    const runner: DatabendStatementRunner = async (sql) => {
+      sent.push(sql);
+      throw new DatabendError("statement", "unknown table", { code: 1025 });
+    };
+    await getHealth(runner);
+    expect(sent).toContain(databendSlowQueriesSql(Number(quoted?.[1])));
+    expect(sent).toContain(databendSessionsSql(Number(quoted?.[2])));
+  });
+
+  test("the retry schedule is what retryDecision answers", () => {
+    const retries = flat(sectionOf(DOC, "### 3.6 Retries"));
+    const steps = [1, 2, 3, 4, 5].map((attempt) =>
+      retryDecision({
+        request: "page",
+        status: 503,
+        gatewayKind: null,
+        transportKind: null,
+        attempt,
+        msLeft: 600_000,
+        retryAfter: null,
+        random: 0.5,
+        pageTimerRetried: false,
+      }),
+    );
+    expect(steps.slice(0, 2)).toEqual([
+      { retry: true, delayMs: 1000 },
+      { retry: true, delayMs: 2000 },
+    ]);
+    expect(steps[2]).toEqual({ retry: false });
+    const post = (attempt: number) =>
+      retryDecision({
+        request: "query",
+        status: 200,
+        gatewayKind: "ProvisionWarehouseTimeout",
+        transportKind: null,
+        attempt,
+        msLeft: 600_000,
+        retryAfter: null,
+        random: 0.5,
+        pageTimerRetried: false,
+      });
+    expect([1, 2, 3, 4, 5].map((attempt) => post(attempt))).toEqual(
+      [1000, 2000, 4000, 8000, 8000].map((delayMs) => ({ retry: true, delayMs })),
+    );
+    expect(post(6)).toEqual({ retry: false });
+    expect(
+      retryDecision({
+        request: "query",
+        status: 503,
+        gatewayKind: null,
+        transportKind: null,
+        attempt: 1,
+        msLeft: 600_000,
+        retryAfter: null,
+        random: 0.5,
+        pageTimerRetried: false,
+      }),
+    ).toEqual({ retry: false });
+    expect(retries).toContain("1, 2, 4, 8 and 8 seconds, each 20 percent either way");
+    expect(retries).toContain("at most six POST attempts and three GET attempts");
+  });
+
+  test("each EXPLAIN shape the doc says gets no plan gets none, and each it says plans does", () => {
+    const explain = sectionOf(DOC, "### 5.6 EXPLAIN is the planning form only");
+    const rows = explain.split("\n").filter((line) => /^\| `[^`]*` \| (Estimate|Explain|Both|Neither) \|/.test(line));
+    expect(rows.length).toBeGreaterThanOrEqual(10);
+    for (const row of rows) {
+      const [text, declined] = row.slice(2, -2).split(" | ");
+      const sql = text.slice(1, -1);
+      const plans = (mode: "estimate" | "analyze") => databendTextStrategy.buildSql(sql, mode) !== null;
+      const expected = {
+        Both: [false, false],
+        Estimate: [false, true],
+        Explain: [true, false],
+        Neither: [true, true],
+      }[declined] as [boolean, boolean];
+      expect([plans("estimate"), plans("analyze")], sql).toEqual(expected);
+    }
+    const words = /The names that decline both modes, as a word or a quoted name, are ([^.]+)\./.exec(
+      flat(explain),
+    )?.[1];
+    const listed = [...(words ?? "").matchAll(/`(\w+)`/g)].map((match) => match[1]);
+    expect(listed).toHaveLength(13);
+    for (const name of listed) {
+      expect(databendTextStrategy.buildSql(`SELECT ${name.toLowerCase()}(1)`, "analyze"), name).toBeNull();
+      expect(databendTextStrategy.buildSql(`SELECT 1 AS "${name.toLowerCase()}"`, "analyze"), name).toBeNull();
+    }
+    expect(capabilities.explainFormat).toBe("databend-text");
+  });
+
+  test("the capability and label tables are the provider's declarations and the records'", () => {
+    const section = sectionOf(DOC, "## 9. Capabilities & labels");
+    const declared: Readonly<Record<string, unknown>> = { ...capabilities };
+    for (const key of [
+      "queryLanguage",
+      "defaultPort",
+      "supportsExplain",
+      "explainFormat",
+      "supportsExternalQueryLimiting",
+      "supportsResultPagination",
+      "supportsCreateTable",
+      "supportsInlineRowEdit",
+      "supportsTestDataGeneration",
+      "supportsTransactions",
+      "declaresForeignKeys",
+      "supportsMaintenance",
+      "maintenanceOperations",
+      "supportsConnectionString",
+      "identifierQuoting",
+      "containerPathShapes",
+    ]) {
+      expect(rowOf(section, `\`${key}\``), key).toBe(`| \`${key}\` | \`${JSON.stringify(declared[key])}\` |`);
+    }
+    expect(capabilities.resumesBilledCompute).toBeUndefined();
+    expect(new DatabendProvider({ ...CONNECTION, warehouse: "wh" }).getCapabilities().resumesBilledCompute).toBe(true);
+    expect(section).toContain("`resumesBilledCompute`");
+    for (const [name, record] of [
+      ["READ_ONLY_ENFORCED", READ_ONLY_ENFORCED],
+      ["MCP_EXPOSABLE", MCP_EXPOSABLE],
+      ["READS_FILE_ACCESS_POSTURE", READS_FILE_ACCESS_POSTURE],
+      ["CONNECTION_STRING_ACCEPTED", CONNECTION_STRING_ACCEPTED],
+    ] as const) {
+      expect(rowOf(section, `\`${name}\``), name).toBe(`| \`${name}\` | \`${record.databend}\` |`);
+    }
+    const kinds = (capabilities.objectKinds ?? []).map((kind) => `\`${kind.id}\``);
+    expect(kinds).toHaveLength(4);
+    for (const kind of kinds) expect(section).toContain(kind);
+    const labels: Readonly<Record<string, unknown>> = { ...DATABEND_LABELS };
+    for (const key of [
+      "entityName",
+      "entityNamePlural",
+      "rowName",
+      "selectAction",
+      "generateAction",
+      "analyzeGlobalTitle",
+      "vacuumGlobalTitle",
+    ]) {
+      expect(rowOf(section, `\`${key}\``), key).toBe(`| \`${key}\` | ${String(labels[key])} |`);
+    }
+    expect(DATABEND_KILL_SPEC.label).toBe("Kill Query");
+    expect(sectionOf(DOC, "## 8. Maintenance")).toContain(`"${DATABEND_KILL_SPEC.label}"`);
+  });
+
+  test("the degrading codes the monitoring section names are the ones introspect.ts reads", () => {
+    const monitoring = flat(sectionOf(DOC, "## 7. Monitoring & health"));
+    const named = /Databend answers one of the codes (.+?) \(/.exec(monitoring)?.[1] ?? "";
+    const codes = [...named.matchAll(/\d{4}/g)].map((match) => Number(match[0]));
+    expect(codes.sort()).toEqual([...DATABEND_DEGRADE_CODES].sort());
+  });
+
+  test("the seed recipe is a seed the loader takes", () => {
+    const usage = sectionOf(DOC, "### 12.3 A seed connection");
+    const recipe = /```yaml\n([\s\S]*?)```/.exec(usage)?.[1] ?? "";
+    const [seed] = parseYAML(recipe.replace(/\$\{\w+\}/g, "filled")) as unknown[];
+    const parsed = SeedConnectionSchema.safeParse(seed);
+    expect(parsed.error?.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`) ?? []).toEqual([]);
+    expect(recipe).toContain("warehouse:");
+    expect(usage).toContain("[SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md)");
+  });
+
+  test("every curl example reads the password from DATABEND_PASSWORD and the doc carries no fixture password", () => {
+    const curls = DOC.split("\n").filter((line) => /\bcurl\b/.test(line) && line.includes(" -u "));
+    expect(curls.length).toBeGreaterThan(0);
+    for (const line of curls) expect(line).toContain('"$DATABEND_USER:$DATABEND_PASSWORD"');
+    expect(DOC).not.toContain("Probe123pass!");
+    expect(DOC).not.toContain("Reader123pass!");
+  });
+
+  test("every backlog id the doc cites is an entry of docs/BACKLOG.md", () => {
+    const cited = [...new Set([...DOC.matchAll(/\[([BDUS]\d{1,3})\]\(\.\.\/BACKLOG\.md\)/g)].map((match) => match[1]))];
+    for (const id of ["D246", "D247", "D248", "D249", "U97", "B103", "S2"]) expect(cited).toContain(id);
+    for (const id of cited) expect(BACKLOG).toMatch(new RegExp(`^### ${id}\\. `, "m"));
+  });
+
+  test("the known limitations keep each stated limit", () => {
+    const limits = flat(sectionOf(DOC, "## 13. Known limitations"));
+    for (const fragment of [
+      "A dollar-quoted run tagged other than `$$`",
+      "A form feed",
+      "A stage name (`@...`) holding a backslash",
+      "An optimizer hint",
+      "a quote other than a plain single-quoted value",
+      "A temporary table and a transaction end with their statement",
+      "`SET VARIABLE`",
+      "`SET ROLE`",
+      "may have run",
+      "no HTTP proxy",
+      "AI and MCP",
+      "stages and `COPY`",
+      "`_mv_source_row_id`",
+      "a view that no longer plans",
+      "Studio's own monitoring reads",
+      "16 MiB",
+      "when its page is large",
+      RESULT_MODE_FLOOR,
+      "the Sessions panel",
+      "`IDENTIFIED BY`",
+      "`login_history`",
+      "plain HTTP",
+      "transformed",
+      "server's global time zone",
+      "`Timestamp_Tz`",
+      "path prefix",
+      "default catalog",
+      "skipped by name",
+      "the session's current statement",
+      "verified locally",
+    ]) {
+      expect(limits, fragment).toContain(fragment);
+    }
+  });
+
+  test("the object edit section the edit census asks of an abstainer is there", () => {
+    expect(DOC).toMatch(/^#{1,6} .*Object edit \(#789\)/m);
+  });
+
+  test("the doc carries no em dash and no en dash", () => {
+    expect(DOC).not.toMatch(/[–—]/);
+  });
+});
