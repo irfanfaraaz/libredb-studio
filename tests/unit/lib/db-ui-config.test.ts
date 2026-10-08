@@ -5,7 +5,9 @@ import {
   connectionFieldHint,
   connectionFieldLabel,
   connectionFieldPlaceholder,
+  connectionFieldRefusal,
   DATABEND_FIELD_HINTS,
+  DATABEND_FIELD_RULES,
   DB_UI_CONFIG,
   getDBConfig,
   getDBIcon,
@@ -19,7 +21,11 @@ import {
   type DatabaseUIConfig,
 } from "@/lib/db-ui-config";
 import { SHOWCASE_DATABASE_ORDER, SHOWCASE_RANK, listShowcaseDatabases } from "@/lib/db-showcase";
-import type { DatabaseType } from "@/lib/types";
+import type { DatabaseConnection, DatabaseType } from "@/lib/types";
+import {
+  buildDatabendConnectionOptions,
+  DATABEND_CONNECTION_SENTENCES,
+} from "@/lib/db/providers/sql/databend/connection-options";
 import { DatabendIcon, InfluxDBIcon } from "@/components/icons/db-icons";
 import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
 import { declareHostUri } from "../../helpers/synthetic-host-uri";
@@ -908,6 +914,83 @@ describe("declared connection-field copy (#1085)", () => {
     for (const field of EVERY_FIELD.filter((candidate) => candidate !== "saslMechanism")) {
       expect(connectionFieldLabel(config, field, "the dialog's own word")).toBe("the dialog's own word");
       expect(connectionFieldHint(config, field)).toBeUndefined();
+    }
+  });
+});
+
+describe("declared field rules (Databend design 6.3)", () => {
+  const databend = (fields: Partial<DatabaseConnection>): DatabaseConnection => ({
+    id: "c1",
+    name: "Databend",
+    type: "databend",
+    host: "localhost",
+    port: 8000,
+    user: "root",
+    createdAt: new Date(),
+    ...fields,
+  });
+  const LONGEST = "w".repeat(63);
+
+  test("databend declares User required and the Warehouse rule, in the provider's own sentences", () => {
+    const config = getDBConfig("databend");
+    expect(config.fieldRules).toBe(DATABEND_FIELD_RULES);
+    expect(DATABEND_FIELD_RULES.user?.required).toBe(DATABEND_CONNECTION_SENTENCES.userRequired);
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.sentence).toBe(DATABEND_CONNECTION_SENTENCES.warehouse);
+    expect(DATABEND_FIELD_RULES.warehouse?.required).toBeUndefined();
+    // Each sentence names its field first and holds no value, so a refusal never repeats what was typed.
+    expect(DATABEND_FIELD_RULES.user?.required).toStartWith("User ");
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.sentence).toStartWith("Warehouse ");
+  });
+
+  test("the form's warehouse pattern is the provider's, which the dialog cannot import because it is server code", () => {
+    const source = readFileSync(path.join(ROOT, "src/lib/db/providers/sql/databend/connection-options.ts"), "utf8");
+    const declared = /const WAREHOUSE_NAME = \/(.+)\/;/.exec(source);
+    expect(declared?.[1]).toBe(DATABEND_FIELD_RULES.warehouse?.format?.pattern.source);
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.pattern.flags).toBe("");
+    // The control that the two copies agree on the values that matter, not only on their spelling.
+    for (const warehouse of ["small-xy2t", "wh_1", LONGEST, `${LONGEST}w`, "small xy", "wh.1", "wh:1", " wh"]) {
+      const form = connectionFieldRefusal(getDBConfig("databend"), databend({ warehouse }));
+      let provider: string | undefined;
+      try {
+        buildDatabendConnectionOptions(databend({ warehouse }), { queryTimeout: 30_000, appVersion: null });
+      } catch (error) {
+        provider = (error as Error).message;
+      }
+      expect({ warehouse, form }).toEqual({ warehouse, form: provider });
+    }
+  });
+
+  test("connectionFieldRefusal requires User and checks Warehouse, naming the field and never the value", () => {
+    const config = getDBConfig("databend");
+    expect(connectionFieldRefusal(config, databend({ user: "" }))).toBe(DATABEND_CONNECTION_SENTENCES.userRequired);
+    expect(connectionFieldRefusal(config, databend({ user: undefined }))).toBe(
+      DATABEND_CONNECTION_SENTENCES.userRequired,
+    );
+    for (const warehouse of ["small xy", `${LONGEST}w`]) {
+      const refusal = connectionFieldRefusal(config, databend({ warehouse }));
+      expect(refusal).toBe(DATABEND_CONNECTION_SENTENCES.warehouse);
+      expect(refusal).not.toContain(warehouse);
+    }
+    // A valid Warehouse and an absent one pass.
+    expect(connectionFieldRefusal(config, databend({ warehouse: "small-xy2t" }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({ warehouse: LONGEST }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({}))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({ warehouse: "" }))).toBeUndefined();
+    // Fields are checked in the dialog's order, so User is named before Warehouse.
+    expect(connectionFieldRefusal(config, databend({ user: "", warehouse: "small xy" }))).toBe(
+      DATABEND_CONNECTION_SENTENCES.userRequired,
+    );
+  });
+
+  test("only databend declares field rules, so no other engine's Test Connection or Save is checked", () => {
+    const declaring = Object.entries(DB_UI_CONFIG)
+      .filter(([, config]) => config.fieldRules !== undefined)
+      .map(([type]) => type);
+    expect(declaring).toEqual(["databend"]);
+    for (const type of ALL_TYPES.filter((candidate) => candidate !== "databend")) {
+      expect(connectionFieldRefusal(getDBConfig(type), databend({ type, user: "", warehouse: "small xy" }))).toBe(
+        undefined,
+      );
     }
   });
 });

@@ -20,24 +20,13 @@
  * At most 256 entries, each lasting 15 minutes: a new key first drops every expired entry, then the oldest [X30].
  */
 import { createHash } from "node:crypto";
-import { latchedError } from "./errors";
+import { latchedError, latchesSignIn, type SignInAnswer } from "./errors";
 import type { DatabendError } from "./transport";
 
 /** How long a refusal holds its key, Databend's own lockout window (`password_policy.rs:45-46`). */
 export const AUTH_LATCH_TTL_MS = 15 * 60 * 1000;
 /** The most keys the latch holds. */
 export const AUTH_LATCH_MAX_ENTRIES = 256;
-/** The codes of a 401 that refuse the credential: wrong password, the two token codes, and an unknown user. */
-export const LATCHING_401_CODES = Object.freeze([5100, 5101, 5103, 2201] as const);
-/** The lockout code, which latches over HTTP 500 and never in a body, where it is also a complexity error. */
-export const LOCKOUT_CODE = 2215;
-/** The Databend Cloud gateway's kinds for a refused credential. */
-export const LATCHING_GATEWAY_KINDS = Object.freeze([
-  "PasswordAuthFailed",
-  "JWTVerificationFailed",
-  "ForbiddenAccessUser",
-] as const);
-
 /** What the key frames, each field as the connection options validated it. */
 export interface AuthLatchIdentity {
   readonly scheme: "http" | "https";
@@ -51,16 +40,12 @@ export interface AuthLatchIdentity {
   readonly password: string;
 }
 
-/** The part of an answer that decides a sign-in: its status, Databend's code, and a gateway's kind. */
-export interface SignInAnswer {
-  readonly status: number;
-  readonly code?: number;
-  readonly gatewayKind?: string;
-}
-
 /** One attempt's hold on its key, which its first answer settles. */
 export interface AuthAttempt {
-  /** Reports an answer: a 200 proves the key, a latching refusal latches it, and anything else hands it on. */
+  /**
+   * Reports an answer: a 200 proves the key, a refusal that `latchesSignIn` of `errors.ts` names latches it, and
+   * anything else hands it on.
+   */
   settle(answer: SignInAnswer): void;
   /** The attempt ended with no answer (a network failure, a timeout or a cancel): the key goes to the next waiter. */
   abandon(): void;
@@ -79,19 +64,6 @@ export function authLatchKey(identity: AuthLatchIdentity): string {
   const { scheme, host, port, route, user, password } = identity;
   const framed = [scheme, host, String(port), route, user, password].map((value) => `${value.length}:${value}`);
   return createHash("sha256").update(framed.join(""), "utf8").digest("hex");
-}
-
-/**
- * Whether an answer refuses the credential itself (design 3.13), which latches its key: any one of the three signals,
- * the same OR as `refusalError` of `errors.ts`, so a code still latches beside an unrelated gateway kind.
- */
-export function latchesSignIn(answer: SignInAnswer): boolean {
-  const { status, code, gatewayKind } = answer;
-  return (
-    (LATCHING_GATEWAY_KINDS as readonly (string | undefined)[]).includes(gatewayKind) ||
-    (status === 401 && (LATCHING_401_CODES as readonly (number | undefined)[]).includes(code)) ||
-    (status === 500 && code === LOCKOUT_CODE)
-  );
 }
 
 interface Entry {

@@ -584,7 +584,8 @@ export type ExplainFormat =
   | "clickhouse-json"
   | "druid-native"
   | "trino-json"
-  | "duckdb-json";
+  | "duckdb-json"
+  | "databend-text";
 
 /**
  * How deep an engine's container chain is, in the TYPE rather than only in a derivation.

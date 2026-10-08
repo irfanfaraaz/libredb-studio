@@ -28,7 +28,7 @@ import {
   OxiaIcon,
   DatabendIcon,
 } from "@/components/icons/db-icons";
-import type { DatabaseType } from "@/lib/types";
+import type { DatabaseConnection, DatabaseType } from "@/lib/types";
 import type { HostUriScheme } from "@/lib/connection-host-uri";
 import { CREDENTIAL_WARNINGS, type CredentialWarning } from "@/lib/db/credential-warnings";
 
@@ -98,6 +98,13 @@ export interface DatabaseUIConfig {
    */
   readOnlyHint?: string;
   /**
+   * The checks the connection dialog runs on a field before Test Connection and Save send anything, each refusal a
+   * sentence that names the field and never repeats its value. Read through `connectionFieldRefusal`. The provider
+   * runs the same checks again at connect, because a seed or an API call never passes the dialog; this declaration
+   * says them before a request is made.
+   */
+  fieldRules?: Partial<Record<ConnectionField, ConnectionFieldRule>>;
+  /**
    * The choices of a field the connection dialog draws as a select rather than a text box, each a
    * stored value and its label, offered after an empty "None" choice that stores nothing (#1088).
    * The dialog draws the select where the engine takes the field, the same condition
@@ -129,6 +136,33 @@ export interface DatabaseUIConfig {
 
 /** One addressing field, named by the same list that decides whether a save writes it. */
 export type ConnectionField = DatabaseUIConfig["connectionFields"][number];
+
+/** A check the connection dialog runs on one field before Test Connection and Save (`fieldRules`). */
+export interface ConnectionFieldRule {
+  /** The refusal of a blank field; absent, a blank field passes. */
+  readonly required?: string;
+  /** A field that is not blank must match `pattern` whole, or `sentence` is the refusal. */
+  readonly format?: { readonly pattern: RegExp; readonly sentence: string };
+}
+
+/**
+ * Databend's form checks (design 6.3), in the provider's own sentences. The provider module is server code the dialog
+ * cannot import, so the warehouse pattern is a copy of its `WAREHOUSE_NAME`, and tests/unit/lib/db-ui-config.test.ts
+ * holds the copy, and both sentences, to the provider's.
+ */
+export const DATABEND_FIELD_RULES: Readonly<Partial<Record<ConnectionField, ConnectionFieldRule>>> = Object.freeze({
+  user: {
+    required:
+      "User is required: Databend signs in every request as a SQL user, root on a fresh self-hosted node. Nothing was sent.",
+  },
+  warehouse: {
+    format: {
+      pattern: /^[A-Za-z0-9_-]{1,63}$/,
+      sentence:
+        "Warehouse must be 1 to 63 letters, digits, hyphens or underscores, as the warehouse is named in Databend Cloud. Nothing was sent.",
+    },
+  },
+});
 
 /**
  * The sentences the connection dialog draws under Databend's fields (design 6.1), exported so the docs and the form's
@@ -653,6 +687,7 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     fieldLabels: { warehouse: "Warehouse" },
     fieldPlaceholders: { user: "root", database: "default" },
     fieldHints: DATABEND_FIELD_HINTS,
+    fieldRules: DATABEND_FIELD_RULES,
     hostAcceptsUri: ["http", "https"],
   },
   libredb: {
@@ -766,6 +801,26 @@ export function connectionFieldPlaceholder(config: DatabaseUIConfig, field: Conn
  */
 export function connectionFieldHint(config: DatabaseUIConfig, field: ConnectionField): string | undefined {
   return config.fieldHints?.[field];
+}
+
+/**
+ * The first refusal of the engine's `fieldRules` for a connection as the dialog built it, or `undefined` when every
+ * declared check passes. The fields are checked in `connectionFields` order, so the dialog names the first box to fix.
+ * A blank field is one the dialog wrote no value for, or an empty one.
+ */
+export function connectionFieldRefusal(config: DatabaseUIConfig, connection: DatabaseConnection): string | undefined {
+  const values = connection as Partial<Record<ConnectionField, unknown>>;
+  for (const field of config.connectionFields) {
+    const rule = config.fieldRules?.[field];
+    if (rule === undefined) continue;
+    const value = values[field];
+    if (value === undefined || value === "") {
+      if (rule.required !== undefined) return rule.required;
+      continue;
+    }
+    if (rule.format !== undefined && !rule.format.pattern.test(String(value))) return rule.format.sentence;
+  }
+  return undefined;
 }
 
 /** The sentence under the Read-only toggle: the engine's own where it declares one, else the dialog's. */

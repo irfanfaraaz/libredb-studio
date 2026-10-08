@@ -297,10 +297,10 @@ describe("the fleet census of object source declarations", () => {
       [],
     );
     expect(mariadbRows.filter((row) => row.kind.hasSource === true)).toHaveLength(8);
-    // 83 on a MariaDB connection against 81 unconnected: the design states both numbers because
+    // 87 on a MariaDB connection against 85 unconnected: the design states both numbers because
     // criterion 2's evidence method reads an unconnected provider and would otherwise
     // structurally exclude the two riskiest declarations in the phase.
-    expect(UNCONNECTED_SOURCE_KINDS.length + MARIADB_EXTRA_SOURCE_KINDS.length).toBe(83);
+    expect(UNCONNECTED_SOURCE_KINDS.length + MARIADB_EXTRA_SOURCE_KINDS.length).toBe(87);
   });
 
   /*
@@ -386,8 +386,8 @@ describe("the fleet census of object source declarations", () => {
         throw new Error(`the half-declaration guard never reached ${extra}, so it does not cover the MariaDB branch`);
       }
     }
-    // 114 unconnected kinds plus the MariaDB branch's eight.
-    expect(rows).toHaveLength(122);
+    // 118 unconnected kinds plus the MariaDB branch's eight.
+    expect(rows).toHaveLength(126);
 
     const halfDeclared = rows
       .filter((row) => row.kind.sourceLanguage !== undefined && row.kind.hasSource !== true)

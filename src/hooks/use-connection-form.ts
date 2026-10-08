@@ -13,7 +13,7 @@ import {
   type QueryWarning,
 } from "@/lib/types";
 import { describeWarning } from "@/components/results-grid/utils";
-import { getDBConfig, hostUriSchemes, offersSshTunnel } from "@/lib/db-ui-config";
+import { connectionFieldRefusal, getDBConfig, hostUriSchemes, offersSshTunnel } from "@/lib/db-ui-config";
 import { databendNotAppliedNotice, parseConnectionString } from "@/lib/connection-string-parser";
 import { parseHostUri, tlsModeAfterScheme, type HostUriResult } from "@/lib/connection-host-uri";
 import { newLocalId } from "@/lib/ids";
@@ -860,8 +860,19 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     return false;
   }, [type, host, showHostRefusal]);
 
+  /**
+   * The engine's declared field checks (`fieldRules`), run on the connection as it would be sent, so the value
+   * judged is the value written; the refusal names the field and never the value, as the timeout's does.
+   */
+  const validateFieldRules = useCallback(() => {
+    const refusal = connectionFieldRefusal(getDBConfig(type), buildConnection());
+    if (refusal === undefined) return true;
+    setTestResult({ tone: "error", message: refusal });
+    return false;
+  }, [type, buildConnection]);
+
   const handleTestConnection = useCallback(async () => {
-    if (!validateQueryTimeout() || !validateHostAddress()) return;
+    if (!validateQueryTimeout() || !validateHostAddress() || !validateFieldRules()) return;
     setIsTesting(true);
     setTestResult(null);
 
@@ -887,10 +898,10 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     } finally {
       setIsTesting(false);
     }
-  }, [buildConnection, probeConnection, validateQueryTimeout, validateHostAddress]);
+  }, [buildConnection, probeConnection, validateQueryTimeout, validateHostAddress, validateFieldRules]);
 
   const handleConnect = useCallback(async () => {
-    if (!validateQueryTimeout() || !validateHostAddress()) return;
+    if (!validateQueryTimeout() || !validateHostAddress() || !validateFieldRules()) return;
     setIsTesting(true);
     setTestResult(null);
 
@@ -973,6 +984,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     resetConnectionFields,
     validateQueryTimeout,
     validateHostAddress,
+    validateFieldRules,
   ]);
 
   const handlePasteConnectionString = useCallback(() => {

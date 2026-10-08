@@ -67,6 +67,25 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
 const mockFields = (type: string): string[] =>
   MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
 
+// Databend's form checks (design 6.3), with sentences of this file's own: the real declaration and its sentences are
+// held to the provider's by tests/unit/lib/db-ui-config.test.ts, and this file tests that the dialog asks before it
+// sends. Every other type declares none, as in the real table.
+const MOCK_USER_REQUIRED = "User is required (mock).";
+const MOCK_WAREHOUSE_FORMAT = "Warehouse must be a warehouse name (mock).";
+const MOCK_FIELD_RULES: Record<string, Record<string, { required?: string; format?: RegExp }>> = {
+  databend: { user: { required: MOCK_USER_REQUIRED }, warehouse: { format: /^[A-Za-z0-9_-]{1,63}$/ } },
+};
+const mockFieldRefusal = (config: { label: string }, connection: Record<string, unknown>): string | undefined => {
+  const rules = MOCK_FIELD_RULES[config.label.toLowerCase()] ?? {};
+  for (const [field, rule] of Object.entries(rules)) {
+    const value = connection[field];
+    if (value === undefined || value === "") {
+      if (rule.required) return rule.required;
+    } else if (rule.format && !rule.format.test(String(value))) return MOCK_WAREHOUSE_FORMAT;
+  }
+  return undefined;
+};
+
 mock.module("@/lib/db-ui-config", () => ({
   getDBConfig: (type: string) => ({
     label: type.charAt(0).toUpperCase() + type.slice(1),
@@ -82,6 +101,7 @@ mock.module("@/lib/db-ui-config", () => ({
     connectionFields: mockFields(type),
   }),
   takesConnectionField: (type: string, field: string) => mockFields(type).includes(field),
+  connectionFieldRefusal: mockFieldRefusal,
   // Mirrors the real table: `kafka` is the one entry that declares `showSshTunnel: false`.
   offersSshTunnel: (type: string) => type !== "kafka",
 }));
@@ -3616,6 +3636,7 @@ describe("the warehouse field (Databend design 6.1)", () => {
   test("an empty box writes no key, and a type that does not take the field drops it", async () => {
     const empty = renderHook(() => useConnectionForm(props));
     act(() => empty.result.current.setType("databend"));
+    act(() => empty.result.current.setUser("root"));
     expect(await saved(empty.result)).not.toHaveProperty("warehouse");
 
     props.onConnect.mockClear();
@@ -3654,6 +3675,79 @@ describe("the warehouse field (Databend design 6.1)", () => {
     rerender({ ...props, isOpen: true, editConnection: null });
     expect(result.current.warehouse).toBe("");
     expect(CONNECTION_FORM_DEFAULTS.warehouse).toBe("");
+  });
+});
+
+describe("the form checks before Test Connection and Save (Databend design 6.3)", () => {
+  const props = {
+    isOpen: true,
+    onClose: mock(() => {}),
+    onConnect: mock<(connection: DatabaseConnection) => void>(() => {}),
+    onTestConnection: mock(async () => ({ success: true })),
+    editConnection: null as DatabaseConnection | null,
+  };
+  beforeEach(() => {
+    props.onConnect.mockClear();
+    props.onTestConnection.mockClear();
+  });
+
+  const form = (type: DatabaseType, user: string, warehouse: string) => {
+    const { result } = renderHook(() => useConnectionForm(props));
+    act(() => result.current.setType(type));
+    act(() => result.current.setUser(user));
+    act(() => result.current.setWarehouse(warehouse));
+    return result;
+  };
+  const pressBoth = async (result: { current: ReturnType<typeof useConnectionForm> }) => {
+    await act(async () => {
+      await result.current.handleTestConnection();
+    });
+    const tested = result.current.testResult;
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    return { tested, saved: result.current.testResult };
+  };
+
+  test("an empty User blocks Test Connection and Save with its sentence, and nothing is sent", async () => {
+    const result = form("databend", "", "");
+    const refusal = { tone: "error" as const, message: MOCK_USER_REQUIRED };
+    expect(await pressBoth(result)).toEqual({ tested: refusal, saved: refusal });
+    expect(props.onTestConnection).not.toHaveBeenCalled();
+    expect(props.onConnect).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["a space", "small xy"],
+    ["64 characters", "w".repeat(64)],
+  ])("a Warehouse with %s is refused naming the field, never the value", async (_case, warehouse) => {
+    const result = form("databend", "root", warehouse);
+    const refusal = { tone: "error" as const, message: MOCK_WAREHOUSE_FORMAT };
+    expect(await pressBoth(result)).toEqual({ tested: refusal, saved: refusal });
+    expect(props.onTestConnection).not.toHaveBeenCalled();
+    expect(props.onConnect).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["a valid Warehouse", "small-xy2t"],
+    ["63 characters", "w".repeat(63)],
+    ["an empty Warehouse", ""],
+    ["a blank Warehouse, which writes no key", "   "],
+  ])("%s passes to the probe and the save", async (_case, warehouse) => {
+    const result = form("databend", "root", warehouse);
+    const { tested } = await pressBoth(result);
+    expect(tested?.tone).toBe("success");
+    expect(props.onTestConnection).toHaveBeenCalledTimes(2);
+    expect(props.onConnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("no other type is checked: an empty User and a leftover Warehouse still reach the probe and the save", async () => {
+    const result = form("databend", "", "small xy");
+    act(() => result.current.setType("postgres"));
+    const { tested } = await pressBoth(result);
+    expect(tested?.tone).toBe("success");
+    expect(props.onTestConnection).toHaveBeenCalledTimes(2);
+    expect(props.onConnect).toHaveBeenCalledTimes(1);
   });
 });
 

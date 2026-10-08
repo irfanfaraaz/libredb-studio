@@ -88,16 +88,17 @@ export const DATABEND_PROTOCOL_FAULTS = Object.freeze({
   pollBound: "more answers than one statement may take",
 });
 
-/** Codes a query node signs a refused sign-in with over HTTP 401 (L10, UC1, UC2, UC6). */
+/** Codes a query node signs a refused sign-in with over HTTP 401: wrong password, two token codes, unknown user (L10). */
 const SIGN_IN_CODES: ReadonlySet<number> = new Set([5100, 5101, 5103, 2201]);
-/** The lockout of a password policy, over HTTP 500 (L10). */
+/** The lockout of a password policy, which refuses over HTTP 500 and never in a body, where it is also a complexity error. */
 const LOCKOUT_CODE = 2215;
 /** Fail-to-start code naming a setting Studio sent (07 M08d). */
 const SETTING_CODE = 2803;
 const UNKNOWN_DATABASE_CODE = 1003;
 const ABORTED_CODE = 1043;
 
-const GATEWAY_AUTH: ReadonlySet<string> = new Set([
+/** The Databend Cloud gateway's kinds for a refused credential. */
+const GATEWAY_AUTH: ReadonlySet<string | undefined> = new Set([
   "PasswordAuthFailed",
   "JWTVerificationFailed",
   "ForbiddenAccessUser",
@@ -115,6 +116,28 @@ const NO_ANSWER_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504, 520
 const GATEWAY_FAILURE_STATUSES: ReadonlySet<number> = new Set([502, 504, 520]);
 /** Statuses a GET is retried on and, past its retries, reads as a warehouse that did not come up (design 3.11). */
 const BUSY_STATUSES: ReadonlySet<number> = new Set([429, 503]);
+
+/** The part of an answer that decides a sign-in: its status, Databend's code, and a gateway's kind. */
+export interface SignInAnswer {
+  readonly status: number;
+  readonly code?: number;
+  readonly gatewayKind?: string;
+}
+
+/**
+ * Whether an answer refuses the credential itself (design 3.5, 3.13): a gateway's credential kind, a 401 signed with
+ * a sign-in code, or the lockout over HTTP 500. Any one of the three is enough, so a code still counts beside an
+ * unrelated gateway kind. This is the one rule: `refusalError` makes exactly these `auth`, and the sign-in latch of
+ * `auth-latch.ts` latches exactly these (I18).
+ */
+export function latchesSignIn(answer: SignInAnswer): boolean {
+  const { status, code, gatewayKind } = answer;
+  return (
+    GATEWAY_AUTH.has(gatewayKind) ||
+    (status === 401 && SIGN_IN_CODES.has(code ?? 0)) ||
+    (status === 500 && code === LOCKOUT_CODE)
+  );
+}
 
 /** What every classification needs to know about the request that failed. */
 export interface DatabendFailureContext {
@@ -214,8 +237,8 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
   const details = { code, status, detail };
 
   if (gatewayKind === GATEWAY_RESUMING) return unavailableError(gatewayKind, ctx, details);
-  const gatewayAuth = gatewayKind !== null && GATEWAY_AUTH.has(gatewayKind);
-  if (gatewayAuth || (status === 401 && SIGN_IN_CODES.has(code ?? 0)) || (status === 500 && code === LOCKOUT_CODE)) {
+  const gatewayAuth = GATEWAY_AUTH.has(gatewayKind ?? undefined);
+  if (latchesSignIn({ status, code, gatewayKind: gatewayKind ?? undefined })) {
     const parts = [sentences.signInRefused, detail];
     if (code === LOCKOUT_CODE) parts.push(sentences.possibleLockout);
     if (gatewayAuth || ctx.warehouse) parts.push(sentences.cloudSqlUser);
@@ -261,6 +284,14 @@ export function stopError(stop: DatabendStop, state: DatabendStopState, ctx: Dat
   const wait = seconds(ctx.timeoutMs);
   const message = provider && ctx.warehouse ? sentences.resuming(ctx.warehouse, wait) : sentences.deadline(wait);
   return new DatabendError("timeout", message);
+}
+
+/**
+ * Studio's own cancel or deadline before anything was sent, such as a sign-in latch wait cut short: nothing can still
+ * run, so a cancel is `cancelled` and a deadline `timeout`, never `outcome-unknown`.
+ */
+export function unsentStopError(stop: DatabendStop, ctx: DatabendFailureContext): DatabendError {
+  return stopError(stop, { answered: true, killAcknowledged: true }, ctx);
 }
 
 /**

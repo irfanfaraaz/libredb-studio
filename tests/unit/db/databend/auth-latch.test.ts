@@ -12,8 +12,6 @@ import {
   authLatchKey,
   createAuthLatch,
   databendAuthLatch,
-  LATCHING_GATEWAY_KINDS,
-  latchesSignIn,
 } from "@/lib/db/providers/sql/databend/auth-latch";
 import { latchedError } from "@/lib/db/providers/sql/databend/errors";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
@@ -121,40 +119,6 @@ describe("authLatchKey", () => {
     expect(authLatchKey({ ...IDENTITY, user: "ab", password: "c" })).not.toBe(
       authLatchKey({ ...IDENTITY, user: "a", password: "bc" }),
     );
-  });
-});
-
-describe("latchesSignIn", () => {
-  test.each([
-    ["401 with 5100", { status: 401, code: 5100 }],
-    ["401 with 5101", { status: 401, code: 5101 }],
-    ["401 with 5103", { status: 401, code: 5103 }],
-    ["401 with 2201", { status: 401, code: 2201 }],
-    ["500 with 2215", { status: 500, code: 2215 }],
-    ["gateway PasswordAuthFailed", { status: 401, gatewayKind: "PasswordAuthFailed" }],
-    ["gateway JWTVerificationFailed", { status: 401, gatewayKind: "JWTVerificationFailed" }],
-    ["gateway ForbiddenAccessUser", { status: 403, gatewayKind: "ForbiddenAccessUser" }],
-    ["401 with 5100 beside an unrelated gateway kind", { status: 401, code: 5100, gatewayKind: "SomethingElse" }],
-    ["500 with 2215 beside an unrelated gateway kind", { status: 500, code: 2215, gatewayKind: "SomethingElse" }],
-  ])("%s latches", (_label, answer) => {
-    expect(latchesSignIn(answer)).toBe(true);
-  });
-
-  test.each([
-    ["an in-body 2215 over a 200, which is also a complexity error", { status: 200, code: 2215 }],
-    ["a 200", { status: 200 }],
-    ["another 401, a session mismatch", { status: 401, code: 1001 }],
-    ["a 401 with no code", { status: 401 }],
-    ["2215 over a 401", { status: 401, code: 2215 }],
-    ["5100 over a 500", { status: 500, code: 5100 }],
-    ["a 503", { status: 503 }],
-    ["another gateway kind", { status: 400, gatewayKind: "WarehouseNotFound" }],
-  ])("%s does not latch", (_label, answer) => {
-    expect(latchesSignIn(answer)).toBe(false);
-  });
-
-  test("the gateway kinds are exactly the three of design 3.13", () => {
-    expect([...LATCHING_GATEWAY_KINDS]).toEqual(["PasswordAuthFailed", "JWTVerificationFailed", "ForbiddenAccessUser"]);
   });
 });
 

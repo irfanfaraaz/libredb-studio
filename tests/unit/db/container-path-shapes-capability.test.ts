@@ -154,7 +154,7 @@ describe("the declaration follows the check (#1147)", () => {
     expect(unknownTypeIds(callerFiles)).toEqual([]);
     const callers = callerFiles.map(providerTypeId).sort();
     const declaring = TYPES.filter((type) => EXPECTED_CONTAINER_PATH_SHAPES[type] !== "absent").sort();
-    expect(callers).toHaveLength(18);
+    expect(callers).toHaveLength(19);
     expect(callers).toEqual(declaring);
   });
 });

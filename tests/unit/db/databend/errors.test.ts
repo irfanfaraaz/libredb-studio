@@ -22,11 +22,13 @@ import {
   DATABEND_PROTOCOL_FAULTS,
   type DatabendFailureContext,
   latchedError,
+  latchesSignIn,
   protocolError,
   refusalError,
   stopError,
   toDatabaseError,
   transportFailure,
+  unsentStopError,
 } from "@/lib/db/providers/sql/databend/errors";
 import { DatabendError, type DatabendErrorCategory } from "@/lib/db/providers/sql/databend/transport";
 import { secretForms, serverText } from "@/lib/db/utils/server-text";
@@ -332,6 +334,69 @@ describe("no answer on the POST", () => {
     expect(S.network("h", 1, "w")).toBe(
       "The server at h:1 did not answer Databend's HTTP API (w). It listens on 8000 self-hosted and 443 on Databend Cloud; 3307 (MySQL) and 8900 (Flight SQL) are not used.",
     );
+  });
+});
+
+describe("latchesSignIn, the one latching rule that refusalError and the latch both read (I18)", () => {
+  test.each([
+    ["401 with 5100", { status: 401, code: 5100 }],
+    ["401 with 5101", { status: 401, code: 5101 }],
+    ["401 with 5103", { status: 401, code: 5103 }],
+    ["401 with 2201", { status: 401, code: 2201 }],
+    ["500 with 2215", { status: 500, code: 2215 }],
+    ["gateway PasswordAuthFailed", { status: 401, gatewayKind: "PasswordAuthFailed" }],
+    ["gateway JWTVerificationFailed", { status: 401, gatewayKind: "JWTVerificationFailed" }],
+    ["gateway ForbiddenAccessUser", { status: 403, gatewayKind: "ForbiddenAccessUser" }],
+    ["401 with 5100 beside an unrelated gateway kind", { status: 401, code: 5100, gatewayKind: "SomethingElse" }],
+    ["500 with 2215 beside an unrelated gateway kind", { status: 500, code: 2215, gatewayKind: "SomethingElse" }],
+  ])("%s latches", (_label, answer) => {
+    expect(latchesSignIn(answer)).toBe(true);
+  });
+
+  test.each([
+    ["an in-body 2215 over a 200, which is also a complexity error", { status: 200, code: 2215 }],
+    ["a 200", { status: 200 }],
+    ["another 401, a session mismatch", { status: 401, code: 1001 }],
+    ["a 401 with no code", { status: 401 }],
+    ["2215 over a 401", { status: 401, code: 2215 }],
+    ["5100 over a 500", { status: 500, code: 5100 }],
+    ["a 503", { status: 503 }],
+    ["another gateway kind", { status: 400, gatewayKind: "WarehouseNotFound" }],
+  ])("%s does not latch", (_label, answer) => {
+    expect(latchesSignIn(answer)).toBe(false);
+  });
+
+  test("every answer that latches is the auth refusal, and every one that does not is another category", () => {
+    for (const answer of [
+      { status: 401, code: 5100 },
+      { status: 500, code: 2215 },
+      { status: 403, gatewayKind: "ForbiddenAccessUser" },
+    ]) {
+      const error = refusalError(
+        refusal({ status: answer.status, code: answer.code ?? null, gatewayKind: answer.gatewayKind ?? null }),
+        context(),
+      );
+      expect(latchesSignIn(answer)).toBe(true);
+      expect(error.category).toBe("auth");
+    }
+    for (const answer of [
+      { status: 401, code: 1001 },
+      { status: 500, code: 5100 },
+      { status: 401, code: 2215 },
+    ]) {
+      expect(latchesSignIn(answer)).toBe(false);
+      expect(refusalError(refusal({ status: answer.status, code: answer.code }), context()).category).not.toBe("auth");
+    }
+  });
+});
+
+describe("a stop before anything was sent (a latch wait cut short, I18)", () => {
+  test("our cancel is cancelled and our deadline is timeout, never outcome-unknown, since nothing can still run", () => {
+    expectRow(unsentStopError("cancel", context()), "cancelled", QueryCancelledError, S.cancelled);
+    expectRow(unsentStopError("deadline", context()), "timeout", TimeoutError, S.deadline("60"));
+    const ctx = context({ origin: "provider", warehouse: "wh", timeoutMs: 10_000 });
+    expectRow(unsentStopError("cancel", ctx), "cancelled", QueryCancelledError, S.cancelled, ctx);
+    expectRow(unsentStopError("deadline", ctx), "timeout", TimeoutError, S.resuming("wh", "10"), ctx);
   });
 });
 
