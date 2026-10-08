@@ -328,6 +328,16 @@ Measured 2026-10-08 with user objects seeded next to the extensions:
 | YugabyteDB 2026.1.2 (PG 15.12), pgcrypto + hstore | 98 functions | 1 function |
 | CockroachDB 26.3.2 | 1 function, 1 view, 1 table | the same; `pg_depend` answers nothing |
 | Materialize 26.45.1 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+
+Three places read other catalogs and needed the same test on their own (#1599). The
+Overview's table and index counts read `information_schema.tables` and `pg_indexes`, which
+name a table instead of carrying its oid, so `extensionMemberTableExclusion()` asks by
+schema and name; an index is left out by asking about the table it sits on. The Triggers
+folder's count, listing and source read leave out a trigger whose table an extension created,
+since that table is already hidden. Measured 2026-10-08 on PostgreSQL 17.5 with PostGIS 3.5,
+`orders` with one index and one trigger, and a second trigger added to `spatial_ref_sys`:
+the Overview went from 2 tables and 2 indexes to 1 and 1, and the Triggers folder from 2 to
+1. CockroachDB 25.2 answers the new statement unchanged.
 | RisingWave 3.1.0 | 1 view, 1 table | the same; `pg_depend` answers nothing |
 
 All nine accept the clause. The listings and counts retry without it on an engine that
