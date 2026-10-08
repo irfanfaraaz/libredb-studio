@@ -300,19 +300,29 @@ export async function countObjects(
   return counts;
 }
 
+/**
+ * The kinds whose `system.tables` counts are not theirs: a materialized view's row there says 0 rows and 0 bytes
+ * whatever it holds (measured on the pinned image: `every_type_mv` holds 4 rows), so it is listed with neither.
+ */
+const UNCOUNTED_KINDS: ReadonlySet<string> = new Set(["materialized_view"]);
+
 export async function listObjects(
   runner: DatabendStatementRunner,
   container: DatabendContainer,
   kind: string,
 ): Promise<DatabaseObject[]> {
   const rows = await readCompleteRows(runner, databendObjectListSql(container, kind), "object list");
+  const counted = !UNCOUNTED_KINDS.has(kind);
   return rows.map((row) => {
     const name = readText(row.object_name);
-    const rowCount = readNumber(row.num_rows);
-    const sizeBytes = readNumber(row.data_compressed_size);
+    const rowCount = counted ? readNumber(row.num_rows) : undefined;
+    const sizeBytes = counted ? readNumber(row.data_compressed_size) : undefined;
     const object: DatabaseObject = { path: [container.catalog, container.database, name], name, kind };
-    const counted = rowCount === undefined ? {} : { rowCount };
-    return Object.assign(object, counted, sizeBytes === undefined ? {} : { sizeBytes });
+    return Object.assign(
+      object,
+      rowCount === undefined ? {} : { rowCount },
+      sizeBytes === undefined ? {} : { sizeBytes },
+    );
   });
 }
 

@@ -363,6 +363,17 @@ describe("listObjects", () => {
     expect(listed.sizeBytes).toBe(10);
   });
 
+  // Measured on the pinned image: `every_type_mv` holds 4 rows, and its system.tables row says 0 rows and 0 bytes.
+  test("a materialized view is listed with no row count or size, which system.tables reports as 0 for one", async () => {
+    const { runner } = scripted(outcome(LIST_SCHEMA, [["every_type_mv", "0", "0", ""]]));
+    const [listed] = await listObjects(runner, CONTAINER, "materialized_view");
+    expect(listed).toEqual({
+      path: [CATALOG, DATABASE, "every_type_mv"],
+      name: "every_type_mv",
+      kind: "materialized_view",
+    });
+  });
+
   test("a count past 2^53, which decodes as its text, is still read as a number", async () => {
     const { runner } = scripted(outcome(LIST_SCHEMA, [["t", "18446744073709551615", "1", ""]]));
     const [listed] = await listObjects(runner, CONTAINER, "table");
