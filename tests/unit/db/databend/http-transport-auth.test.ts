@@ -368,11 +368,12 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
       { method: "GET", path: P.final, reply: WRONG_PASSWORD },
     ]);
     const outcome = await transport.run(statement("BEGIN"));
-    // The ROLLBACK and the logout were not sent, so the transaction may stay open and the session was not ended.
+    // The ROLLBACK and the logout were not sent, so the transaction may stay open and the session was not ended:
+    // the logout was skipped, never left unanswered.
     expect(outcome.notices).toEqual([
       { kind: "close-failed", step: "final" },
       { kind: "transaction-may-stay-open" },
-      { kind: "close-failed", step: "logout" },
+      { kind: "close-skipped", step: "logout" },
     ]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
     expect(script.requests).toHaveLength(2);
@@ -385,7 +386,7 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
       { method: "POST", path: "/v1/query", reply: LOCKOUT },
     ]);
     const outcome = await transport.run(statement("BEGIN"));
-    expect(outcome.notices).toEqual([{ kind: "transaction-may-stay-open" }, { kind: "close-failed", step: "logout" }]);
+    expect(outcome.notices).toEqual([{ kind: "transaction-may-stay-open" }, { kind: "close-skipped", step: "logout" }]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toStartWith(
       "Databend refused this sign-in at",
     );
@@ -409,7 +410,7 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
     expect(outcome.notices).toEqual([
       { kind: "transaction-ended" },
       { kind: "close-failed", step: "rollback" },
-      { kind: "close-failed", step: "logout" },
+      { kind: "close-skipped", step: "logout" },
     ]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
     expect(script.requests).toHaveLength(3);
@@ -502,6 +503,55 @@ describe("a gateway refusal over HTTP 200 (HASIM-D-3)", () => {
     );
     first.cancel();
     await running;
+    script.expectDone();
+  });
+});
+
+describe("a gateway's sign-in refusal over HTTP 200 on a close (REV-T-2)", () => {
+  const REFUSED_OVER_200 = {
+    status: 200,
+    body: { error: { kind: "AuthorizationFailed", message: "Authorization failed" } },
+  };
+
+  test("a kill answered so is no acknowledged kill: no logout follows, and the next statement sends nothing", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: { hang: true } },
+      { method: "GET", path: pathsOf(FIRST.queryId).kill, reply: REFUSED_OVER_200 },
+    ]);
+    const run = runSignal();
+    const running = failure(transport.run(statement("SELECT 1", { signal: run.signal })));
+    await script.received(1);
+    run.cancel();
+    const first = await running;
+    expect(first.category).toBe("outcome-unknown");
+    expect(first.message).toBe(S.noAnswer(S.cancelledBeforeAnswer));
+    expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
+    expect(sent(script.requests)).toEqual(["POST /v1/query", "GET /v1/query/<id>/kill"]);
+    script.expectDone();
+  });
+
+  test("a final answered so is a notice, and the next statement sends nothing", async () => {
+    const P = pathsOf(FIRST.queryId);
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { next_uri: P.final }) },
+      { method: "GET", path: P.final, reply: REFUSED_OVER_200 },
+    ]);
+    expect((await transport.run(statement("SELECT 1"))).notices).toEqual([{ kind: "close-failed", step: "final" }]);
+    expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
+    expect(script.requests).toHaveLength(2);
+    script.expectDone();
+  });
+
+  test("a logout answered so drops no temporary table, and the next statement sends nothing", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: { ...OPEN, txn_state: "AutoCommit" } }) },
+      { method: "POST", path: LOGOUT, reply: REFUSED_OVER_200 },
+    ]);
+    expect((await transport.run(statement("CREATE TEMP TABLE t (a INT)"))).notices).toEqual([
+      { kind: "close-failed", step: "logout" },
+    ]);
+    expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
+    expect(script.requests).toHaveLength(2);
     script.expectDone();
   });
 });

@@ -5,6 +5,7 @@ import {
   FALLBACK_TABLE_NAME,
   resultExportFileName,
 } from "@/lib/export/result-export";
+import { UnwritableValue } from "@/lib/export/typed-literals";
 
 const source = (over: Partial<Parameters<typeof buildResultExport>[1]> = {}) => ({
   rows: [{ id: 1, name: "Ada" }],
@@ -1705,6 +1706,27 @@ describe("buildResultExport: a row with a cell the dialect has no literal for (#
     expect(content.split("\n")).toHaveLength(1);
     expect(content).toBe(
       '-- Row 1 skipped: column "a\\nDROP TABLE x; --?" holds an array that is not a list, which trino has no literal for.',
+    );
+  });
+
+  // The comment cleans what a refusal names on its own, whatever writer raised it. No writer but Databend's names
+  // engine text today, and that one cleans the type first, so a cell that raises the refusal itself, read here by the
+  // Trino writer, stands for the next writer that does.
+  test("cannot let what any writer's refusal names end the comment", () => {
+    const cell = [7];
+    Object.defineProperty(cell, 0, {
+      get() {
+        throw new UnwritableValue("an element\nSELECT 2 AS injected; -- ");
+      },
+    });
+    const content = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ a: cell }], fields: ["a"], dialect: "trino", columnTypes: { a: "array(integer)" } }),
+    ).content;
+
+    expect(content.split("\n")).toHaveLength(1);
+    expect(content).toBe(
+      '-- Row 1 skipped: column "a" holds an element?SELECT 2 AS injected; --?, which trino has no literal for.',
     );
   });
 

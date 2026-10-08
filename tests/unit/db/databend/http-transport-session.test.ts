@@ -5,6 +5,7 @@
  * answer gets one kill and one logout with our session id.
  */
 import { describe, expect, test } from "bun:test";
+import { DATABEND_ERROR_SENTENCES as S, DATABEND_PROTOCOL_FAULTS as F } from "@/lib/db/providers/sql/databend/errors";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
 import { serverText } from "@/lib/db/utils/server-text";
 import {
@@ -212,6 +213,24 @@ describe("an Active transaction (design 3.4; X13)", () => {
       { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: echo({ txn_state: "Fail" }) }) },
     ]);
     expect((await transport.run(statement("SELECT 1"))).notices).toEqual([]);
+    script.expectDone();
+  });
+});
+
+describe("an echoed session nested past what an answer may have (REV-T-1)", () => {
+  test("is a protocol fault before it is parsed: the statement is killed, and no ROLLBACK stringifies it", async () => {
+    // Written as text: JSON.stringify overflows on 50,000 levels, in this test as in the ROLLBACK's body.
+    const deep = `${"[".repeat(50_000)}${"]".repeat(50_000)}`;
+    const session = `{"txn_state":"Active","need_keep_alive":false,"settings":{"http_json_result_mode":"display"},"x":${deep}}`;
+    const body = `{"id":"${FIRST.queryId}","session_id":"${FIRST.sessionId}","node_id":"${TEST_NODE}","state":"Succeeded","session":${session},"schema":[],"data":[]}`;
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: { status: 200, body } },
+      { method: "GET", path: P.kill, reply: { status: 200 } },
+    ]);
+    const error = await transport.run(statement("SELECT version()")).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DatabendError);
+    expect((error as DatabendError).category).toBe("protocol");
+    expect((error as DatabendError).message).toBe(S.protocol(F.depth));
     script.expectDone();
   });
 });

@@ -13,6 +13,10 @@
  * MiB, three of them past the production limit of 384 MiB, where Node ends; with it, about 11 MiB each. A child that
  * outgrows the limit here ends the same way and fails its case.
  *
+ * One more case follows a statement's pages to its 16 MiB budget of answer text, each page holding 60,000 different
+ * warnings and no row: past the first 100 a warning is counted, never kept (F4), so the warnings a statement keeps do
+ * not grow with the pages it reads.
+ *
  * The child is the node on PATH, so CI's Node 24 runs it; NODE_TRANSPORT_NODES, split on the path delimiter, names
  * other binaries, as it does for the runtimes test.
  */
@@ -46,6 +50,9 @@ interface ChildReport {
   readonly message: string;
   readonly bodyBytes: number;
   readonly requests: readonly string[];
+  /** The server warnings the outcome kept, and the count of those it left out. */
+  readonly kept: number;
+  readonly leftOut: number;
   readonly usedBeforeMiB: number;
   readonly usedAfterMiB: number;
 }
@@ -69,11 +76,29 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
   };
   const page = (schema: string, row: string) =>
     filled(`{"id":"q","session_id":"s","node_id":"n","state":"Running","schema":${schema},"data":[`, row, "]}");
-  const cases: Record<string, { readonly where: "post" | "page"; readonly status: number; readonly body: Buffer }> = {
+  // Page `n` of different warnings and no row, linking the next page; within one answer's allowance of values.
+  const warningsPage = (queryId: string, n: number): Buffer => {
+    const count = 60_000;
+    const head = `{"id":"${queryId}","session_id":"s","node_id":"n","state":"Running","schema":[],"data":[],"warnings":[`;
+    const tail = `],"next_uri":"/v1/query/${queryId}/page/${n + 1}"}`;
+    const prefix = `"p${String(n).padStart(4, "0")}w`;
+    const buffer = Buffer.allocUnsafe(head.length + count * 14 - 1 + tail.length);
+    let at = buffer.write(head, 0, "latin1");
+    for (let index = 0; index < count; index++) {
+      at += buffer.write(`${index === 0 ? "" : ","}${prefix}${String(index).padStart(5, "0")}"`, at, "latin1");
+    }
+    buffer.write(tail, at, "latin1");
+    return buffer;
+  };
+  const cases: Record<
+    string,
+    { readonly where: "post" | "page" | "pages"; readonly status: number; readonly body: Buffer }
+  > = {
     "page-empty-rows": { where: "page", status: 200, body: page("[]", "[]") },
     "page-null-rows": { where: "page", status: 200, body: page('[{"name":"c","type":"NULL"}]', "[null]") },
     "refusal-arrays": { where: "post", status: 500, body: filled("[", "[]", "]") },
     "refusal-strings": { where: "post", status: 500, body: filled("[", '""', "]") },
+    "pages-of-warnings": { where: "pages", status: 200, body: Buffer.alloc(0) },
   };
   const { where, status, body } = cases[shape];
   const requests: string[] = [];
@@ -102,6 +127,10 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
           next_uri: `/v1/query/${queryId}/page/0`,
         }),
       );
+    } else if (where === "pages" && url.includes("/page/")) {
+      const [, , , queryId, , n] = url.split("/");
+      response.writeHead(200, json);
+      response.end(warningsPage(queryId, Number(n)));
     } else if (url.endsWith("/page/0")) {
       response.writeHead(status, json);
       response.end(body);
@@ -129,8 +158,19 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
   const before = deps.getHeapStatistics().used_heap_size;
   let category: string | null = null;
   let message = "";
+  let kept = 0;
+  let leftOut = 0;
   try {
-    await transport.run({ sql: "SELECT 1", origin: "user", rowCut: 100_000, signal: new AbortController().signal });
+    const outcome = await transport.run({
+      sql: "SELECT 1",
+      origin: "user",
+      rowCut: 100_000,
+      signal: new AbortController().signal,
+    });
+    for (const notice of outcome.notices) {
+      if (notice.kind === "server-warning") kept += 1;
+      else if (notice.kind === "warnings-left-out") leftOut = notice.count;
+    }
   } catch (error) {
     category = (error as { category?: string }).category ?? "thrown";
     message = (error as Error).message;
@@ -145,6 +185,8 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
     message,
     bodyBytes: body.length,
     requests,
+    kept,
+    leftOut,
     usedBeforeMiB: mib(before),
     usedAfterMiB: mib(after),
   };
@@ -217,13 +259,13 @@ const CASES: ReadonlyArray<readonly [string, string, string, readonly string[]]>
   [
     "page-empty-rows",
     "protocol",
-    S.protocol(F.field("data")),
+    S.protocol(F.rows),
     ["POST /v1/query", "GET /v1/query/<id>/page/0", "GET /v1/query/<id>/kill"],
   ],
   [
     "page-null-rows",
     "protocol",
-    S.protocol(F.field("data")),
+    S.protocol(F.rows),
     ["POST /v1/query", "GET /v1/query/<id>/page/0", "GET /v1/query/<id>/kill"],
   ],
   ["refusal-arrays", "server", S.server(500, refusalText("[]")), ["POST /v1/query", "GET /v1/query/<id>/kill"]],
@@ -247,5 +289,24 @@ for (const binary of nodeBinaries()) {
       },
       60_000,
     );
+
+    test("a statement's pages of different warnings, to its 16 MiB budget, keep 100 of them and count the rest", async () => {
+      const report = await runChild(binary, "pages-of-warnings");
+      const pages = report.requests.filter((request) => request.startsWith("GET /v1/query/<id>/page/")).length;
+      console.log(
+        `databend wire heap: pages-of-warnings under ${HEAP_LIMIT_MIB} MiB, ${pages} pages, used ${report.usedBeforeMiB} MiB before and ${report.usedAfterMiB} MiB after`,
+      );
+      expect(report.category).toBeNull();
+      // The 16 MiB budget of answer text ends the statement, after about 20 pages of 60,000 warnings.
+      expect(pages).toBeGreaterThan(16);
+      expect(report.requests).toEqual([
+        "POST /v1/query",
+        ...Array.from({ length: pages }, (_, n) => `GET /v1/query/<id>/page/${n}`),
+        "GET /v1/query/<id>/final",
+      ]);
+      expect(report.kept).toBe(100);
+      expect(report.leftOut).toBe(pages * 60_000 - 100);
+      expect(report.usedAfterMiB - report.usedBeforeMiB).toBeLessThan(RETAINED_LIMIT_MIB);
+    }, 60_000);
   });
 }

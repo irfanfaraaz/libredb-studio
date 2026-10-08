@@ -97,7 +97,8 @@ const DOLLAR_LITERAL_OPENER = "$$";
  * it, `--`, `/*`, `$$` and `[` into the name, up to the first of these ending
  * characters, where the span reader opens a comment, a literal or an array that can end
  * past the token. The token's `\s` is Unicode White_Space, which JavaScript's `\s` is
- * not: measured on v1.2.951, U+0085 ends a stage name and U+FEFF does not.
+ * not: measured on v1.2.951, U+0085 ends a stage name and U+FEFF does not. An `@` that
+ * ends a `<@` operator opens no stage token.
  */
 const FORM_FEED = "\f";
 const HINT_OPENER = "/*+";
@@ -115,6 +116,18 @@ function plainStageEnd(sql: string, index: number): number | undefined {
     i++;
   }
   return i;
+}
+
+/**
+ * Whether the `@` at `index` ends a `<@` operator (`ArrowAt`), the one operator that
+ * starts with another character and takes an `@` in: the lexer takes the longest token,
+ * so a run of `<` is read in pairs from its start, `<<` before `<@`, and only after an
+ * even run does the `@` open a stage token.
+ */
+function endsArrowAt(sql: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && sql[start - 1] === "<") start--;
+  return (index - start) % 2 === 1;
 }
 
 /**
@@ -173,7 +186,7 @@ function screen(sql: string, mode: ExplainMode): boolean {
       continue;
     }
 
-    if (sql[i] === "@" && i >= stageReadTo) {
+    if (sql[i] === "@" && i >= stageReadTo && !endsArrowAt(sql, i)) {
       const end = plainStageEnd(sql, i);
       if (end === undefined) return false;
       stageReadTo = end;

@@ -66,14 +66,14 @@ function failure(code: number): DatabendError {
   return new DatabendError("statement", `failed with ${code}`, { code });
 }
 
+/** The sessions read's columns as the fixture answered them (measured 2026-10-08 on v1.2.951-nightly). */
 const SESSION_SCHEMA = [
   ["session_id", "String"],
   ["user_name", "String"],
   ["host", "Nullable(String)"],
   ["database_name", "String"],
-  ["status", "String"],
+  ["command", "String"],
   ["query_text", "String"],
-  ["current_query_id", "String"],
   ["created_time", "Timestamp"],
   ["elapsed_seconds", "UInt64"],
 ] as const;
@@ -83,9 +83,8 @@ const SESSION_ROW = [
   "studio_reader",
   "172.20.0.1",
   "libredb_demo",
-  "Executing pipeline",
+  "Query",
   "SELECT 1",
-  "01a11896a18d7ae399fb6947927521b2",
   "2026-10-07 22:58:07.375243",
   "3",
 ];
@@ -151,7 +150,7 @@ describe("the design 5.5 statements, exactly, as each panel sends them", () => {
 
   test("the sessions read covers every non-idle session of the warehouse", () => {
     expect(databendSessionsSql(7)).toBe(
-      "SELECT id AS session_id, `user` AS user_name, host, database AS database_name, status, extra_info AS query_text, current_query_id, created_time, time AS elapsed_seconds FROM default.system.processes WHERE command <> 'Idle' AND id <> connection_id() ORDER BY created_time LIMIT 7",
+      "SELECT id AS session_id, `user` AS user_name, host, database AS database_name, command, extra_info AS query_text, created_time, time AS elapsed_seconds FROM default.system.processes WHERE command <> 'Idle' AND id <> connection_id() ORDER BY created_time LIMIT 7",
     );
   });
 
@@ -209,7 +208,7 @@ describe("limits", () => {
 });
 
 describe("sessions and the kill [X08]", () => {
-  test("a row maps id to pid, and current_query_id is shown, never the kill target", async () => {
+  test("a row maps id to pid, the kill target, and a running statement's state is the word the panels count", async () => {
     const { runner } = routed({ [databendSessionsSql(5)]: outcome(SESSION_SCHEMA, [SESSION_ROW]) });
     expect(await getActiveSessions(runner, { limit: 5 })).toEqual([
       {
@@ -217,7 +216,7 @@ describe("sessions and the kill [X08]", () => {
         user: "studio_reader",
         database: "libredb_demo",
         clientAddr: "172.20.0.1",
-        state: DATABEND_MONITORING_SENTENCES.sessionState("Executing pipeline", "01a11896a18d7ae399fb6947927521b2"),
+        state: "active",
         query: "SELECT 1",
         queryStart: new Date("2026-10-07T22:58:07.375Z"),
         duration: "3.00s",
@@ -226,14 +225,27 @@ describe("sessions and the kill [X08]", () => {
     ]);
   });
 
-  test("a session with no host, no query id and an unreadable time keeps only what it has", async () => {
+  // The Sessions, Overview and Operations panels count `state === "active"`, PostgreSQL's word for a statement in
+  // flight, which is what Databend's command `Query` means (F8); `Aborting` keeps its own word, lower-cased, so no
+  // card counts it as active or idle. The sessions read leaves `Idle` out.
+  test.each([
+    ["Query", "active"],
+    ["Aborting", "aborting"],
+  ])("the command %s is the panel state %s", async (command, state) => {
     const row = [...SESSION_ROW];
-    row[2] = null as unknown as string;
-    row[6] = "";
-    row[7] = "not a time";
+    row[4] = command;
     const { runner } = routed({ [databendSessionsSql(5)]: outcome(SESSION_SCHEMA, [row]) });
     const [session] = await getActiveSessions(runner, { limit: 5 });
-    expect(session.state).toBe("Executing pipeline");
+    expect(session.state).toBe(state);
+  });
+
+  test("a session with no host and an unreadable time keeps only what it has", async () => {
+    const row = [...SESSION_ROW];
+    row[2] = null as unknown as string;
+    row[6] = "not a time";
+    const { runner } = routed({ [databendSessionsSql(5)]: outcome(SESSION_SCHEMA, [row]) });
+    const [session] = await getActiveSessions(runner, { limit: 5 });
+    expect(session.state).toBe("active");
     expect("clientAddr" in session).toBe(false);
     expect("queryStart" in session).toBe(false);
   });
@@ -478,7 +490,7 @@ describe("the panels", () => {
           pid: "5c00e52f-34c2-4cab-8ba8-c1f1121157bf",
           user: "studio_reader",
           database: "libredb_demo",
-          state: DATABEND_MONITORING_SENTENCES.sessionState("Executing pipeline", "01a11896a18d7ae399fb6947927521b2"),
+          state: "active",
           query: "SELECT 1",
           duration: "3.00s",
         },
@@ -497,6 +509,6 @@ describe("the sentences", () => {
       expect(sentence).toMatch(/^[A-Z].*\.$/);
       expect(sentence).not.toMatch(DASHES);
     }
-    expect(DATABEND_MONITORING_SENTENCES.sessionState("Running", "q")).toBe("Running (query q)");
+    expect(Object.keys(DATABEND_MONITORING_SENTENCES)).toEqual(["killNeedsId", "killIdRefused", "killAsked"]);
   });
 });

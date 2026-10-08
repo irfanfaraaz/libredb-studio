@@ -3885,6 +3885,27 @@ describe("a databend:// paste (Databend design 6.2)", () => {
     expect(result.current.pasteInput).toBe(text);
   });
 
+  test("an @ in a parameter of a DSN with no sign-in is refused with the sentence naming both readings", () => {
+    const text = "databend://db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem";
+    const result = paste(text, (form) => form.setShowPasteInput(true));
+    expect(result.current.testResult).toEqual({ tone: "error", message: DATABEND_DSN_REFUSALS.userinfo });
+    expect(result.current.testResult!.message).toContain("percent-encode it as %40");
+    expect(result.current.type).toBe("postgres");
+    expect(result.current.host).toBe("localhost");
+    expect(result.current.pasteInput).toBe(text);
+  });
+
+  test("an @ in a parameter after the sign-in's own @ is no refusal, and the fields are filled", () => {
+    const result = paste("databend://root:pw@db.example.com:8000/default?role=analyst@corp");
+    expect(result.current.type).toBe("databend");
+    expect(result.current.host).toBe("db.example.com");
+    expect(result.current.port).toBe("8000");
+    expect(result.current.user).toBe("root");
+    expect(result.current.password).toBe("pw");
+    expect(result.current.database).toBe("default");
+    expect(result.current.testResult).toEqual({ tone: "warning", message: databendNotAppliedNotice(["role"]) });
+  });
+
   test.each([
     ["databend+flight://root:@localhost:8900/db", DATABEND_DSN_REFUSALS.flight],
     ["databend://root:pa#ss@host/db", DATABEND_DSN_REFUSALS.fragment],

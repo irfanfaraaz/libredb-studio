@@ -209,6 +209,28 @@ describe("databendTextStrategy.buildSql", () => {
     expect(databendTextStrategy.buildSql("SELECT * FROM @s -- note", mode)).toBe("EXPLAIN SELECT * FROM @s -- note");
   });
 
+  // The lexer takes the longest token and `<@` is the one operator that starts with another character and takes an `@`
+  // in (`token.rs`: `ArrowAt`), so a run of `<` is read in pairs from its start, `<<` before `<@`: after an odd run the
+  // `@` ends the operator and opens nothing, and after an even one it opens a stage token. Measured on v1.2.951 as the
+  // guard's rows are; the first text's plan held no `numbers` scan when its comment named `count(*) FROM numbers(7)`.
+  test.each(MODES)("%s plans a <@ operator before a comment, a dollar quote or a bracket", (mode) => {
+    for (const sql of [
+      "SELECT parse_json('[1]')<@--, numbers((SELECT nextval(s)))\nparse_json('[1,2]') AS r",
+      "SELECT parse_json('[1]')<@[1,2] AS r",
+      "SELECT parse_json('[1]')<@$$[1,2]$$ AS r",
+      "SELECT 2<<<@/*c*/1 AS r",
+      "SELECT $1 FROM '@~/a--b.csv'",
+    ]) {
+      expect(databendTextStrategy.buildSql(sql, mode), sql).toBe(`EXPLAIN ${sql}`);
+    }
+  });
+
+  test.each(MODES)("%s declines a stage name after a << operator and one that starts like @>", (mode) => {
+    for (const sql of ["SELECT 2<<@~/--, numbers((SELECT nextval(s)))", "SELECT parse_json('[1,2]')@>[1] AS r"]) {
+      expect(databendTextStrategy.buildSql(sql, mode), sql).toBeNull();
+    }
+  });
+
   /**
    * A timing guard for the walk: a run of `@` is one stage token, and a nested `[` was read to its closing bracket at
    * every level and after every `(`. Measured on the walk this replaced: 3.1 seconds for 25k `@`, 2.2 seconds for 50k
@@ -220,6 +242,8 @@ describe("databendTextStrategy.buildSql", () => {
       ["a 20k run of @", `SELECT 1 FROM ${"@".repeat(20_000)}`],
       ["50k nested brackets", `SELECT ${"[".repeat(50_000)}${"]".repeat(50_000)}`],
       ["20k nested ([", `SELECT ${"([".repeat(20_000)}${"])".repeat(20_000)}`],
+      ["an odd 20k run of < before an @", `SELECT 1 ${"<".repeat(20_001)}@[1]`],
+      ["10k <@ operators", `SELECT 1 ${"<@".repeat(10_000)}[1]`],
     ];
 
     for (const [label, sql] of adversarial) {

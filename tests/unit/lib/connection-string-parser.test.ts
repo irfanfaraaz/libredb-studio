@@ -1340,11 +1340,43 @@ describe("parseConnectionString: databend:// DSNs", () => {
       const result = parseConnectionString(input);
       expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
       expect(JSON.stringify(result)).not.toContain("Tail");
-      expect(DATABEND_DSN_REFUSALS.userinfo).toBe(
-        "The DSN's user or password holds / or ?, which end the address part of a URL: percent-encode them as %2F and %3F, or type the password in its own field.",
-      );
     },
   );
+
+  // The same text is the other reading when the @ is the path's or a parameter's, so the sentence names both.
+  test.each([
+    "databend://db.example.com:8000/default?role=analyst@corp",
+    "databend://db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
+    "databend://db.example.com:8000/team@corp",
+  ])("an @ past the address part of a DSN with no sign-in is refused, naming both readings: %s", (input) => {
+    expect(parseConnectionString(input)).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+    expect(DATABEND_DSN_REFUSALS.userinfo).toBe(
+      "The DSN has an @ after a / or ?, which end the address part of a URL: if the / or ? is in the user or password, percent-encode it as %2F or %3F, or type the password in its own field; if the @ is in the path or a parameter, percent-encode it as %40.",
+    );
+  });
+
+  test("a DSN whose address part holds its @ is never refused for a later @, which is the path's or a parameter's", () => {
+    const role = parseConnectionString("databend://root:pw@db.example.com:8000/default?role=analyst@corp")!;
+    expect(role.refusal).toBeUndefined();
+    expect([role.user, role.password, role.host, role.port, role.database]).toEqual([
+      "root",
+      "pw",
+      "db.example.com",
+      "8000",
+      "default",
+    ]);
+    expect(role.ignoredParameters).toEqual(["role"]);
+    const file = parseConnectionString(
+      "databend://root@db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
+    )!;
+    expect(file.refusal).toBeUndefined();
+    expect(file.cautions).toEqual([DATABEND_DSN_CAUTIONS.caFile]);
+    expect(parseConnectionString("databend://root@db.example.com:8000/team@corp")!.database).toBe("team@corp");
+    // Percent-encoded, the @ of a DSN with no sign-in reads one way only.
+    const encoded = parseConnectionString("databend://db.example.com:8000/default?role=analyst%40corp")!;
+    expect(encoded.refusal).toBeUndefined();
+    expect(encoded.ignoredParameters).toEqual(["role"]);
+  });
 
   test("a percent-encoded / or ? in the sign-in, and an @ only before the path, still parse", () => {
     const encoded = parseConnectionString("databend://cloudapp:2024%2FSecret%3FTail@host:443/default?warehouse=w1")!;
@@ -1407,6 +1439,8 @@ describe("parseConnectionString: databend:// DSNs", () => {
       "tn3ftqihs--e_ric.gw.aws-us-east-2.default.databend.com",
       "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com.example.net",
       "db--internal.example.com",
+      // Counted as Databend Cloud's for billing, but the older form is shown under databend.com and databend.cn only.
+      "tn3ftqihs--eric.gw.aws-us-east-2.default.tidbcloud.com",
     ]) {
       expect(parseConnectionString(`databend://cloudapp@${host}:443/default`)!.warehouse, host).toBeUndefined();
     }

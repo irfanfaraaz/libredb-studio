@@ -28,7 +28,7 @@ None of it is a GitHub issue.
 **Sections**
 
 - [SQL statement reading](#sql-statement-reading) — S2–S7 · 5
-- [Drivers and connections](#drivers-and-connections) — D1-D252, U17 · 156
+- [Drivers and connections](#drivers-and-connections) — D1-D253, U17 · 157
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
 - [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U98 · 89
@@ -2700,11 +2700,11 @@ Found 2026-10-08 by the red-team round of the Databend provider (HD-1); pre-exis
 `parseGenericURL` in `src/lib/connection-string-parser.ts`, which reads `postgres://`, `mysql://`, `redis://`, `oracle://`, `mssql://`, `db2://`, `clickhouse://` and `http(s)://` and their aliases, hands the text to `new URL`, which ends a URL's address part at the first `/` or `?`.
 So an unencoded `/` in the password moves the split: `postgres://app:2024/Secret-Tail@db.example.com:5432/prod` reads as host `app`, port `2024` and database `Secret-Tail@db.example.com:5432/prod`, and the dialog reports a green "parsed successfully" with that text in Database and in the auto-filled Name; with `?` the tail is dropped.
 Measured 2026-10-08 on `origin/main` (575eb8ccd) for `postgres://` and `mysql://`.
-The Databend DSN parser refuses such a string before `new URL`, with a sentence that says to percent-encode `/` and `?` (`DATABEND_DSN_REFUSALS.userinfo`), as it refuses `#`.
+The Databend DSN parser refuses such a string before `new URL` when its address part holds no `@`, with a sentence that names both readings and their percent-encodings (`DATABEND_DSN_REFUSALS.userinfo`), as it refuses `#`.
 
 Found 2026-10-08 by the red-team round of the Databend provider (HD-2); pre-existing.
 
-**Done when:** every scheme `parseGenericURL` reads refuses a string with an `@` past the first `/` or `?` after `://`, with a sentence naming the percent-encodings, and parser tests per scheme plus a hook test show that such a paste fills nothing.
+**Done when:** every scheme `parseGenericURL` reads refuses a string whose address part, between `://` and the first `/` or `?`, holds no `@` while a later part does, with a sentence naming both readings and their percent-encodings, never refuses one whose address part holds its `@`, and parser tests per scheme plus a hook test show that such a paste fills nothing.
 
 ### D252. The Databend sign-in latch is kept per process, so each replica sends a refused password once
 
@@ -2715,6 +2715,18 @@ So five or more replicas can send five refused sign-ins inside one 15-minute win
 Found 2026-10-08 by the red-team round of the Databend provider (HD-5); the latch is new with the provider.
 
 **Done when:** a sign-in Databend refused is latched for every replica of one deployment, before any socket, with a test that two latch instances over one shared record send a refused password once between them, and `docs/providers/databend.md` sections 3.7 and 13 drop the per-process scope.
+
+### D253. The shared HTTP transport reports a request stopped while it waits for a socket as one stopped in flight
+
+`createNodeTransport` in `src/lib/db/http/node-transport.ts` holds the requests past `maxSockets` itself and starts one only when a socket is free.
+A request whose signal fires while it waits there fails as `TransportError` kind `aborted`, "The request was cancelled", the same kind and words as a request stopped after it was sent (`onAbort` calls `abortFailure` in both), so a caller cannot tell a request that never left from one that may have reached the server.
+Measured 2026-10-08 on Bun 1.4.2 and Node 24.14 with `maxSockets: 1` against a local `node:http` server: of two POSTs, the second, cancelled while the first held the socket, failed as `aborted` and the server received only the first; the first, cancelled after the server received it, failed the same way.
+The Databend transport is the one caller that reads an `aborted` POST as possibly run: it sends the kill and a logout, and reports that the statement may have run (`postFailed` and `closeUnanswered` in `src/lib/db/providers/sql/databend/http-transport.ts`).
+Through the Databend provider a POST does not wait for a socket today, since its limiter admits two statements per process, each sends one request at a time, and a connection has three sockets; Qdrant and InfluxDB read `aborted` as a cancel either way.
+
+Found 2026-10-08 while fixing the red-team findings on the Databend provider's transport; pre-existing in the shared transport.
+
+**Done when:** a request stopped before it was handed a socket fails in a way its caller can tell from one stopped after it was sent, by a kind or a flag of its own, as `truncated` marks a cut answer, with a node-transport test that runs two requests under `maxSockets: 1`, stops the queued one, and asserts its failure and that the server received one request, and the Databend transport reads that failure as a stop with nothing sent, with no kill, no logout and `cancelled` or `timeout`, tested.
 
 ## Value interpolation
 

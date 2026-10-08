@@ -11,6 +11,7 @@ import {
   DATABEND_REQUEST_HEADER_NAMES,
 } from "@/lib/db/providers/sql/databend/connection-options";
 import { DATABEND_ERROR_SENTENCES as S, DATABEND_PROTOCOL_FAULTS as F } from "@/lib/db/providers/sql/databend/errors";
+import { DATABEND_WARNING_LIMIT } from "@/lib/db/providers/sql/databend/http-transport";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
 import { serverText } from "@/lib/db/utils/server-text";
 import {
@@ -385,6 +386,43 @@ describe("the notices", () => {
       { kind: "server-warning", text: "setting no_such_setting ignored" },
       { kind: "server-warning", text: withheld },
     ]);
+  });
+
+  test("the first 100 distinct warnings are kept, and the ones past them only counted, after them (F4)", async () => {
+    expect(DATABEND_WARNING_LIMIT).toBe(100);
+    const distinct = (from: number) => Array.from({ length: 60 }, (_, n) => `w${from + n}`);
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { warnings: distinct(0), next_uri: P.page(0) }) },
+      // w0 again is one of the kept ones: neither kept twice nor counted.
+      { method: "GET", path: P.page(0), reply: ok(FIRST, { warnings: [...distinct(60), "w0"], next_uri: P.page(1) }) },
+      // w130 twice: each one Databend sent past the kept ones is counted.
+      { method: "GET", path: P.page(1), reply: ok(FIRST, { warnings: [...distinct(120), "w130"] }) },
+    ]);
+    const outcome = await transport.run(statement("SELECT 1"));
+    script.expectDone();
+    expect(outcome.notices).toEqual([
+      ...Array.from({ length: 100 }, (_, n) => ({ kind: "server-warning" as const, text: `w${n}` })),
+      { kind: "warnings-left-out", count: 20 + 61 },
+    ]);
+  });
+
+  test("many pages of distinct warnings keep 100 of them, however many Databend sends (F4)", async () => {
+    const pages = 50;
+    const perPage = 1000;
+    const warnings = (page: number) => Array.from({ length: perPage }, (_, n) => `page ${page} warning ${n}`);
+    const next = (page: number) => (page + 1 < pages ? { next_uri: P.page(page) } : {});
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { warnings: warnings(0), ...next(0) }) },
+      ...Array.from({ length: pages - 1 }, (_, n) => ({
+        method: "GET" as const,
+        path: P.page(n),
+        reply: ok(FIRST, { warnings: warnings(n + 1), ...next(n + 1) }),
+      })),
+    ]);
+    const outcome = await transport.run(statement("SELECT 1"));
+    script.expectDone();
+    expect(outcome.notices).toHaveLength(DATABEND_WARNING_LIMIT + 1);
+    expect(outcome.notices.at(-1)).toEqual({ kind: "warnings-left-out", count: pages * perPage - 100 });
   });
 
   test("SET ROLE is told against the role the first provider statement echoed (design 3.7)", async () => {

@@ -79,7 +79,7 @@ import {
 } from "./connection-options";
 import { decodeOutcome } from "./decode";
 import { type DatabendFailureContext, toDatabaseError, unsentStopError } from "./errors";
-import { createDatabendHttpTransport, type DatabendHttpTransportDeps } from "./http-transport";
+import { createDatabendHttpTransport, DATABEND_WARNING_LIMIT, type DatabendHttpTransportDeps } from "./http-transport";
 import {
   DATABEND_MONITORING_SENTENCES,
   getActiveSessions as readActiveSessions,
@@ -132,7 +132,7 @@ const DATABEND = "databend";
 
 const databendLimiter = engineLimiter(DATABEND, DATABEND_LIMITER_OPTIONS);
 
-/** The steps a `close-failed` notice names, as a sentence says them. */
+/** The steps a `close-failed` or `close-skipped` notice names, as a sentence says them. */
 const CLOSE_STEPS: Readonly<Record<Extract<DatabendNotice, { kind: "close-failed" }>["step"], string>> = {
   final: "close the finished statement (final)",
   kill: "stop the statement (kill)",
@@ -147,6 +147,10 @@ export const DATABEND_PROVIDER_SENTENCES = Object.freeze({
     `The result reached Studio's statement budget of ${DATABEND_OBJECT_SENTENCES.bound(cut)}, so only the rows before it are shown.`,
   closeFailed: (step: keyof typeof CLOSE_STEPS) =>
     `The statement finished, but Studio's request to ${CLOSE_STEPS[step]} got no answer within 5 seconds.`,
+  closeSkipped: (step: keyof typeof CLOSE_STEPS) =>
+    `The statement finished, but Databend then refused the sign-in, so Studio did not send its request to ${CLOSE_STEPS[step]}, or any further request for this statement.`,
+  warningsLeftOut: (count: number) =>
+    `Studio shows the first ${DATABEND_WARNING_LIMIT} different warnings of this statement and left out ${count} more that Databend sent.`,
   databaseMissing: (database: string) =>
     `Database "${database}" is not in the default catalog's databases, so unqualified names will not resolve: check Database, or leave it empty.`,
   unverifiedTls:
@@ -209,10 +213,14 @@ function noticeWarning(notice: DatabendNotice): QueryWarning {
       return { message: TEMP_TABLES_DROPPED };
     case "close-failed":
       return { message: DATABEND_PROVIDER_SENTENCES.closeFailed(notice.step) };
+    case "close-skipped":
+      return { message: DATABEND_PROVIDER_SENTENCES.closeSkipped(notice.step) };
     case "result-mode":
       return { message: DATABEND_ANSWER_SENTENCES.resultMode(notice.mode) };
     case "server-warning":
       return { message: notice.text };
+    case "warnings-left-out":
+      return { message: DATABEND_PROVIDER_SENTENCES.warningsLeftOut(notice.count) };
   }
 }
 

@@ -13,8 +13,9 @@
  *
  * Sessions [X08]: Databend creates a session per HTTP request, so `system.processes` lists one row per running
  * statement of the whole warehouse, every user's included, and needs no grant (`user_grant.rs:27-51`). The kill target
- * is that row's `id`, a SESSION id: `KILL QUERY` by the HTTP query id answers 1053, so `current_query_id` is shown and
- * never sent. `KILL QUERY` on a session stops its current statement and needs global SUPER.
+ * is that row's `id`, a SESSION id: `KILL QUERY` by the HTTP query id answers 1053, so the query id is never read. A
+ * row's state is the word the monitoring panels count, "active", for the command `Query`, and the command lower-cased
+ * otherwise (`Aborting`). `KILL QUERY` on a session stops its current statement and needs global SUPER.
  *
  * Studio's own reads are not running work: `system.processes` lists the reading statement too, so both reads of it
  * leave out `connection_id()`, the reading row's own id (measured equal on the fixture), and a panel sends its reads
@@ -72,7 +73,6 @@ export const DATABEND_MONITORING_SENTENCES = Object.freeze({
   killNeedsId: "Stopping a statement needs its session id, which the Sessions panel lists.",
   killIdRefused: "A Databend session id is 1 to 64 letters, digits and hyphens, as the Sessions panel lists it.",
   killAsked: (pid: string) => `Asked Databend to stop the current statement of session ${pid}.`,
-  sessionState: (status: string, queryId: string) => `${status} (query ${queryId})`,
 });
 
 /** The tables the statistics read: the default catalog's own, without the two generated databases. */
@@ -92,7 +92,7 @@ const DATABEND_ACTIVE_QUERIES_SQL =
 const DATABEND_INDEX_COUNT_SQL = "SELECT count(*) AS index_count FROM default.system.indexes";
 
 export function databendSessionsSql(limit: number): string {
-  return `SELECT id AS session_id, \`user\` AS user_name, host, database AS database_name, status, extra_info AS query_text, current_query_id, created_time, time AS elapsed_seconds FROM default.system.processes WHERE command <> 'Idle' AND id <> connection_id() ORDER BY created_time LIMIT ${limit}`;
+  return `SELECT id AS session_id, \`user\` AS user_name, host, database AS database_name, command, extra_info AS query_text, created_time, time AS elapsed_seconds FROM default.system.processes WHERE command <> 'Idle' AND id <> connection_id() ORDER BY created_time LIMIT ${limit}`;
 }
 
 /** `log_type` 2 is a finished statement; rows arrive through an ETL batch, so the newest lag. */
@@ -224,6 +224,15 @@ export async function getSlowQueries(
   });
 }
 
+/**
+ * The state the monitoring panels count: they count `state === "active"`, PostgreSQL's word for a statement in flight,
+ * which is what the command `Query` means; another command (`Aborting`) keeps its own word, lower-cased, so no panel
+ * counts it as active or idle, as Neo4j's sessions do.
+ */
+function sessionState(command: string): string {
+  return command === "Query" ? "active" : command.toLowerCase();
+}
+
 /** Every running statement of the warehouse, keyed by its session id [X08]. */
 export async function getActiveSessions(
   runner: DatabendStatementRunner,
@@ -232,8 +241,6 @@ export async function getActiveSessions(
   const limit = clampMonitoringLimit(options.limit, DATABEND_DEFAULT_SESSION_LIMIT);
   const rows = await readPanelRows(runner, databendSessionsSql(limit), "sessions");
   return rows.map((row) => {
-    const status = readText(row.status);
-    const queryId = readText(row.current_query_id);
     const host = readText(row.host);
     const queryStart = readInstant(row.created_time);
     // `time` is seconds since the session was created, and a session lives for one request, so it is the age.
@@ -242,7 +249,7 @@ export async function getActiveSessions(
       pid: readText(row.session_id),
       user: readText(row.user_name),
       database: readText(row.database_name),
-      state: queryId === "" ? status : DATABEND_MONITORING_SENTENCES.sessionState(status, queryId),
+      state: sessionState(readText(row.command)),
       query: readText(row.query_text),
       duration: formatDuration(durationMs),
       durationMs,

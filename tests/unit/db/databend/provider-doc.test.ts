@@ -28,8 +28,9 @@ import {
   READS_FILE_ACCESS_POSTURE,
 } from "@/lib/db/compatibility";
 import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
-import { DATABEND_ANSWER_SENTENCES, RESULT_MODE_FLOOR } from "@/lib/db/providers/sql/databend/answer";
+import { DATABEND_ANSWER_SENTENCES, RESULT_MODE_FLOOR, readAnswer } from "@/lib/db/providers/sql/databend/answer";
 import { AUTH_LATCH_MAX_ENTRIES, AUTH_LATCH_TTL_MS } from "@/lib/db/providers/sql/databend/auth-latch";
+import { databendCloudHostWarehouse } from "@/lib/db/providers/sql/databend/cloud-host";
 import {
   DATABEND_CELL_BUDGET,
   DATABEND_CLOSE_TIMEOUT_MS,
@@ -49,7 +50,7 @@ import {
   type DatabendFailureContext,
   refusalError,
 } from "@/lib/db/providers/sql/databend/errors";
-import { DATABEND_PAGE_UNANSWERED } from "@/lib/db/providers/sql/databend/http-transport";
+import { DATABEND_PAGE_UNANSWERED, DATABEND_WARNING_LIMIT } from "@/lib/db/providers/sql/databend/http-transport";
 import { DATABEND_PROVIDER_SENTENCES, DatabendProvider } from "@/lib/db/providers/sql/databend/index";
 import {
   DATABEND_DEFAULT_SESSION_LIMIT,
@@ -61,6 +62,7 @@ import {
   DATABEND_UNKNOWN_TEXT,
   databendSessionsSql,
   databendSlowQueriesSql,
+  getActiveSessions,
   getHealth,
 } from "@/lib/db/providers/sql/databend/introspect";
 import { DATABEND_KILL_SPEC, DATABEND_LABEL_SENTENCES, DATABEND_LABELS } from "@/lib/db/providers/sql/databend/labels";
@@ -83,7 +85,7 @@ import {
   DATABEND_IDENTIFIER_DOLLAR,
   DATABEND_MULTIPLE_STATEMENTS,
   DATABEND_NO_STATEMENT,
-  DATABEND_STAGE_BACKSLASH,
+  DATABEND_STAGE_RUN_ON,
   DATABEND_TAGGED_DOLLAR,
   DATABEND_UNTERMINATED_SPAN,
   databendStatementRefusal,
@@ -91,6 +93,7 @@ import {
 import { DatabendError, type DatabendTruncation } from "@/lib/db/providers/sql/databend/transport";
 import { MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
 import { databendTextStrategy } from "@/lib/explain/databend-text";
+import { buildResultExport } from "@/lib/export/result-export";
 import { SeedConnectionSchema } from "@/lib/seed/types";
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import type { DatabaseConnection } from "@/lib/types";
@@ -235,6 +238,10 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_PROTOCOL_FAULTS.sessionId,
       DATABEND_PROTOCOL_FAULTS.proxySession,
       DATABEND_PROTOCOL_FAULTS.pollBound,
+      DATABEND_PROTOCOL_FAULTS.rows,
+      DATABEND_PROTOCOL_FAULTS.schema,
+      DATABEND_PROTOCOL_FAULTS.values,
+      DATABEND_PROTOCOL_FAULTS.depth,
     ],
   },
   DATABEND_LABEL_SENTENCES: {
@@ -252,6 +259,8 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_PROVIDER_SENTENCES.closeFailed("kill"),
       DATABEND_PROVIDER_SENTENCES.closeFailed("rollback"),
       DATABEND_PROVIDER_SENTENCES.closeFailed("logout"),
+      DATABEND_PROVIDER_SENTENCES.closeSkipped("logout"),
+      DATABEND_PROVIDER_SENTENCES.warningsLeftOut(slot("[count]")),
       DATABEND_PROVIDER_SENTENCES.databaseMissing("[database]"),
       DATABEND_PROVIDER_SENTENCES.unverifiedTls,
       DATABEND_PROVIDER_SENTENCES.slotsBusy("[seconds]"),
@@ -264,7 +273,6 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_MONITORING_SENTENCES.killNeedsId,
       DATABEND_MONITORING_SENTENCES.killIdRefused,
       DATABEND_MONITORING_SENTENCES.killAsked("[session id]"),
-      DATABEND_MONITORING_SENTENCES.sessionState("[status]", "[query id]"),
     ],
   },
   DATABEND_DSN_REFUSALS: {
@@ -306,7 +314,7 @@ const GUARD_SENTENCES: readonly string[] = [
   DATABEND_IDENTIFIER_DOLLAR,
   DATABEND_MULTIPLE_STATEMENTS,
   DATABEND_NO_STATEMENT,
-  DATABEND_STAGE_BACKSLASH,
+  DATABEND_STAGE_RUN_ON,
   DATABEND_TAGGED_DOLLAR,
   DATABEND_UNTERMINATED_SPAN,
 ];
@@ -381,15 +389,61 @@ describe("docs/providers/databend.md quotes what the code says", () => {
   test("a Databend Cloud host, the older one that names its warehouse included, is stated where the billing is", () => {
     const cloud = flat(sectionOf(DOC, "### 4.4 Databend Cloud: warehouse, cold start and billing"));
     expect(cloud).toContain("`<tenant>--<warehouse>.gw.<region>.default.databend.com`");
-    expect(cloud).toContain("`databend.com` or `databend.cn`");
+    // RI-4: the clients' test is for their presign mode, and it counts tidbcloud.com too.
+    expect(cloud).toContain("A host under `databend.com`, `databend.cn` or `tidbcloud.com` is Databend Cloud's");
+    expect(cloud).toContain("when they choose their presign mode for uploads, not for billing");
+    expect(cloud).not.toContain("as BendSQL and databend-jdbc tell it apart");
+    expect(cloud).toContain(
+      "Databend's docs show that form under `databend.com` and `databend.cn` only, so Studio reads no warehouse from a host under `tidbcloud.com`.",
+    );
     const older = "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com";
     expect(new DatabendProvider({ ...CONNECTION, host: older }).getCapabilities().resumesBilledCompute).toBe(true);
     expect(parseConnectionString(`databend://cloudapp@${older}:443/default`)?.warehouse).toBe("eric");
+    const lake = "tn3ftqihs--eric.gw.aws-us-east-2.default.tidbcloud.com";
+    expect(new DatabendProvider({ ...CONNECTION, host: lake }).getCapabilities().resumesBilledCompute).toBe(true);
+    expect(parseConnectionString(`databend://cloudapp@${lake}:443/default`)?.warehouse).toBeUndefined();
     expect(flat(sectionOf(DOC, "### 4.1 Configuration fields"))).toContain(
       "or, with no `warehouse=`, the warehouse an older Databend Cloud host names (section 4.4)",
     );
     expect(flat(sectionOf(DOC, "## 9. Capabilities & labels"))).toContain(
       "`resumesBilledCompute` is declared when Warehouse is set or the host is Databend Cloud's (section 4.4).",
+    );
+  });
+
+  test("section 10 names an older Cloud host's warehouse as it names a Warehouse, and 4.4 says so (RI-3)", () => {
+    const errors = sectionOf(DOC, "## 10. Error handling");
+    expect(rowOf(errors, "A 503 or 429 on a GET past its retries, with no warehouse named")).toBe(
+      `| A 503 or 429 on a GET past its retries, with no warehouse named | ${DATABEND_ERROR_SENTENCES.unavailable("[cause]", "[seconds]")} |`,
+    );
+    expect(flat(errors)).toContain(
+      `With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), an outcome-unknown sentence adds "${DATABEND_ERROR_SENTENCES.warehouseStarting}", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.`,
+    );
+    expect(flat(sectionOf(DOC, "### 4.4 Databend Cloud: warehouse, cold start and billing"))).toContain(
+      "For such a host the sentences of this section and of section 10 name the warehouse the host carries, as they name a Warehouse,",
+    );
+    // The sentences once connect() has put the host's warehouse into the options they read, which
+    // cloud-host.test.ts drives through the provider.
+    const ctx: DatabendFailureContext = {
+      request: "post",
+      origin: "user",
+      sql: "SELECT 1",
+      warehouse: databendCloudHostWarehouse("tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com"),
+      endpoint: { host: "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com", port: 443 },
+      timeoutMs: 60_000,
+      secretForms: [],
+    };
+    const refusal = (status: number) => ({
+      status,
+      contentType: "text/plain",
+      code: null,
+      gatewayKind: null,
+      text: "",
+    });
+    expect(refusalError(refusal(502), ctx).message).toBe(
+      `${DATABEND_ERROR_SENTENCES.noAnswer("HTTP 502")} ${DATABEND_ERROR_SENTENCES.warehouseStarting}`,
+    );
+    expect(refusalError(refusal(503), { ...ctx, request: "get" }).message).toBe(
+      DATABEND_ERROR_SENTENCES.resuming("eric", "60"),
     );
   });
 
@@ -399,6 +453,13 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       "its kill, ROLLBACK and logout included, that Studio process sends that password to that server again only after 15 minutes",
     );
     expect(latch).toContain("[D252](../BACKLOG.md)");
+    // The sentence a latched run reads makes the same promise, for the one server that latched (RI-6).
+    const latched = DATABEND_ERROR_SENTENCES.latched("[time]", "[until]");
+    expect(latched).toContain("so this Studio server will not send this password again");
+    expect(latch).toContain(`> ${latched}`);
+    expect(read("docs/DATABASE_PROVIDERS.md")).toContain(
+      "auth-latch.ts   #   A refused sign-in is not sent again by this process for 15 minutes",
+    );
     expect(flat(sectionOf(DOC, "## 13. Known limitations"))).toContain(
       "The sign-in latch is one Studio process's: several replicas each send a refused password once per 15 minutes",
     );
@@ -500,6 +561,35 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(prose).toContain(`> ${databendNotAppliedNotice(["[names]"])}`);
   });
 
+  test("tls_ca_file is listed with the parameters that are not applied, as its caution says (RI-2)", () => {
+    const prose = flat(sectionOf(DOC, "### 4.1 Configuration fields"));
+    expect(prose).toContain(
+      "`tls_ca_file` is not applied, nor is an `sslmode` other than `disable`, `require` and `enable`: each gets its caution above.",
+    );
+    expect(prose).toContain(
+      "Any other parameter, `warehouse` and the sign-in ones refused above aside, is not applied either: it is named in a warning, never valued, and the other fields are filled in:",
+    );
+    expect(prose).not.toContain("A parameter other than `warehouse`, `sslmode` and `tls_ca_file` is not applied");
+    const read = (query: string) => parseConnectionString(`databend://root@localhost:8000/db?${query}`);
+    expect(read("tls_ca_file=/ca.pem")?.cautions).toEqual([DATABEND_DSN_CAUTIONS.caFile]);
+    expect(read("sslmode=verify-full")?.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    for (const mode of ["disable", "require", "enable"]) expect(read(`sslmode=${mode}`)?.cautions).toBeUndefined();
+    expect(read("tls_ca_file=/ca.pem&role=r&warehouse=w")?.ignoredParameters).toEqual(["role"]);
+    expect(read("access_token=t&role=r")?.refusal).toBe(DATABEND_DSN_REFUSALS.signIn);
+  });
+
+  test("an @ past the address part is refused only when the address part holds none (RI-1)", () => {
+    const prose = flat(sectionOf(DOC, "### 4.1 Configuration fields"));
+    const signedIn = "databend://root:pw@host:443/db?role=analyst@corp";
+    expect(prose).toContain(
+      `An \`@\` past the address part is refused only when the address part holds none, since the text then reads two ways; a DSN that signs in, as \`${signedIn}\` does, is read as the URL parser splits it.`,
+    );
+    expect(parseConnectionString(signedIn)?.refusal).toBeUndefined();
+    expect(parseConnectionString("databend://host:443/db?role=analyst@corp")?.refusal).toBe(
+      DATABEND_DSN_REFUSALS.userinfo,
+    );
+  });
+
   test("every exported sentence record is quoted whole, key for key", () => {
     const expectedKeys: Readonly<Record<string, readonly string[]>> = {
       DATABEND_CONNECTION_SENTENCES: [
@@ -554,6 +644,10 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "sessionId",
         "proxySession",
         "pollBound",
+        "rows",
+        "schema",
+        "values",
+        "depth",
       ],
       DATABEND_LABEL_SENTENCES: [
         "analyzeGlobalDesc",
@@ -566,12 +660,14 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "params",
         "resultCut",
         "closeFailed",
+        "closeSkipped",
+        "warningsLeftOut",
         "databaseMissing",
         "unverifiedTls",
         "slotsBusy",
         "maintenanceRefused",
       ],
-      DATABEND_MONITORING_SENTENCES: ["killNeedsId", "killIdRefused", "killAsked", "sessionState"],
+      DATABEND_MONITORING_SENTENCES: ["killNeedsId", "killIdRefused", "killAsked"],
       DATABEND_DSN_REFUSALS: ["fragment", "userinfo", "signIn", "flight", "jdbc", "shellExport"],
       DATABEND_SSLMODE_NOTICES: ["require", "enable"],
       DATABEND_DSN_CAUTIONS: ["caFile", "sslmode"],
@@ -639,6 +735,55 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(databendStatementRefusal("SELECT /*+ SET_VAR(timezone='UTC') */ now()")).toBeNull();
   });
 
+  test("the stage rule is stated as the guard applies it, the <@ operator and the names it still refuses included", () => {
+    const guard = flat(sectionOf(DOC, "### 5.2 The statement guard"));
+    const arrowAt = "SELECT parse_json('[1]')<@/*c*/parse_json('[1,2]') AS r";
+    expect(guard).toContain(`\`${arrowAt}\` is sent`);
+    expect(databendStatementRefusal(arrowAt)).toBeNull();
+    expect(rowOf(sectionOf(DOC, "### 5.2 The statement guard"), "`SELECT 2<<@s--;SELECT 3 AS hidden`")).toBe(
+      `| \`SELECT 2<<@s--;SELECT 3 AS hidden\` | ${DATABEND_STAGE_RUN_ON} |`,
+    );
+    expect(guard).toContain("a stage token, a `;` and a second statement to Databend");
+    expect(flat(sectionOf(DOC, "### 5.6 EXPLAIN is the planning form only"))).toContain(
+      "An `@` that ends a `<@` operator opens no stage name here either.",
+    );
+    // A name that itself holds a run hides nothing, yet is refused; the quoted location is the way through.
+    const limits = flat(sectionOf(DOC, "## 13. Known limitations"));
+    expect(limits).toContain(
+      "as `@s[1]` and `@s/a--b.csv` do, is one stage name to Databend, which a space would cut short;",
+    );
+    expect(limits).toContain("`FROM '@s/a--b.csv'`, which Databend reads as the same stage location");
+    expect(limits).toContain(
+      "with `LIST` and `REMOVE`, which take only the bare name, name the stage alone and match the path with `PATTERN`.",
+    );
+    for (const name of ["@s[1]", "@s/a--b.csv"]) {
+      expect(databendStatementRefusal(`SELECT $1 FROM ${name}`)).toBe(DATABEND_STAGE_RUN_ON);
+      expect(databendStatementRefusal(`SELECT $1 FROM '${name}'`)).toBeNull();
+    }
+    expect(databendStatementRefusal("LIST @s PATTERN = '.*a--b[.]csv'")).toBeNull();
+  });
+
+  test("the skipped row's comment names a type by its outer name, as the writer builds it (R-SQL-2)", () => {
+    const written = flat(sectionOf(DOC, "### 5.7 What the SQL INSERT export writes"));
+    expect(written).toContain(
+      "The comment names the type by its outer name, with `Nullable` unwrapped and its arguments dropped (`Map` for `Nullable(Map(String, Int32))`), cut at 64 characters,",
+    );
+    expect(written).not.toContain("as the server spelled it");
+    const skipped = (type: string) =>
+      buildResultExport("sql-insert", {
+        rows: [{ c: "x" }],
+        fields: ["c"],
+        tabName: "users",
+        dialect: "databend",
+        columnTypes: { c: type },
+      }).content;
+    expect(skipped("Nullable(Map(String, Int32))")).toBe(
+      '-- Row 1 skipped: column "c" holds a value of type Map, which databend has no literal for.',
+    );
+    expect(skipped("Array(Nullable(Int32))")).toContain("holds a value of type Array,");
+    expect(skipped("X".repeat(100))).toContain(`holds a value of type ${"X".repeat(64)}...,`);
+  });
+
   test("the bound-parameter refusal is the provider's", async () => {
     let message = "";
     try {
@@ -689,6 +834,28 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(rowOf(bounds, "Sign-in latch")).toContain(
       `${AUTH_LATCH_TTL_MS / 60_000} minutes per refused sign-in, at most ${AUTH_LATCH_MAX_ENTRIES} entries`,
     );
+    expect(rowOf(bounds, "Server warnings")).toContain(
+      `the first ${DATABEND_WARNING_LIMIT} different ones of a statement are shown`,
+    );
+  });
+
+  test("the nesting bound the doc quotes is the depth past which an answer is refused before it is parsed", () => {
+    const bounds = sectionOf(DOC, "### 3.10 Bounds, and what they were measured against");
+    const depth = Number(/^\| Nesting of one answer \| (\d+) arrays and objects deep/m.exec(bounds)?.[1]);
+    expect(depth).toBeGreaterThan(3);
+    const nested = (arrays: number) =>
+      readAnswer(
+        {
+          status: 200,
+          contentType: "application/json",
+          retryAfter: null,
+          text: `{"id":"q","state":"Running","x":${"[".repeat(arrays)}${"]".repeat(arrays)}}`,
+        },
+        { rows: 1, columns: 1 },
+      );
+    // The answer's own object is the first level.
+    expect(nested(depth - 1).kind).toBe("answer");
+    expect(() => nested(depth)).toThrow(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.depth));
   });
 
   test("the statement request is what the transport sends: its headers, settings and paging", async () => {
@@ -746,6 +913,27 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(flat(sectionOf(DOC, "### 5.8 Cancellation and deadlines"))).toContain(
       `a kill answered 404 is sent again at ${waits[0]}, ${waits[1]} and ${waits[2]} ms`,
     );
+  });
+
+  test("a kill a gateway refuses over HTTP 200 is no acknowledged cancel, as sections 3.5 and 5.8 say (REV-T-2)", async () => {
+    expect(flat(sectionOf(DOC, "### 5.8 Cancellation and deadlines"))).toContain(
+      "the run reads as cancelled only when the kill answered 200 with no gateway refusal in its body, or an answer reported code 1043",
+    );
+    expect(flat(sectionOf(DOC, "### 3.5 What a statement leaves open is closed"))).toContain(
+      "A close's HTTP 200 acknowledges it unless its body is a gateway's refusal",
+    );
+    const ids = idsOf(1);
+    const refused = { status: 200, body: { error: { kind: "AuthorizationFailed", message: "Authorization failed" } } };
+    const { script, transport } = transportHarness([
+      { method: "POST", path: QUERY_PATH, reply: { hang: true } },
+      { method: "GET", path: pathsOf(ids.queryId).kill, reply: refused },
+    ]);
+    const run = runSignal();
+    const running = transport.run(statement("SELECT 1", { signal: run.signal })).catch((error: unknown) => error);
+    await script.received(1);
+    run.cancel();
+    expect(((await running) as DatabendError).category).toBe("outcome-unknown");
+    script.expectDone();
   });
 
   test("the server-text cuts the doc quotes are the lengths errors.ts keeps", () => {
@@ -920,6 +1108,30 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(sectionOf(DOC, "## 8. Maintenance")).toContain(`"${DATABEND_KILL_SPEC.label}"`);
   });
 
+  test("the session state the monitoring section names is the word the panels count (F8)", async () => {
+    const monitoring = flat(sectionOf(DOC, "## 7. Monitoring & health"));
+    expect(monitoring).toContain(
+      'Its state is "active" while it runs a statement (`command` `Query`), the word the Active card and the Overview count, and "aborting" (`Aborting`) while a `KILL CONNECTION` or a server shutdown ends its session; the panel\'s own kill, a `KILL QUERY`, leaves it "active" until the statement stops.',
+    );
+    expect(monitoring).not.toContain("(query [query id])");
+    const columns = ["session_id", "user_name", "host", "database_name", "command", "query_text"];
+    const runner: DatabendStatementRunner = async (sql) => {
+      expect(sql).toBe(databendSessionsSql(DATABEND_DEFAULT_SESSION_LIMIT));
+      return {
+        schema: columns.map((name) => ({ name, type: "String" })),
+        rows: [
+          ["s1", "u", "h", "d", "Query", "SELECT 1"],
+          ["s2", "u", "h", "d", "Aborting", "SELECT 2"],
+        ],
+        truncated: null,
+        notices: [],
+        hasResultSet: true,
+        affect: null,
+      };
+    };
+    expect((await getActiveSessions(runner)).map((session) => session.state)).toEqual(["active", "aborting"]);
+  });
+
   test("the degrading codes the monitoring section names are the ones introspect.ts reads", () => {
     const monitoring = flat(sectionOf(DOC, "## 7. Monitoring & health"));
     const named = /Databend answers one of the codes (.+?) \(/.exec(monitoring)?.[1] ?? "";
@@ -987,6 +1199,8 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       "the session's current statement",
       "verified locally",
       "several replicas",
+      "its first 100 different server warnings",
+      "no query id for a running statement",
     ]) {
       expect(limits, fragment).toContain(fragment);
     }

@@ -12,6 +12,7 @@ import {
   DATABEND_ANSWER_SENTENCES,
   RESULT_MODE_FLOOR,
   readAnswer,
+  readCloseAnswer,
   resultModeNotice,
 } from "@/lib/db/providers/sql/databend/answer";
 import {
@@ -32,6 +33,8 @@ const json = (body: unknown, status = 200) => response(status, "application/json
 const BOUNDS: AnswerBounds = { rows: 10_000, columns: 250_000 };
 /** The arrays, objects, keys and values an answer may hold outside its rows and columns. */
 const ALLOWANCE = 65_536;
+/** How deep an answer may nest arrays and objects, its own object included: a real one nests 3. */
+const ANSWER_DEPTH = 64;
 /** The characters of a refusal that are read. */
 const REFUSAL_CHARS = 64 * 1024;
 
@@ -301,10 +304,23 @@ describe("protocol", () => {
     expect(error.cause).toBeInstanceOf(SyntaxError);
   });
 
-  test("nesting deeper than an answer's allowance is refused before it is parsed", () => {
+  test("nesting deeper than an answer may have is refused before it is parsed, as its own fault (REV-T-1)", () => {
     const deep = `{"id":"q","state":"Running","x":${"[".repeat(200_000)}${"]".repeat(200_000)}}`;
     const error = protocolOf(() => readAnswer(response(200, "application/json", deep), BOUNDS));
-    expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field("answer")));
+    expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.depth));
+    expect(error.cause).toBeUndefined();
+  });
+
+  test("64 arrays and objects deep, the answer's own object included, is read; one more is refused", () => {
+    const nested = (arrays: number) =>
+      response(200, "application/json", `{"id":"q","state":"Running","x":${"[".repeat(arrays)}${"]".repeat(arrays)}}`);
+    expect(readAnswer(nested(ANSWER_DEPTH - 1), BOUNDS).kind).toBe("answer");
+    expect(protocolOf(() => readAnswer(nested(ANSWER_DEPTH), BOUNDS)).message).toBe(
+      DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.depth),
+    );
+    // Brackets inside a string are text, at any count.
+    const text = response(200, "application/json", `{"id":"q","state":"Running","x":"${"[".repeat(1000)}"}`);
+    expect(readAnswer(text, BOUNDS).kind).toBe("answer");
   });
 
   test("__proto__ as a key, anywhere, however it is spelled", () => {
@@ -385,27 +401,25 @@ describe("what one answer may hold, counted before it is parsed (design 3.12; HA
     const reading = read(body(`"data":[${row("1")},${row("2")}]`));
     expect(reading.kind === "answer" && reading.answer.data).toEqual([["1"], ["2"]]);
     expect(protocolOf(() => read(body(`"data":[${row("1")},${row("2")},${row("3")}]`))).message).toBe(
-      fault(DATABEND_PROTOCOL_FAULTS.field("data")),
+      fault(DATABEND_PROTOCOL_FAULTS.rows),
     );
     // The third row is counted before the text is parsed: the body never closes.
     expect(protocolOf(() => read(`{"id":"q","state":"Running","data":[[],[],[`)).message).toBe(
-      fault(DATABEND_PROTOCOL_FAULTS.field("data")),
+      fault(DATABEND_PROTOCOL_FAULTS.rows),
     );
   });
 
   test("data under a key spelled with an escape is held to the page once it is parsed", () => {
     const text = body(`"d\\u0061ta":[${row("1")},${row("2")},${row("3")}]`);
-    expect(protocolOf(() => read(text)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.field("data")));
+    expect(protocolOf(() => read(text)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.rows));
   });
 
   test("a schema wider than the columns a result can keep, or a column of more keys, is refused before parsing", () => {
     const columns = (count: number) => Array.from({ length: count }, (_, n) => ({ name: `c${n}`, type: "String" }));
     const wide = `{"id":"q","state":"Running","schema":${JSON.stringify(columns(4))}`;
-    expect(protocolOf(() => read(wide)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.field("schema")));
+    expect(protocolOf(() => read(wide)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.schema));
     const keyed = `{"id":"q","state":"Running","schema":[{"name":"a","type":"S","b":1,"c":2,"d":3,"e":4,"f":5,"g":6}`;
-    expect(protocolOf(() => read(keyed, { rows: 2, columns: 1 })).message).toBe(
-      fault(DATABEND_PROTOCOL_FAULTS.field("schema")),
-    );
+    expect(protocolOf(() => read(keyed, { rows: 2, columns: 1 })).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.schema));
     const reading = read(body(`"data":[]`).replace(JSON.stringify(schema), JSON.stringify(columns(3))));
     expect(reading.kind === "answer" && reading.answer.schema).toHaveLength(3);
   });
@@ -419,18 +433,29 @@ describe("what one answer may hold, counted before it is parsed (design 3.12; HA
   });
 
   test.each([
-    ["values in an array of the answer", `"x":[${"0,".repeat(ALLOWANCE)}0]`, "answer"],
-    [
-      "keys of an object of the answer",
-      `"x":{${Array.from({ length: ALLOWANCE }, (_, n) => `"k${n}":0`).join(",")}}`,
-      "answer",
-    ],
-    ["arrays inside a row", `"data":[[${"[],".repeat(ALLOWANCE)}[]]]`, "data"],
-    ["values inside a column", `"schema":[{"name":[${"0,".repeat(ALLOWANCE)}0]}]`, "schema"],
-  ])("more %s than the allowance are refused before parsing", (_label, fields, field) => {
+    ["values in an array of the answer", `"x":[${"0,".repeat(ALLOWANCE)}0]`],
+    ["keys of an object of the answer", `"x":{${Array.from({ length: ALLOWANCE }, (_, n) => `"k${n}":0`).join(",")}}`],
+    ["arrays inside a row", `"data":[[${"[],".repeat(ALLOWANCE)}[]]]`],
+    ["values inside a column", `"schema":[{"name":[${"0,".repeat(ALLOWANCE)}0]}]`],
+  ])("more %s than the allowance are refused before parsing, as an answer holding too much", (_label, fields) => {
     expect(protocolOf(() => read(`{"id":"q","state":"Running",${fields}}`, BOUNDS)).message).toBe(
-      fault(DATABEND_PROTOCOL_FAULTS.field(field)),
+      fault(DATABEND_PROTOCOL_FAULTS.values),
     );
+  });
+
+  test("a bound passed reads as too large, never as a field of the wrong type (REV-T-3)", () => {
+    for (const what of [
+      DATABEND_PROTOCOL_FAULTS.rows,
+      DATABEND_PROTOCOL_FAULTS.schema,
+      DATABEND_PROTOCOL_FAULTS.values,
+      DATABEND_PROTOCOL_FAULTS.depth,
+    ]) {
+      expect(what).not.toContain("wrong type");
+    }
+    expect(DATABEND_PROTOCOL_FAULTS.rows).toBe("more rows than the page Studio asked for");
+    expect(DATABEND_PROTOCOL_FAULTS.schema).toBe("a schema larger than a result can keep");
+    expect(DATABEND_PROTOCOL_FAULTS.values).toBe("more values than one answer may hold");
+    expect(DATABEND_PROTOCOL_FAULTS.depth).toBe("nesting deeper than one answer may have");
   });
 
   test("the allowance counts only outside strings: brackets, commas and colons inside one are text", () => {
@@ -521,6 +546,53 @@ describe("a refusal is read up to 64 KiB (HASIM-D-2)", () => {
         text: text.slice(0, REFUSAL_CHARS),
       },
     });
+  });
+});
+
+describe("a close's 200, read only for a gateway's refusal (REV-T-2)", () => {
+  test("what a kill, a final and a logout answer acknowledges the close", () => {
+    // kill.json: 200 with no content type and an empty body; the logout's and a final's, as captured.
+    expect(readCloseAnswer(response(200, null, ""))).toBeNull();
+    expect(readCloseAnswer(response(200, "application/json; charset=utf-8", '{"error":null}'))).toBeNull();
+    expect(readCloseAnswer(json({ ...FIRST, next_uri: null }))).toBeNull();
+    // A close is read by its status: an empty or broken JSON body is no fault here.
+    expect(readCloseAnswer(response(200, "application/json", ""))).toBeNull();
+    expect(readCloseAnswer(response(200, "application/json", "{"))).toBeNull();
+    expect(readCloseAnswer(json([1]))).toBeNull();
+    // A kind beside a state is an answer's field, not a refusal.
+    expect(readCloseAnswer(json({ id: "q", state: "Succeeded", kind: "AuthorizationFailed" }))).toBeNull();
+  });
+
+  test("a gateway's refusal over HTTP 200, its kind nested or top-level, is a refusal with its upstream", () => {
+    const wrapped = `status: 401, message: {"error":{"code":5100,"message":"Authentication failed"}}: Authorization failed`;
+    expect(readCloseAnswer(json({ error: { kind: "AuthorizationFailed", message: wrapped } }))).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "AuthorizationFailed",
+        text: wrapped,
+        upstreamStatus: 401,
+        upstreamCode: 5100,
+        upstreamMessage: "Authentication failed",
+      },
+    });
+    expect(readCloseAnswer(json({ kind: "ProvisionWarehouseTimeout", message: "resuming" }))).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "ProvisionWarehouseTimeout",
+        text: "resuming",
+      },
+    });
+  });
+
+  test("a body longer than 64 KiB is never parsed: the close is read by its status", () => {
+    const padded = json({ error: { kind: "AuthorizationFailed", message: "no" }, pad: "x".repeat(REFUSAL_CHARS) });
+    expect(readCloseAnswer(padded)).toBeNull();
   });
 });
 

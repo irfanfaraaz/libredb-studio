@@ -693,6 +693,45 @@ describe("query", () => {
     ]);
   });
 
+  test("warnings past the first 100 different ones are one warning that counts them (F4)", async () => {
+    const warnings = Array.from({ length: 103 }, (_, n) => `w${n}`);
+    const { provider } = await connected((sql) => (sql === "SELECT 1" ? { warnings } : undefined));
+    const result = await provider.query("SELECT 1");
+    expect(result.warnings).toEqual([
+      ...warnings.slice(0, 100).map((message) => ({ message })),
+      { message: DATABEND_PROVIDER_SENTENCES.warningsLeftOut(3) },
+    ]);
+    expect(DATABEND_PROVIDER_SENTENCES.warningsLeftOut(3)).toBe(
+      "Studio shows the first 100 different warnings of this statement and left out 3 more that Databend sent.",
+    );
+  });
+
+  test("a sign-in refused on the final leaves the logout unsent, and says so rather than that it went unanswered", async () => {
+    const refused: NodeResponse = {
+      status: 401,
+      contentType: "application/json",
+      retryAfter: null,
+      text: JSON.stringify({ error: { code: 5100, message: "Authentication failed: incorrect password" } }),
+    };
+    const fake = fakeDatabend({
+      answer: withConnect((sql) =>
+        sql === "SELECT 1" ? { ...session({ need_keep_alive: true }), next_uri: "FINAL" } : undefined,
+      ),
+      close: (path) => (path.endsWith("/final") ? refused : EMPTY_OK),
+    });
+    const { provider } = build(fake);
+    await provider.connect();
+    const result = await provider.query("SELECT 1");
+    expect(result.warnings).toEqual([
+      { message: DATABEND_PROVIDER_SENTENCES.closeFailed("final") },
+      { message: DATABEND_PROVIDER_SENTENCES.closeSkipped("logout") },
+    ]);
+    expect(fake.events.filter((event) => event.endsWith("/v1/session/logout"))).toEqual([]);
+    expect(DATABEND_PROVIDER_SENTENCES.closeSkipped("logout")).toBe(
+      "The statement finished, but Databend then refused the sign-in, so Studio did not send its request to end its session (logout), or any further request for this statement.",
+    );
+  });
+
   test("a result cut at the statement budget is marked on pagination and warned about", async () => {
     const width = 5;
     const rows = Array.from({ length: 50_001 }, () => Array.from({ length: width }, () => "1"));

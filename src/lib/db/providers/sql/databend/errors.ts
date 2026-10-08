@@ -39,7 +39,7 @@ const MAX_STATEMENT_TEXT = 1000;
  */
 export const DATABEND_ERROR_SENTENCES = Object.freeze({
   latched: (at: string, until: string) =>
-    `Databend refused this sign-in at ${at} UTC, so Studio will not send this password again before ${until} UTC, or until it changes.`,
+    `Databend refused this sign-in at ${at} UTC, so this Studio server will not send this password again before ${until} UTC, or until it changes.`,
   signInRefused: "Databend refused the sign-in for this user.",
   possibleLockout:
     "Under a password policy, five failed sign-ins lock the user for 15 minutes for every client, and the right password is refused until then.",
@@ -76,7 +76,10 @@ export const DATABEND_ERROR_SENTENCES = Object.freeze({
   currentDatabase: "Database is the current database for unqualified names: check it, or leave it empty.",
 });
 
-/** What the protocol sentence names, never a link, an id or a value. */
+/**
+ * What the protocol sentence names, never a link, an id or a value. The last four name the bound of one answer
+ * (design 3.12) that an answer passed, so what was too large is named, never a type.
+ */
 export const DATABEND_PROTOCOL_FAULTS = Object.freeze({
   notAnswer: "a 200 answer that is not JSON",
   notJson: "a body that does not parse as JSON",
@@ -89,6 +92,10 @@ export const DATABEND_PROTOCOL_FAULTS = Object.freeze({
   sessionId: "an answer for another session",
   proxySession: "an answer for another session; a proxy may drop the X-DATABEND-SESSION header",
   pollBound: "more answers than one statement may take",
+  rows: "more rows than the page Studio asked for",
+  schema: "a schema larger than a result can keep",
+  values: "more values than one answer may hold",
+  depth: "nesting deeper than one answer may have",
 });
 
 /** Codes a query node signs a refused sign-in with over HTTP 401: wrong password, two token codes, unknown user (L10). */

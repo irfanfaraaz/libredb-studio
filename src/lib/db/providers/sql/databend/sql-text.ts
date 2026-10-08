@@ -18,7 +18,7 @@
  *   `a$$` is one name there and what the span reader reads as a dollar string is code;
  * - a code-level `@` stage token holding a backslash or a run the span reader opens: `@([^\s,`;'"()]|\\\s|\\'|\\"|\\\\)+`
  *   takes `\'`, `--`, `/*`, `$$` and `[` into the name, so `@s\'; DROP TABLE t; --'` and `@s--;DROP TABLE t` are a
- *   stage, a `;` and a DROP there and one statement here;
+ *   stage, a `;` and a DROP there and one statement here; an `@` that ends a `<@` operator opens no stage token;
  * - a `/*+` hint holding a `;`: Databend tokenizes a hint body where the span reader sees a block comment, and no hint
  *   needs a `;`;
  * - a `/*+` hint holding a token that can run past the closing star-slash the span reader stops at: wherever the
@@ -50,7 +50,7 @@ export const DATABEND_TAGGED_DOLLAR =
 export const DATABEND_IDENTIFIER_DOLLAR =
   "A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again.";
 
-export const DATABEND_STAGE_BACKSLASH =
+export const DATABEND_STAGE_RUN_ON =
   "A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again.";
 
 export const DATABEND_HINT_SEMICOLON =
@@ -84,6 +84,18 @@ function plainStageEnd(sql: string, index: number): number | undefined {
   return i;
 }
 
+/**
+ * Whether the `@` at `index` ends a `<@` operator (`ArrowAt`), the one operator that starts with another character and
+ * takes an `@` in. The lexer takes the longest token, so a run of `<` is read in pairs from its start, `<<` before
+ * `<@`: an odd run ends in `<@`, and after an even one the `@` opens a stage token. The walk reaches an `@` only past
+ * every span and stage token, so the run before it starts a token.
+ */
+function endsArrowAt(sql: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && sql[start - 1] === "<") start--;
+  return (index - start) % 2 === 1;
+}
+
 /** Whether the character before `index` continues a Databend identifier, which takes `$` into its tail. */
 function continuesIdentifier(sql: string, index: number): boolean {
   return index > 0 && (IDENTIFIER_PART.test(sql[index - 1]) || sql[index - 1] === "$");
@@ -107,13 +119,13 @@ function lexerDisagreement(sql: string): string | null {
     // A `[` is stepped into, not over, so an array literal's contents are walked as the rest of the code is.
     const span = sql[i] === "[" ? null : readSqlSpan(sql, i, GRAMMAR);
     if (span === null) {
-      if (sql[i] !== "@") {
+      if (sql[i] !== "@" || endsArrowAt(sql, i)) {
         i++;
         continue;
       }
       // The whole stage token is code to both readers when it ends plainly, so the walk resumes after it.
       const end = plainStageEnd(sql, i);
-      if (end === undefined) return DATABEND_STAGE_BACKSLASH;
+      if (end === undefined) return DATABEND_STAGE_RUN_ON;
       i = end;
       continue;
     }

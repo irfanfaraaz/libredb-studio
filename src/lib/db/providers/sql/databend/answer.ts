@@ -8,13 +8,17 @@
  * gateway wraps a query node's refusal as `status: <n>, message: <json>: <words>`: that one shape is unwrapped into
  * the upstream status, code and message, and no other message text is read. A 200 that is not JSON, a body that does
  * not parse (a `RangeError` included), a key named `__proto__` anywhere, a field of the wrong type, a cell that is not
- * text or null, a row of another width than the schema, or more rows than the page Studio asked for is `protocol`.
+ * text or null, a row of another width than the schema, or an answer past one of its bounds is `protocol`. A close's
+ * 200 (a kill, final or logout) acknowledges it by its status, unless its body is a gateway's refusal, which may come
+ * over HTTP 200 as over any status.
  *
  * What one answer costs is bounded by what Studio asked for, not by the 16 MiB an answer may be: before a 200 is
  * parsed, one pass over its text counts what `JSON.parse` would build, outside strings, and refuses an answer holding
- * more rows than the page, more columns or column keys than the cell budget can keep, or more of anything else than
- * a fixed allowance. The parse takes no reviver, the rows are checked where they lie and never copied, and a refusal
- * is read only up to 64 KiB, past which it is read by its status alone.
+ * more rows than the page, more columns or column keys than the cell budget can keep, more of anything else than a
+ * fixed allowance, or arrays and objects nested deeper than 64, each with a fault that names what was too large. The
+ * depth bound keeps a recursive reader of the parsed answer, the `JSON.stringify` of the session a ROLLBACK echoes
+ * among them, inside its stack. The parse takes no reviver, the rows are checked where they lie and never copied, and
+ * a refusal is read only up to 64 KiB, past which it is read by its status alone.
  *
  * Nothing here classifies a refusal or scrubs its text: `errors.ts` does both, with the connection's secret forms.
  * Pure: no I/O.
@@ -113,6 +117,12 @@ const REFUSAL_CHARS = 64 * 1024;
  * error, affect, warnings and stats hold a few hundred.
  */
 const ANSWER_ALLOWANCE = 65_536;
+/**
+ * How deep an answer may nest arrays and objects, its own object included: a real one nests 3 (a row, the session's
+ * settings, a progress of its stats), and Node's `JSON.stringify` overflows its stack from a few thousand (4,460 on
+ * Node 24.14).
+ */
+const ANSWER_DEPTH = 64;
 /** The keys and separators one column of `schema` holds: its name, its type and the comma between them. */
 const COLUMN_TOKENS = 3;
 
@@ -146,13 +156,15 @@ function regionOf(text: string, keyAt: number, keyEnd: number): Region {
 }
 
 /**
- * The field an answer holds too much of, found in one pass over its text that allocates nothing, or null. Outside
- * strings every array, object, key and value after a comma is something `JSON.parse` builds: a row of `data` counts
- * against the page's rows, a column of `schema` and its keys against the columns, and the rest of the answer against
- * the allowance, the arrays and objects inside a row or a column included. A row's cells are bounded by the answer's
- * bytes alone: a page wider than the cell budget is legal, and the budget cuts it once it is read.
+ * What an answer holds too much of, as the protocol fault that names it, found in one pass over its text that
+ * allocates nothing; null when it is within every bound. Outside strings every array, object, key and value after a
+ * comma is something `JSON.parse` builds: a row of `data` counts against the page's rows, a column of `schema` and its
+ * keys against the columns, and the rest of the answer against the allowance, the arrays and objects inside a row or a
+ * column included; nothing nests deeper than {@link ANSWER_DEPTH}. A row's cells are bounded by the answer's bytes
+ * alone: a page wider than the cell budget is legal, and the budget cuts it once it is read.
  */
 function oversized(text: string, bounds: AnswerBounds): string | null {
+  const faults = DATABEND_PROTOCOL_FAULTS;
   let depth = 0;
   let region: Region = "answer";
   let keyAt = -1;
@@ -178,22 +190,23 @@ function oversized(text: string, bounds: AnswerBounds): string | null {
       depth -= 1;
       continue;
     }
-    if (code === OPEN_ARRAY || code === OPEN_OBJECT) depth += 1;
-    else if (code === COLON && depth === 1) region = regionOf(text, keyAt, keyEnd);
+    if (code === OPEN_ARRAY || code === OPEN_OBJECT) {
+      if (++depth > ANSWER_DEPTH) return faults.depth;
+    } else if (code === COLON && depth === 1) region = regionOf(text, keyAt, keyEnd);
     else if (code !== COMMA && code !== COLON) continue;
     const within = depth < 2 ? "answer" : region;
     const separates = code === COMMA;
     if (within === "data" && depth === 2 && separates) {
-      if (++rows > bounds.rows) return "data";
+      if (++rows > bounds.rows) return faults.rows;
     } else if (within === "data" && depth === 3 && code !== COLON) {
       // A row, or a cell after a comma.
     } else if (within === "schema" && depth === 2 && separates) {
-      if (++columns > bounds.columns) return "schema";
+      if (++columns > bounds.columns) return faults.schema;
     } else if (within === "schema" && depth === 3 && (separates || code === COLON)) {
-      if (++columnTokens > COLUMN_TOKENS * bounds.columns) return "schema";
+      if (++columnTokens > COLUMN_TOKENS * bounds.columns) return faults.schema;
     } else if (within === "schema" && depth === 3) {
       // A column.
-    } else if (++rest > ANSWER_ALLOWANCE) return within;
+    } else if (++rest > ANSWER_ALLOWANCE) return faults.values;
   }
   return null;
 }
@@ -316,7 +329,8 @@ function readAffect(body: Body): DatabendAffect | null {
 /** The rows as parsed, each checked where it lies and none copied: at most the page's, each as wide as the schema. */
 function readRows(body: Body, width: number, bounds: AnswerBounds): readonly (readonly DatabendCell[])[] {
   const rows = list(body, "data");
-  if (rows.length > bounds.rows) return wrongType("data");
+  // Rows under a key spelled with an escape reach here uncounted by the scan.
+  if (rows.length > bounds.rows) throw protocolError(DATABEND_PROTOCOL_FAULTS.rows);
   for (const row of rows) {
     if (!Array.isArray(row)) throw protocolError(DATABEND_PROTOCOL_FAULTS.cell);
     if (row.length !== width) throw protocolError(DATABEND_PROTOCOL_FAULTS.width(row.length, width));
@@ -425,21 +439,43 @@ function refusalOf(response: NodeResponse, parsed?: unknown): DatabendRefusal {
 
 /**
  * One HTTP answer as an answer or a refusal; throws a `protocol` `DatabendError` for a malformed 200, or for one that
- * holds more than `bounds` allows, which is refused before it is parsed.
+ * holds more than `bounds` and the allowance allow or nests deeper than its depth, which is refused before it is
+ * parsed.
  */
 export function readAnswer(response: NodeResponse, bounds: AnswerBounds): DatabendReading {
   if (response.status !== 200) return { kind: "refusal", refusal: refusalOf(response) };
   if (!isJson(response.contentType)) throw protocolError(DATABEND_PROTOCOL_FAULTS.notAnswer, undefined, 200);
-  const field = oversized(response.text, bounds);
-  if (field !== null) throw protocolError(DATABEND_PROTOCOL_FAULTS.field(field), undefined, 200);
+  const fault = oversized(response.text, bounds);
+  if (fault !== null) throw protocolError(fault, undefined, 200);
   const body = parse(response.text, 200);
   if (!isRecord(body)) return wrongType("answer");
-  // The Cloud gateway's refusal may come over any status, ProvisionWarehouseTimeout among them (design 3.11), with
-  // its kind top-level or nested under `error` (I19).
+  return gatewayRefusal(response, body) ?? { kind: "answer", answer: readBody(body, bounds) };
+}
+
+/**
+ * A close's 200 (a kill, final or logout), which acknowledges the close by its status: null, unless its body is a
+ * gateway's refusal, JSON of at most 64 KiB naming a kind and no state. An empty kill answer, a final's answer, the
+ * logout's `{"error":null}` and a body that does not parse are each null: a close's body is never a fault.
+ */
+export function readCloseAnswer(response: NodeResponse): DatabendReading | null {
+  if (!isJson(response.contentType) || response.text.length > REFUSAL_CHARS) return null;
+  let body: unknown;
+  try {
+    body = JSON.parse(response.text);
+  } catch {
+    return null;
+  }
+  return isRecord(body) ? gatewayRefusal(response, body) : null;
+}
+
+/**
+ * A parsed 200 body as the Cloud gateway's refusal, which may come over any status, ProvisionWarehouseTimeout among
+ * them (design 3.11): a kind, top-level or nested under `error` (I19), and no state; null for anything else.
+ */
+function gatewayRefusal(response: NodeResponse, body: Body): DatabendReading | null {
   const nested = isRecord(body.error) ? body.error : null;
-  if (gatewayKindOf(body, nested) !== null && body.state === undefined)
-    return { kind: "refusal", refusal: refusalOf(response, body) };
-  return { kind: "answer", answer: readBody(body, bounds) };
+  if (gatewayKindOf(body, nested) === null || body.state !== undefined) return null;
+  return { kind: "refusal", refusal: refusalOf(response, body) };
 }
 
 /**

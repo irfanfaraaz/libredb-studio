@@ -83,10 +83,14 @@ export type DatabendAffect =
  *   with a statement that left a transaction or a temporary table open.
  * - `close-failed`: a best-effort final, kill, ROLLBACK or logout that did not answer within its 5 s; a failed final
  *   of a complete result is this notice and never an error, which would report a committed write as failed.
+ * - `close-skipped`: a close that was never sent, because Databend had refused the sign-in on an earlier request of
+ *   the statement and the run sends nothing after that (design 3.5).
  * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4), the mode
  *   already passed through `serverWords`.
  * - `server-warning`: one entry of an answer's `warnings`, which the poll loop of design 3.4 keeps, such as the
- *   warning for a setting name the server ignores; its text is already passed through `serverText`.
+ *   warning for a setting name the server ignores; its text is already passed through `serverText`. A statement keeps
+ *   its first 100 different ones.
+ * - `warnings-left-out`: how many warnings Databend sent past the ones kept, counted and never kept (design 3.12).
  */
 export type DatabendNotice =
   | { readonly kind: "use-not-carried" }
@@ -97,8 +101,10 @@ export type DatabendNotice =
   | { readonly kind: "transaction-may-stay-open" }
   | { readonly kind: "temp-tables-dropped" }
   | { readonly kind: "close-failed"; readonly step: "final" | "kill" | "rollback" | "logout" }
+  | { readonly kind: "close-skipped"; readonly step: "final" | "kill" | "rollback" | "logout" }
   | { readonly kind: "result-mode"; readonly mode: string }
-  | { readonly kind: "server-warning"; readonly text: string };
+  | { readonly kind: "server-warning"; readonly text: string }
+  | { readonly kind: "warnings-left-out"; readonly count: number };
 
 /**
  * One completed statement.

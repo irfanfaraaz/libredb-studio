@@ -59,7 +59,11 @@ export interface DatabendConnectionOptions {
   readonly hasPassword: boolean;
   /** The connection's Database field, or undefined when it is blank. */
   readonly database: string | undefined;
-  /** The Warehouse field, or undefined when it is blank; sent as `x-databend-warehouse` on every request. */
+  /**
+   * The Warehouse field, or undefined when it is blank, which `headers` sends as `x-databend-warehouse` on every
+   * request. A connected session also puts here, for its sentences only, the warehouse an older Databend Cloud host
+   * names when the field is blank (`index.ts`); that one is never sent as a header.
+   */
   readonly warehouse: string | undefined;
   /** The key of this sign-in in the process latch (design 3.5). */
   readonly latchKey: string;
@@ -81,7 +85,10 @@ export interface DatabendConnectionOptions {
   readonly secretForms: readonly string[];
 }
 
-/** The query node's HTTP handler port; 443 comes from TLS, a DSN or an `https://` paste, never from the host. */
+/**
+ * The query node's HTTP handler port. 443 comes from a DSN or an `https://` paste, never from the host: choosing an SSL
+ * mode by hand keeps Port at 8000.
+ */
 export const DATABEND_DEFAULT_PORT = 8000;
 /** The limiter over every statement (design 2.3, 3.12): two per provider and two per engine, 64 queued [X04]. */
 export const DATABEND_LIMITER_OPTIONS = { perProvider: 2, perEngine: 2, queueDepth: 64 } as const;

@@ -8,29 +8,31 @@
  *
  * - The sign-in latch is consulted before any socket (design 3.5): a latched key is refused with no request, and an
  *   unproven key held by another run waits for it. Only an answer read as one proves the key; every refusal, of the
- *   POST, a page or a close, is reported to the latch, which latches the ones `latchesSignIn` names, and after that the
- *   run sends nothing more. An unproven key passes to a waiting run only after this run's last close, so a refused
- *   password is sent once.
+ *   POST, a page or a close, a gateway's over HTTP 200 included, is reported to the latch, which latches the ones
+ *   `latchesSignIn` names, and after that the run sends nothing more. An unproven key passes to a waiting run only
+ *   after this run's last close, so a refused password is sent once.
  * - The statement POST carries a closed body built field by field (design 3.3) and new ids from `session.ts`. Its
  *   first answer must be for our query id and our session, from a node id of the accepted shape; a fail-to-start answer
  *   (`id` empty) has nothing to close.
- * - The loop keeps the last echoed session, the first non-empty schema, the rows, the warnings and the affect; it
- *   follows `next_uri` alone, and stops at the row, cell and byte budgets of design 3.12 or past the poll bound. Every
- *   answer is read within the page the POST asked for and the columns the cell budget keeps, so what one answer
- *   costs before the budgets apply is bounded by them, not by the 16 MiB an answer may be.
+ * - The loop keeps the last echoed session, the first non-empty schema, the rows, the first 100 different warnings
+ *   with a count of the rest, and the affect; it follows `next_uri` alone, and stops at the row, cell and byte budgets
+ *   of design 3.12 or past the poll bound. Every answer is read within the page the POST asked for and the columns the
+ *   cell budget keeps, so what one answer costs before the budgets apply is bounded by them, not by the 16 MiB an
+ *   answer may be.
  * - Every exit after the server registered the statement, or may have, sends one close: the final link when the
  *   server already ended it (an in-body error, a budget cut, a complete result), else the kill. A final or a kill is
- *   best effort under its own 5 s, off the statement's signal; a failed final of a complete result is a notice, never
- *   an error, which would report a committed write as failed [X02]. A POST that may have reached the server with no
- *   answer also sends one logout, since the session id is ours [X13]; a POST another status refused (`server`) is
- *   killed alone. An auth refusal, of the POST, a page or a close, a middleware 400 or a fail-to-start sends nothing
- *   more: a kill, ROLLBACK or logout would carry the refused credential again and count toward a lockout.
+ *   best effort under its own 5 s, off the statement's signal, and acknowledged only by a 200 that is not a gateway's
+ *   refusal; a failed final of a complete result is a notice, never an error, which would report a committed write as
+ *   failed [X02]. A POST that may have reached the server with no answer also sends one logout, since the session id
+ *   is ours [X13]; a POST another status refused (`server`) is killed alone. An auth refusal, of the POST, a page or a
+ *   close, a middleware 400 or a fail-to-start sends nothing more: a kill, ROLLBACK or logout would carry the refused
+ *   credential again and count toward a lockout, and a logout left unsent so is told apart from one unanswered.
  * - The end-open reads the server's flags, never SQL text: an `Active` transaction is rolled back under a new query
  *   id with its links followed inside the same 5 s, and a session still needing keep-alive is logged out, which drops
  *   its temporary tables. The echoed session never leaves `run()`.
  * - A cancel before the first answer can miss the statement, so a kill answered 404 is sent again at 250, 500 and
- *   1000 ms; after the first answer a cancel is `cancelled` only when the kill answered 200 or an answer reported 1043
- *   [X02].
+ *   1000 ms; after the first answer a cancel is `cancelled` only when Databend acknowledged the kill or an answer
+ *   reported 1043 [X02].
  *
  * Time, sleep, randomness, ids and deadlines are injected deps with production defaults, so no test waits on a real
  * timer [X16]. Every request goes through `createNodeTransport`, the one socket path.
@@ -53,6 +55,7 @@ import {
   type DatabendRefusal,
   type DatabendSessionEcho,
   readAnswer,
+  readCloseAnswer,
   resultModeNotice,
 } from "./answer";
 import { type AuthAttempt, type AuthLatch, createAuthLatch } from "./auth-latch";
@@ -100,6 +103,12 @@ import {
  * the statement deadline, which is `timeout`.
  */
 export const DATABEND_PAGE_UNANSWERED = "a page of the result did not arrive in two attempts";
+
+/**
+ * The different server warnings one statement keeps (design 3.12): past them each warning is counted and never kept,
+ * so a server sending distinct warnings on every page costs a count, not the statement's byte budget in warnings.
+ */
+export const DATABEND_WARNING_LIMIT = 100;
 
 /** What the transport takes from outside, each with a production default [12 #6] [X16]. */
 export interface DatabendHttpTransportDeps {
@@ -185,13 +194,13 @@ interface Exchange {
   readonly signal: AbortSignal;
   /** When the attempts must end, in `now()` ms. */
   readonly endsAt: number;
-  /** Whether a 200 is read as an answer; a close reads only its status. */
+  /** Whether a 200 is read as an answer; a close's 200 is read only for a gateway's refusal. */
   readonly read: boolean;
 }
 
 interface Exchanged {
   readonly response: NodeResponse;
-  /** Null for a 200 that was not read. */
+  /** Null for a close's 200 that acknowledged it. */
   readonly reading: DatabendReading | null;
 }
 
@@ -208,7 +217,10 @@ interface Gathered {
   rows: DatabendCell[][];
   affect: DatabendAffect | null;
   hasResultSet: boolean;
+  /** The first `DATABEND_WARNING_LIMIT` different warnings, through `serverText`. */
   readonly warnings: Set<string>;
+  /** The warnings past those, counted and never kept. */
+  warningsLeftOut: number;
 }
 
 /**
@@ -220,6 +232,11 @@ class StoppedBetweenAttempts extends Error {
   constructor() {
     super("A stop between two attempts of the statement POST");
   }
+}
+
+/** A close Databend acknowledged: answered 200, and not with a gateway's refusal over HTTP 200. */
+function acknowledged(exchanged: Exchanged | null): boolean {
+  return exchanged?.response.status === 200 && exchanged.reading?.kind !== "refusal";
 }
 
 /** A refusal of the node transport before any socket, such as the egress guard's, which names no address. */
@@ -382,6 +399,7 @@ class StatementRun {
       affect: null,
       hasResultSet: false,
       warnings: new Set(),
+      warningsLeftOut: 0,
     };
     const end = await this.loop(answer, Buffer.byteLength(response.text), gathered);
     if (end.kind === "refused") throw await this.abandon(end.error, gathered.session);
@@ -392,6 +410,7 @@ class StatementRun {
       throw answerError({ id: end.id, error: end.error }, this.context("get"), stop);
     }
     const warnings: DatabendNotice[] = [...gathered.warnings].map((text) => ({ kind: "server-warning", text }));
+    if (gathered.warningsLeftOut > 0) warnings.push({ kind: "warnings-left-out", count: gathered.warningsLeftOut });
     return {
       schema: gathered.schema,
       rows: gathered.rows,
@@ -417,7 +436,7 @@ class StatementRun {
       if (gathered.schema.length === 0) gathered.schema = current.schema;
       if (current.affect !== null) gathered.affect = current.affect;
       gathered.hasResultSet ||= current.hasResultSet;
-      for (const warning of current.warnings) gathered.warnings.add(serverText(warning, this.options.secretForms));
+      for (const warning of current.warnings) this.keepWarning(gathered, warning);
       // The server already ended a failed statement, and a cut one is ended by its final.
       const final = current.nextUri !== null;
       // Rows of a failed statement are discarded (M05g).
@@ -438,6 +457,14 @@ class StatementRun {
       current = page.answer;
       bytes += page.bytes;
     }
+  }
+
+  /** Keeps a server warning, once, among the first `DATABEND_WARNING_LIMIT` different ones; one past them is counted. */
+  private keepWarning(gathered: Gathered, warning: string): void {
+    const text = serverText(warning, this.options.secretForms);
+    if (gathered.warnings.has(text)) return;
+    if (gathered.warnings.size < DATABEND_WARNING_LIMIT) gathered.warnings.add(text);
+    else gathered.warningsLeftOut += 1;
   }
 
   /** Keeps a page's rows up to the row cut and the cell budget, first reached; the cut, or null. */
@@ -536,7 +563,8 @@ class StatementRun {
           signal: exchange.attempt(),
           maxResponseBytes: this.options.responseCapBytes,
         });
-        const reading = response.status === 200 && !exchange.read ? null : readAnswer(response, this.bounds);
+        const reading =
+          response.status === 200 && !exchange.read ? readCloseAnswer(response) : readAnswer(response, this.bounds);
         if (reading?.kind !== "refusal") return { response, reading };
         exchanged = { response, reading };
       } catch (error) {
@@ -605,15 +633,18 @@ class StatementRun {
     return exchanged;
   }
 
-  /** Stops the statement; true when the kill answered 200. Before the first answer a 404 is resent (design 3.10). */
+  /**
+   * Stops the statement; true when Databend acknowledged the kill, with a 200 that is not a gateway's refusal. Before
+   * the first answer a 404 is resent (design 3.10).
+   */
   private async kill(beforeAnswer: boolean): Promise<boolean> {
     const resends: number[] = beforeAnswer ? [...KILL_RESENDS_MS] : [];
     const budget = this.closeBudget();
     for (;;) {
       // oxlint-disable-next-line no-await-in-loop -- a resent kill follows a 404.
-      const status = (await this.closeExchange("kill", "GET", killPath(this.ids.queryId), budget))?.response.status;
-      if (status === 200) return true;
-      const wait = status === 404 ? resends.shift() : undefined;
+      const exchanged = await this.closeExchange("kill", "GET", killPath(this.ids.queryId), budget);
+      if (acknowledged(exchanged)) return true;
+      const wait = exchanged?.response.status === 404 ? resends.shift() : undefined;
       if (wait === undefined) return false;
       // oxlint-disable-next-line no-await-in-loop -- the wait before the kill is resent.
       await this.deps.sleep(wait, budget.signal);
@@ -623,12 +654,12 @@ class StatementRun {
   /** Closes a statement the server already ended; its failure is a notice, never an error [X02]. */
   private async final(): Promise<void> {
     const exchanged = await this.closeExchange("final", "GET", finalPath(this.ids.queryId), this.closeBudget());
-    if (exchanged?.response.status !== 200) this.notices.push({ kind: "close-failed", step: "final" });
+    if (!acknowledged(exchanged)) this.notices.push({ kind: "close-failed", step: "final" });
   }
 
   private async logout(): Promise<boolean> {
     const exchanged = await this.closeExchange("logout", "POST", LOGOUT_PATH, this.closeBudget());
-    return exchanged?.response.status === 200;
+    return acknowledged(exchanged);
   }
 
   /** What the last echoed session left open, closed from the server's flags (design 3.4). */
@@ -637,9 +668,9 @@ class StatementRun {
     let keepAlive = true;
     if (plan.includes("rollback")) keepAlive = await this.rollback(last as DatabendSessionEcho);
     if (plan.includes("logout") && keepAlive) {
-      this.notices.push(
-        (await this.logout()) ? { kind: "temp-tables-dropped" } : { kind: "close-failed", step: "logout" },
-      );
+      // A logout a refused sign-in left unsent never went unanswered.
+      const kind = this.signInRefused ? "close-skipped" : "close-failed";
+      this.notices.push((await this.logout()) ? { kind: "temp-tables-dropped" } : { kind, step: "logout" });
     }
   }
 

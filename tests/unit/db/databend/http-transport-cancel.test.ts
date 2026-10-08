@@ -82,6 +82,28 @@ describe("after a Running answer (X02)", () => {
     script.expectDone();
   });
 
+  test("a kill a gateway answers 200 with ProvisionWarehouseTimeout is retried, and is never an acknowledged cancel", async () => {
+    const resuming = { status: 200, body: { error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } } };
+    const kill = { method: "GET" as const, path: P.kill, reply: resuming };
+    const { script, time, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      { method: "GET", path: P.page(0), reply: { hang: true } },
+      kill,
+      kill,
+      kill,
+    ]);
+    const run = runSignal();
+    const running = failure(transport.run(statement("SELECT 1", { signal: run.signal })));
+    await script.received(2);
+    run.cancel();
+    const error = await running;
+    script.expectDone();
+    expect(error.category).toBe("outcome-unknown");
+    expect(error.message).toBe(S.cancelUnanswered);
+    // The GET backoff inside the kill's own 5 s: three attempts.
+    expect(time.sleeps).toEqual([1000, 2000]);
+  });
+
   test("a 1043 answer under our cancel is cancelled, and the final link closes it", async () => {
     const run = runSignal();
     const { script, transport } = transportHarness([

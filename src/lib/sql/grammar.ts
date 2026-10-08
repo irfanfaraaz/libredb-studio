@@ -671,12 +671,15 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
  * source could not settle, the trailing `FORMAT` clause, was measured on the pinned image over `POST /v1/query`.
  *
  * Five readings of Databend's differ from the span reader's and are refused by the provider's statement guard
- * (`providers/sql/databend/sql-text.ts`) rather than carried here: a `--` comment ends at a form feed, an `@` stage
- * token takes a backslash and the quote after it into the name, the body of a `/*+` hint is tokenized, so the hint
- * ends at the first closing star-slash TOKEN, which a quote or comment inside the body can move past the one the span
- * reader stops at, a `$tag$…$tag$` run is a dollar string to the span reader while Databend lexes `$tag$` as a
- * variable and reads the text between two tags as code, and a `$$` straight after an identifier character is part of
- * that identifier to Databend, whose identifier tail takes `$`, while the span reader opens a dollar string there.
+ * (`providers/sql/databend/sql-text.ts`) rather than carried here. A `--` comment ends at a form feed. An `@` stage
+ * token runs to the first white space, comma, semicolon, quote or parenthesis and takes `\'`, `--`, `/*`, a dollar run
+ * and `[` into the name where the span reader opens a quote, a comment, a dollar string or an array, so the guard
+ * refuses a stage token that holds a backslash or any run the span reader opens; an `@` that ends a `<@` operator,
+ * which the lexer takes as one token, opens no stage token. The body of a `/*+` hint is tokenized, so the hint ends at
+ * the first closing star-slash TOKEN, which a quote or comment inside the body can move past the one the span reader
+ * stops at. A `$tag$…$tag$` run is a dollar string to the span reader while Databend lexes `$tag$` as a variable and
+ * reads the text between two tags as code. And a `$$` straight after an identifier character is part of that
+ * identifier to Databend, whose identifier tail takes `$`, while the span reader opens a dollar string there.
  */
 const DATABEND_GRAMMAR: SqlGrammar = {
   // CODE: the lexer has `#`, `#>`, `#>>` and `#-` as operator tokens, and its only comment forms are `--` and the

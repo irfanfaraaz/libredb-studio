@@ -86,8 +86,9 @@ describe("the latched key", () => {
     const until = new Date("2026-10-08T01:35:30Z");
     const error = latchedError(at, until);
     expectRow(error, "auth", AuthenticationError, S.latched("2026-10-08 01:20", "2026-10-08 01:35"));
+    // The latch is one process's (D252), so the promise is this server's, never all of Studio's (RI-6).
     expect(error.message).toBe(
-      "Databend refused this sign-in at 2026-10-08 01:20 UTC, so Studio will not send this password again before 2026-10-08 01:35 UTC, or until it changes.",
+      "Databend refused this sign-in at 2026-10-08 01:20 UTC, so this Studio server will not send this password again before 2026-10-08 01:35 UTC, or until it changes.",
     );
   });
 });

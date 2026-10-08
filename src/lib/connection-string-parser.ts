@@ -156,7 +156,7 @@ export const ENGINE_URI_SCHEMES: Partial<Record<DatabaseType, string>> = {
 export const DATABEND_DSN_REFUSALS = Object.freeze({
   fragment: "The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field.",
   userinfo:
-    "The DSN's user or password holds / or ?, which end the address part of a URL: percent-encode them as %2F and %3F, or type the password in its own field.",
+    "The DSN has an @ after a / or ?, which end the address part of a URL: if the / or ? is in the user or password, percent-encode it as %2F or %3F, or type the password in its own field; if the @ is in the path or a parameter, percent-encode it as %40.",
   signIn:
     "Token and key-pair sign-in are not supported in this version: paste a DSN that signs in with a SQL user and password, or fill the fields.",
   flight: "Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443.",
@@ -777,18 +777,24 @@ const DATABEND_SIGN_IN_PARAMETERS = new Set([
  * databend-go reads them, and an explicit `sslmode` wins over either. A repeated parameter takes its last value, as
  * BendSQL's does (databend-go takes the first).
  *
- * Three departures, each refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut
- * short; a `/` or `?` ends the address part, so with one in the user or the password the URL parser reads the rest of
- * the password as the database or a parameter; and BendSQL's token and key-pair sign-in have no field here. Unlike
- * BendSQL, which decodes the password only, the user is percent-decoded too, as every other scheme here does. With no
- * `warehouse=`, the warehouse an older Databend Cloud host names (`<tenant>--<warehouse>.gw...`) fills Warehouse.
+ * Three departures, each refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut short;
+ * a `/` or `?` ends the address part, so with one in the user or the password the URL parser reads the rest of the
+ * password as the database or a parameter, and since an address part with no `@` and an `@` after it can also be a path
+ * or a parameter holding an unencoded `@`, the refusal names both readings; and BendSQL's token and key-pair sign-in
+ * have no field here. Unlike BendSQL, which decodes the password only, the user is percent-decoded too, as every other
+ * scheme here does. With no `warehouse=`, the warehouse an older Databend Cloud host names
+ * (`<tenant>--<warehouse>.gw...`) fills Warehouse.
  */
 function parseDatabendDSN(uri: string): ParsedConnection | null {
   if (uri.includes("#")) return databendRefusal("fragment");
-  // An @ past the first / or ? after the scheme is the sign-in's own, so that / or ? is inside the user or password.
+  // With no @ in the address part, an @ past its end reads two ways: the sign-in's own, after a / or ? in the user or
+  // password, or an unencoded @ of the path or a parameter, so the refusal names both. An address part that holds its @
+  // reads one way only, and a later @ is the path's or a parameter's.
   const address = uri.slice(uri.indexOf("://") + 3);
   const addressEnd = address.search(/[/?]/);
-  if (addressEnd >= 0 && address.includes("@", addressEnd)) return databendRefusal("userinfo");
+  if (addressEnd >= 0 && !address.slice(0, addressEnd).includes("@") && address.includes("@", addressEnd)) {
+    return databendRefusal("userinfo");
+  }
   let url: URL;
   try {
     url = new URL(uri);

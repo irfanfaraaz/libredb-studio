@@ -8,9 +8,10 @@ import { DATABEND_FIELD_RULES, DB_UI_CONFIG } from "../src/lib/db-ui-config";
  * What a new type-id needs in order to be SELECTABLE lives outside the provider, as declarations (`DatabaseUIConfig`,
  * `selectableTypes`, the paste handler), which is why this runs in a browser. No assertion here reaches a Databend
  * server: the paste is parsed in the browser, and the form's field checks refuse before Test Connection sends
- * anything, which each refusal test proves by counting the requests to the test route. So it runs on the shared server
- * as the trino spec does, with no Databend and no second server. Every sentence it expects is imported from the module
- * that owns it.
+ * anything, which each refusal test proves by counting the requests to the test route, so no Databend is needed. It
+ * runs on the second server all the same (the chromium-databend project of playwright.config.ts): each test signs in
+ * and opens the dialog, which spends the shared account's query budget, and on the shared server three specs after it
+ * met that budget's refusal. Every sentence it expects is imported from the module that owns it.
  */
 const databend = DB_UI_CONFIG.databend;
 const DSN = "databend://cloudapp@tenant.gw.example.com:443/studio_demo?warehouse=wh-small";

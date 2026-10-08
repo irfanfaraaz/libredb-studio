@@ -79,7 +79,7 @@ src/lib/db/
 │   │       ├── index.ts        #   DatabendProvider
 │   │       ├── transport.ts    #   DatabendTransport seam + neutral outcome types
 │   │       ├── http-transport.ts # The one HTTP implementation (shared node:http(s) transport); the page loop
-│   │       ├── auth-latch.ts   #   A refused sign-in is not sent again for 15 minutes
+│   │       ├── auth-latch.ts   #   A refused sign-in is not sent again by this process for 15 minutes
 │   │       ├── objects.ts      #   system.tables tree + SHOW CREATE source
 │   │       └── introspect.ts   #   system.* monitoring, sessions and the kill (decode.ts, errors.ts, ... session.ts)
 │   ├── document/               # Document Database Providers
