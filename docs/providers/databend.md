@@ -142,11 +142,19 @@ Each close is best effort under its own 5 seconds, off the statement's signal; o
 
 > The statement finished, but Studio's request to close the finished statement (final) got no answer within 5 seconds.
 
-> The statement finished, but Studio's request to stop the statement (kill) got no answer within 5 seconds.
-
 > The statement finished, but Studio's request to roll back the transaction it left open got no answer within 5 seconds.
 
 > The statement finished, but Studio's request to end its session (logout) got no answer within 5 seconds.
+
+One answered with anything but its acknowledgment, an error status or a refused sign-in, says so instead:
+
+> The statement finished, but Studio's request to close the finished statement (final) was answered with an error.
+
+> The statement finished, but Studio's request to roll back the transaction it left open was answered with an error.
+
+> The statement finished, but Studio's request to end its session (logout) was answered with an error.
+
+A kill that is not acknowledged is reported by the statement's own outcome (section 5.8), never by one of these.
 
 A ROLLBACK left unsent after a refused sign-in gives the warning that the transaction may stay open, and a logout left unsent says it was not sent rather than that it went unanswered:
 
@@ -157,7 +165,7 @@ A ROLLBACK left unsent after a refused sign-in gives the warning that the transa
 A statement POST the server may have received is never sent again, because Databend could run it twice.
 The one exception is a Databend Cloud gateway's `ProvisionWarehouseTimeout`, which the gateway answers without forwarding, so the POST goes again with the same ids while the warehouse resumes.
 A Stop or the deadline in the wait between two such attempts sends nothing more, neither a kill nor a logout, since no attempt reached the warehouse, and the run reads as cancelled or timed out (section 5.8).
-A GET of the chain (a page, the final, the kill) is sent again after a network failure or an intermediary's 429, 502, 503, 504 or 520, since the server re-serves each of them.
+A GET of the chain (a page, the final, the kill) is sent again after a network failure or an intermediary's 429, 502, 503, 504 or 520, since the server re-serves each of them, and after a gateway's `ProvisionWarehouseTimeout` over any status, HTTP 200 included, within the same three GET attempts.
 The backoff is 1, 2, 4, 8 and 8 seconds, each 20 percent either way, a `Retry-After` in seconds honoured, and never a wait that reaches the time left: at most six POST attempts and three GET attempts.
 A page that gave no answer within its attempt timer, with statement time left, is asked for again at once, one time, inside the three GET attempts; a second silence ends the statement with "No answer arrived from Databend (a page of the result did not arrive in two attempts)".
 ROLLBACK and logout are never retried.
@@ -233,7 +241,7 @@ A cut result says which budget it reached:
 
 A server that sends different warnings on every page would otherwise fill the statement's budget of answer text with warnings, so the ones past the first 100 are only counted:
 
-> Studio shows the first 100 different warnings of this statement and left out [count] more that Databend sent.
+> Studio shows the first 100 different warnings of this statement and left out the [count] more that Databend sent past them, repeats included.
 
 The bounds were measured together (L9) in the container image under its 384 MiB heap flag, against the local fixture, through the real transport: two statements at once, each stopped at the 16 MiB budget of answer text, peaked at 149.7 MiB of heap used (39 percent of the limit) and 201.8 MiB committed.
 The server cuts a page at about 4 MiB of block memory, and display text multiplies it: a page of 1,024 rows of 8 columns of 512 control characters each is 24 MiB of JSON, past the 16 MiB answer cap at any page of more than about 650 rows, so such a result fails as too large, by design; a bounded statement whose row cut keeps the page smaller is shown (600 rows were 14.1 MiB).
@@ -264,8 +272,8 @@ A spelling Studio does not connect with fills no field and says what to paste in
 | Paste | What Studio says |
 |---|---|
 | `databend://cloudapp@host:443/db#x` | The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field. |
-| `databend://cloudapp:pa/ss@host:443/db` | The DSN has an @ after a / or ?, which end the address part of a URL: if the / or ? is in the user or password, percent-encode it as %2F or %3F, or type the password in its own field; if the @ is in the path or a parameter, percent-encode it as %40. |
-| `databend://host:443/db?role=analyst@corp` | The DSN has an @ after a / or ?, which end the address part of a URL: if the / or ? is in the user or password, percent-encode it as %2F or %3F, or type the password in its own field; if the @ is in the path or a parameter, percent-encode it as %40. |
+| `databend://cloudapp:pa/ss@host:443/db` | The DSN has an @ after a / or ?, which end the address part of a URL: percent-encode a /, ? or @ in the user or password as %2F, %3F or %40, or type the password in its own field, and an @ in the path or a parameter as %40. |
+| `databend://host:443/db?role=analyst@corp` | The DSN has an @ after a / or ?, which end the address part of a URL: percent-encode a /, ? or @ in the user or password as %2F, %3F or %40, or type the password in its own field, and an @ in the path or a parameter as %40. |
 | `databend://cloudapp@host:443/db?access_token=t` | Token and key-pair sign-in are not supported in this version: paste a DSN that signs in with a SQL user and password, or fill the fields. |
 | `databend+flight://root@localhost:8900/` | Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443. |
 | `databend+grpc://root@localhost:8900/` | Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443. |
@@ -276,7 +284,7 @@ A spelling Studio does not connect with fills no field and says what to paste in
 | `databend://cloudapp@host:443/db?tls_ca_file=/etc/databend/ca.pem` | Studio reads no CA file path from a DSN, so tls_ca_file was not applied: paste the certificate's contents into the CA field under SSL / TLS. |
 | `databend://cloudapp@host:443/db?sslmode=verify-full` | sslmode=verify-full is not a Databend DSN mode (BendSQL reads disable, require and enable), so SSL mode was left as it was: choose one under SSL / TLS. |
 
-An `@` past the address part is refused only when the address part holds none, since the text then reads two ways; a DSN that signs in, as `databend://root:pw@host:443/db?role=analyst@corp` does, is read as the URL parser splits it.
+An `@` past the address part is refused even after the sign-in's own `@`, since a password can hold an unencoded `@` before its `/`; percent-encoded, as in `databend://root:pw@host:443/db?role=analyst%40corp`, the text reads one way.
 `tls_ca_file` is not applied, nor is an `sslmode` other than `disable`, `require` and `enable`: each gets its caution above.
 Any other parameter, `warehouse` and the sign-in ones refused above aside, is not applied either: it is named in a warning, never valued, and the other fields are filled in:
 
@@ -353,7 +361,7 @@ A Databend Cloud connection names its warehouse, sent as `x-databend-warehouse` 
 A suspended warehouse resumes on any request and is billed while it runs, and opening the connection is a request: it runs the version probe and then reads the object tree.
 So with Warehouse set the provider declares `resumesBilledCompute`, and Studio sends the connection no background health checks: no connection pulse and no fleet check, only what a person asks for.
 A host under `databend.com`, `databend.cn` or `tidbcloud.com` is Databend Cloud's, and the provider declares `resumesBilledCompute` for it with Warehouse empty too.
-BendSQL and databend-jdbc count the same three domains as Databend Cloud's when they choose their presign mode for uploads, not for billing, and Databend's Cloud guides name the service TiDB Cloud Lake in their data-integration pages; declaring the capability only stops background checks, so a host under `tidbcloud.com` that does not serve Databend loses its pulse and nothing else.
+BendSQL and databend-jdbc count the same three domains as Databend Cloud's when they choose their presign mode for uploads, not for billing, and Databend's Cloud guides name the service TiDB Cloud Lake in their data-integration pages; declaring the capability stops the background checks, so a host under `tidbcloud.com` that does not serve Databend loses its pulse and its fleet check, and its monitoring page shows the billed-compute note; nothing else changes.
 The older host form `<tenant>--<warehouse>.gw.<region>.default.databend.com` names a warehouse and reaches it with no `x-databend-warehouse` header (measured on the test tenant, 2026-10-08), so a pulse would resume it and bill it.
 For such a host the sentences of this section and of section 10 name the warehouse the host carries, as they name a Warehouse, while only the Warehouse field is sent as the header; a DSN paste of that form fills Warehouse from the host unless the DSN has `warehouse=` (section 4.1).
 Databend's docs show that form under `databend.com` and `databend.cn` only, so Studio reads no warehouse from a host under `tidbcloud.com`.
@@ -445,10 +453,10 @@ It reads the text under the Databend grammar row and refuses, with these sentenc
 | `SELECT 1 -- c\fSELECT 2` | This text holds a form feed, which ends a -- comment in Databend but not in Studio's reading. Remove it and run again. |
 | `SELECT $a$ x $a$` | A dollar-quoted run in this text is tagged ($name$), which Databend reads as a variable and not a quote, so the text between two tags is code there and Studio cannot tell where the statement ends. Use $$ quoting and run again. |
 | `SELECT a$$x$$` | A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again. |
-| `SELECT * FROM @s\'; DROP TABLE t; --'` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
-| `SELECT 1 FROM @s--;DROP TABLE t` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
-| `SELECT 1 FROM @s/*;DROP TABLE t;*/` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
-| `SELECT 2<<@s--;SELECT 3 AS hidden` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
+| `SELECT * FROM @s\'; DROP TABLE t; --'` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space, or write the location quoted ('@stage/path') where the statement takes one, and run again. |
+| `SELECT 1 FROM @s--;DROP TABLE t` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space, or write the location quoted ('@stage/path') where the statement takes one, and run again. |
+| `SELECT 1 FROM @s/*;DROP TABLE t;*/` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space, or write the location quoted ('@stage/path') where the statement takes one, and run again. |
+| `SELECT 2<<@s--;SELECT 3 AS hidden` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space, or write the location quoted ('@stage/path') where the statement takes one, and run again. |
 | `SELECT /*+ ; */ 1` | An optimizer hint (/*+ ... */) in this text holds a semicolon, which Databend reads as code and Studio as a comment. Remove the semicolon from the hint and run again. |
 | `/*+ ' */ SELECT 1 AS shown -- ' */ SELECT 2 AS hidden` | An optimizer hint (/*+ ... */) in this text holds a character that can make Databend end the hint at a later */ than Studio does, so Studio cannot tell which statement runs. Keep the hint to names, numbers and plain quoted values, and run again. |
 

@@ -143,7 +143,7 @@ describe("an Active transaction (design 3.4; X13)", () => {
     ]);
     const outcome = await transport.run(statement("BEGIN"));
     script.expectDone();
-    expect(outcome.notices).toEqual([{ kind: "transaction-may-stay-open" }, { kind: "close-failed", step: "logout" }]);
+    expect(outcome.notices).toEqual([{ kind: "transaction-may-stay-open" }, { kind: "close-refused", step: "logout" }]);
   });
 
   test("a ROLLBACK refused with a status may leave the transaction open", async () => {
@@ -184,7 +184,7 @@ describe("an Active transaction (design 3.4; X13)", () => {
     expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-failed", step: "rollback" }]);
   });
 
-  test("a ROLLBACK link that fails within its 5 s is a close failure", async () => {
+  test("a ROLLBACK link answered with an error within its 5 s is a refused close", async () => {
     const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
     const { script, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE }) },
@@ -193,7 +193,7 @@ describe("an Active transaction (design 3.4; X13)", () => {
     ]);
     const outcome = await transport.run(statement("BEGIN"));
     script.expectDone();
-    expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-failed", step: "rollback" }]);
+    expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-refused", step: "rollback" }]);
   });
 
   test("a ROLLBACK that hangs is cut by its own 5 s deadline", async () => {

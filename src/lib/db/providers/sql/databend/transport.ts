@@ -81,8 +81,10 @@ export type DatabendAffect =
  *   passed through `serverWords`.
  * - `transaction-ended`, `transaction-may-stay-open` and `temp-tables-dropped`: what the end-open of design 3.4 did
  *   with a statement that left a transaction or a temporary table open.
- * - `close-failed`: a best-effort final, kill, ROLLBACK or logout that did not answer within its 5 s; a failed final
- *   of a complete result is this notice and never an error, which would report a committed write as failed.
+ * - `close-failed`: a best-effort final, ROLLBACK or logout that did not answer within its 5 s; a failed final of a
+ *   complete result is this notice and never an error, which would report a committed write as failed.
+ * - `close-refused`: a final, ROLLBACK or logout answered with something other than its acknowledgment: an error
+ *   status, or a gateway's refusal over HTTP 200.
  * - `close-skipped`: a close that was never sent, because Databend had refused the sign-in on an earlier request of
  *   the statement and the run sends nothing after that (design 3.5).
  * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4), the mode
@@ -92,6 +94,9 @@ export type DatabendAffect =
  *   its first 100 different ones.
  * - `warnings-left-out`: how many warnings Databend sent past the ones kept, counted and never kept (design 3.12).
  */
+/** The closes a finished statement reports on: the kill is reported through the run's own outcome instead. */
+export type DatabendCloseStep = "final" | "rollback" | "logout";
+
 export type DatabendNotice =
   | { readonly kind: "use-not-carried" }
   | { readonly kind: "settings-not-carried" }
@@ -100,8 +105,9 @@ export type DatabendNotice =
   | { readonly kind: "transaction-ended" }
   | { readonly kind: "transaction-may-stay-open" }
   | { readonly kind: "temp-tables-dropped" }
-  | { readonly kind: "close-failed"; readonly step: "final" | "kill" | "rollback" | "logout" }
-  | { readonly kind: "close-skipped"; readonly step: "final" | "kill" | "rollback" | "logout" }
+  | { readonly kind: "close-failed"; readonly step: DatabendCloseStep }
+  | { readonly kind: "close-refused"; readonly step: DatabendCloseStep }
+  | { readonly kind: "close-skipped"; readonly step: DatabendCloseStep }
   | { readonly kind: "result-mode"; readonly mode: string }
   | { readonly kind: "server-warning"; readonly text: string }
   | { readonly kind: "warnings-left-out"; readonly count: number };

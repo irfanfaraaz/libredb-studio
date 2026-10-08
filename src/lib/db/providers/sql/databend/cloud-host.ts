@@ -9,9 +9,10 @@
  * Cloud's when they choose their presign mode for uploads (`check_presign` in `core/src/client.rs`, `initializePresign`
  * in `DatabendSessionHandle.java`), not for billing, and Databend's Cloud guides name the service TiDB Cloud Lake in
  * their data-integration pages. Studio asks whether a request can resume a billed warehouse, and takes the same three
- * domains: declaring the capability only stops background checks, so a host under `.tidbcloud.com` that does not serve
- * Databend loses its pulse and nothing else. Databend's docs show the older host form under the first two domains only,
- * so only they are read for a warehouse.
+ * domains: declaring the capability stops the background checks, so a host under `.tidbcloud.com` that does not serve
+ * Databend loses its pulse and its fleet check, and its monitoring page shows the billed-compute note; nothing else
+ * changes. Databend's docs show the older host form under the first two domains only, so only they are read for a
+ * warehouse.
  *
  * Pure, with no import: the connection dialog reads it in the browser when a DSN is pasted, and the provider reads it
  * for its capabilities and for the warehouse its sentences name.

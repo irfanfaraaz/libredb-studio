@@ -1351,28 +1351,36 @@ describe("parseConnectionString: databend:// DSNs", () => {
   ])("an @ past the address part of a DSN with no sign-in is refused, naming both readings: %s", (input) => {
     expect(parseConnectionString(input)).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
     expect(DATABEND_DSN_REFUSALS.userinfo).toBe(
-      "The DSN has an @ after a / or ?, which end the address part of a URL: if the / or ? is in the user or password, percent-encode it as %2F or %3F, or type the password in its own field; if the @ is in the path or a parameter, percent-encode it as %40.",
+      "The DSN has an @ after a / or ?, which end the address part of a URL: percent-encode a /, ? or @ in the user or password as %2F, %3F or %40, or type the password in its own field, and an @ in the path or a parameter as %40.",
     );
   });
 
-  test("a DSN whose address part holds its @ is never refused for a later @, which is the path's or a parameter's", () => {
-    const role = parseConnectionString("databend://root:pw@db.example.com:8000/default?role=analyst@corp")!;
-    expect(role.refusal).toBeUndefined();
-    expect([role.user, role.password, role.host, role.port, role.database]).toEqual([
+  // A password may hold an unencoded @ before its / or ?, so an @ in the address part does not settle which @ signs in:
+  // `root:p@ss/x@host` would read host `ss` and put the rest of the password in Database.
+  test.each([
+    "databend://root:p@ss/x@db.example.com:8000/default",
+    "databend://root:p@ss?x@db.example.com:8000/default",
+    "databend://root:pw@db.example.com:8000/default?role=analyst@corp",
+    "databend://root@db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
+    "databend://root@db.example.com:8000/team@corp",
+  ])("an @ past the address part is refused even when the address part holds one: %s", (input) => {
+    const result = parseConnectionString(input);
+    expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+    expect(JSON.stringify(result)).not.toContain("ss/x");
+  });
+
+  test("percent-encoded, an @ of the password, the path or a parameter reads one way only", () => {
+    const password = parseConnectionString("databend://root:p%40ss%2Fx@db.example.com:8000/default")!;
+    expect([password.user, password.password, password.host, password.database]).toEqual([
       "root",
-      "pw",
+      "p@ss/x",
       "db.example.com",
-      "8000",
       "default",
     ]);
+    const role = parseConnectionString("databend://root:pw@db.example.com:8000/default?role=analyst%40corp")!;
+    expect(role.refusal).toBeUndefined();
     expect(role.ignoredParameters).toEqual(["role"]);
-    const file = parseConnectionString(
-      "databend://root@db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
-    )!;
-    expect(file.refusal).toBeUndefined();
-    expect(file.cautions).toEqual([DATABEND_DSN_CAUTIONS.caFile]);
-    expect(parseConnectionString("databend://root@db.example.com:8000/team@corp")!.database).toBe("team@corp");
-    // Percent-encoded, the @ of a DSN with no sign-in reads one way only.
+    expect(parseConnectionString("databend://root@db.example.com:8000/team%40corp")!.refusal).toBeUndefined();
     const encoded = parseConnectionString("databend://db.example.com:8000/default?role=analyst%40corp")!;
     expect(encoded.refusal).toBeUndefined();
     expect(encoded.ignoredParameters).toEqual(["role"]);

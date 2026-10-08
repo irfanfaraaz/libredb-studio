@@ -2700,11 +2700,11 @@ Found 2026-10-08 by the red-team round of the Databend provider (HD-1); pre-exis
 `parseGenericURL` in `src/lib/connection-string-parser.ts`, which reads `postgres://`, `mysql://`, `redis://`, `oracle://`, `mssql://`, `db2://`, `clickhouse://` and `http(s)://` and their aliases, hands the text to `new URL`, which ends a URL's address part at the first `/` or `?`.
 So an unencoded `/` in the password moves the split: `postgres://app:2024/Secret-Tail@db.example.com:5432/prod` reads as host `app`, port `2024` and database `Secret-Tail@db.example.com:5432/prod`, and the dialog reports a green "parsed successfully" with that text in Database and in the auto-filled Name; with `?` the tail is dropped.
 Measured 2026-10-08 on `origin/main` (575eb8ccd) for `postgres://` and `mysql://`.
-The Databend DSN parser refuses such a string before `new URL` when its address part holds no `@`, with a sentence that names both readings and their percent-encodings (`DATABEND_DSN_REFUSALS.userinfo`), as it refuses `#`.
+The Databend DSN parser refuses every string with an `@` after its first `/` or `?` before `new URL`, since a password can also hold an unencoded `@` before its `/`, with a sentence that names each percent-encoding (`DATABEND_DSN_REFUSALS.userinfo`), as it refuses `#`.
 
 Found 2026-10-08 by the red-team round of the Databend provider (HD-2); pre-existing.
 
-**Done when:** every scheme `parseGenericURL` reads refuses a string whose address part, between `://` and the first `/` or `?`, holds no `@` while a later part does, with a sentence naming both readings and their percent-encodings, never refuses one whose address part holds its `@`, and parser tests per scheme plus a hook test show that such a paste fills nothing.
+**Done when:** every scheme `parseGenericURL` reads refuses a string with an `@` after its first `/` or `?`, with a sentence naming each percent-encoding, and parser tests per scheme plus a hook test show that such a paste fills nothing.
 
 ### D252. The Databend sign-in latch is kept per process, so each replica sends a refused password once
 

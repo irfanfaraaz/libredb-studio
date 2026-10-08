@@ -50,7 +50,7 @@ describe("the final of a complete result (X02)", () => {
     const outcome = await transport.run(statement("INSERT INTO t VALUES (1), (2), (3)"));
     script.expectDone();
     expect(decodeOutcome(outcome, "INSERT").rowCount).toBe(3);
-    expect(outcome.notices).toEqual([{ kind: "close-failed", step: "final" }]);
+    expect(outcome.notices).toEqual([{ kind: "close-refused", step: "final" }]);
   });
 
   test("a final that fails on the network three times is retried after 1 and 2 s, then a notice", async () => {

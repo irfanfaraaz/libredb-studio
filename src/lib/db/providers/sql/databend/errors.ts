@@ -201,7 +201,7 @@ export type DatabendStop = "cancel" | "deadline";
 export interface DatabendStopState {
   /** True once the server answered the POST, so the statement is registered. */
   readonly answered: boolean;
-  /** True when the kill answered 200. */
+  /** True when Databend acknowledged the kill: a 200 that is not a gateway's refusal. */
   readonly killAcknowledged: boolean;
 }
 

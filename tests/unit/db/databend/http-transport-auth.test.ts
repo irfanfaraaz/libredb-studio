@@ -371,7 +371,7 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
     // The ROLLBACK and the logout were not sent, so the transaction may stay open and the session was not ended:
     // the logout was skipped, never left unanswered.
     expect(outcome.notices).toEqual([
-      { kind: "close-failed", step: "final" },
+      { kind: "close-refused", step: "final" },
       { kind: "transaction-may-stay-open" },
       { kind: "close-skipped", step: "logout" },
     ]);
@@ -409,7 +409,7 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
     const outcome = await transport.run(statement("BEGIN"));
     expect(outcome.notices).toEqual([
       { kind: "transaction-ended" },
-      { kind: "close-failed", step: "rollback" },
+      { kind: "close-refused", step: "rollback" },
       { kind: "close-skipped", step: "logout" },
     ]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
@@ -423,7 +423,7 @@ describe("a refused sign-in on a close (HASIM-D-1)", () => {
       { method: "POST", path: LOGOUT, reply: WRONG_PASSWORD },
     ]);
     expect((await transport.run(statement("CREATE TEMP TABLE t (a INT)"))).notices).toEqual([
-      { kind: "close-failed", step: "logout" },
+      { kind: "close-refused", step: "logout" },
     ]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
     expect(script.requests).toHaveLength(2);
@@ -536,7 +536,7 @@ describe("a gateway's sign-in refusal over HTTP 200 on a close (REV-T-2)", () =>
       { method: "POST", path: "/v1/query", reply: ok(FIRST, { next_uri: P.final }) },
       { method: "GET", path: P.final, reply: REFUSED_OVER_200 },
     ]);
-    expect((await transport.run(statement("SELECT 1"))).notices).toEqual([{ kind: "close-failed", step: "final" }]);
+    expect((await transport.run(statement("SELECT 1"))).notices).toEqual([{ kind: "close-refused", step: "final" }]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
     expect(script.requests).toHaveLength(2);
     script.expectDone();
@@ -548,7 +548,7 @@ describe("a gateway's sign-in refusal over HTTP 200 on a close (REV-T-2)", () =>
       { method: "POST", path: LOGOUT, reply: REFUSED_OVER_200 },
     ]);
     expect((await transport.run(statement("CREATE TEMP TABLE t (a INT)"))).notices).toEqual([
-      { kind: "close-failed", step: "logout" },
+      { kind: "close-refused", step: "logout" },
     ]);
     expect((await failure(transport.run(statement("SELECT 2")))).message).toBe(LATCHED);
     expect(script.requests).toHaveLength(2);

@@ -89,6 +89,7 @@ import {
 import {
   type DatabendAffect,
   type DatabendCell,
+  type DatabendCloseStep,
   type DatabendColumn,
   DatabendError,
   type DatabendNotice,
@@ -237,6 +238,11 @@ class StoppedBetweenAttempts extends Error {
 /** A close Databend acknowledged: answered 200, and not with a gateway's refusal over HTTP 200. */
 function acknowledged(exchanged: Exchanged | null): boolean {
   return exchanged?.response.status === 200 && exchanged.reading?.kind !== "refusal";
+}
+
+/** The notice of a close that was not acknowledged: refused when an answer came, failed when none did. */
+function closeNotice(exchanged: Exchanged | null, step: DatabendCloseStep): DatabendNotice {
+  return { kind: exchanged === null ? "close-failed" : "close-refused", step };
 }
 
 /** A refusal of the node transport before any socket, such as the egress guard's, which names no address. */
@@ -654,12 +660,11 @@ class StatementRun {
   /** Closes a statement the server already ended; its failure is a notice, never an error [X02]. */
   private async final(): Promise<void> {
     const exchanged = await this.closeExchange("final", "GET", finalPath(this.ids.queryId), this.closeBudget());
-    if (!acknowledged(exchanged)) this.notices.push({ kind: "close-failed", step: "final" });
+    if (!acknowledged(exchanged)) this.notices.push(closeNotice(exchanged, "final"));
   }
 
-  private async logout(): Promise<boolean> {
-    const exchanged = await this.closeExchange("logout", "POST", LOGOUT_PATH, this.closeBudget());
-    return acknowledged(exchanged);
+  private async logout(): Promise<Exchanged | null> {
+    return this.closeExchange("logout", "POST", LOGOUT_PATH, this.closeBudget());
   }
 
   /** What the last echoed session left open, closed from the server's flags (design 3.4). */
@@ -669,8 +674,10 @@ class StatementRun {
     if (plan.includes("rollback")) keepAlive = await this.rollback(last as DatabendSessionEcho);
     if (plan.includes("logout") && keepAlive) {
       // A logout a refused sign-in left unsent never went unanswered.
-      const kind = this.signInRefused ? "close-skipped" : "close-failed";
-      this.notices.push((await this.logout()) ? { kind: "temp-tables-dropped" } : { kind, step: "logout" });
+      const skipped = this.signInRefused;
+      const exchanged = await this.logout();
+      if (acknowledged(exchanged)) this.notices.push({ kind: "temp-tables-dropped" });
+      else this.notices.push(skipped ? { kind: "close-skipped", step: "logout" } : closeNotice(exchanged, "logout"));
     }
   }
 
@@ -697,22 +704,22 @@ class StatementRun {
       const followed =
         // oxlint-disable-next-line no-await-in-loop -- each answer names the next link.
         link.kind === "refused" || polls > maxPolls ? null : await this.followRollback(link.path, budget);
-      if (followed === null) {
-        this.notices.push({ kind: "close-failed", step: "rollback" });
+      const followedAnswer = followed?.reading?.kind === "answer" ? followed.reading.answer : null;
+      if (followedAnswer === null) {
+        this.notices.push(closeNotice(followed, "rollback"));
         break;
       }
-      next = followed.nextUri;
+      next = followedAnswer.nextUri;
     }
     return answer.session?.needKeepAlive ?? true;
   }
 
-  /** One GET of the ROLLBACK's chain inside its budget; its answer, or null when none arrived. */
+  /** One GET of the ROLLBACK's chain inside its budget; what it was answered, or null when nothing arrived. */
   private async followRollback(
     path: string,
     budget: { signal: AbortSignal; endsAt: number },
-  ): Promise<DatabendAnswer | null> {
-    const exchanged = await this.closeExchange("rollback", "GET", path, budget, { read: true });
-    return exchanged?.reading?.kind === "answer" ? exchanged.reading.answer : null;
+  ): Promise<Exchanged | null> {
+    return this.closeExchange("rollback", "GET", path, budget, { read: true });
   }
 
   /** The headers of one request: the client session and route hint, a POST's query id, and the sticky node once known. */

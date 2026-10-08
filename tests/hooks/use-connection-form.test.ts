@@ -3885,18 +3885,32 @@ describe("a databend:// paste (Databend design 6.2)", () => {
     expect(result.current.pasteInput).toBe(text);
   });
 
-  test("an @ in a parameter of a DSN with no sign-in is refused with the sentence naming both readings", () => {
+  test("an @ in a parameter of a DSN with no sign-in is refused with the sentence naming each encoding", () => {
     const text = "databend://db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem";
     const result = paste(text, (form) => form.setShowPasteInput(true));
     expect(result.current.testResult).toEqual({ tone: "error", message: DATABEND_DSN_REFUSALS.userinfo });
-    expect(result.current.testResult!.message).toContain("percent-encode it as %40");
+    expect(result.current.testResult!.message).toContain("and an @ in the path or a parameter as %40");
     expect(result.current.type).toBe("postgres");
     expect(result.current.host).toBe("localhost");
     expect(result.current.pasteInput).toBe(text);
   });
 
-  test("an @ in a parameter after the sign-in's own @ is no refusal, and the fields are filled", () => {
-    const result = paste("databend://root:pw@db.example.com:8000/default?role=analyst@corp");
+  // The sign-in's own @ settles nothing: `root:p@ss/x@db.example.com` is a password holding an @ and a /.
+  test.each([
+    "databend://root:pw@db.example.com:8000/default?role=analyst@corp",
+    "databend://root:p@ss/x@db.example.com:8000/default",
+  ])("an @ past the address part is refused after the sign-in's own @ too, and nothing is filled: %s", (text) => {
+    const result = paste(text, (form) => form.setShowPasteInput(true));
+    expect(result.current.testResult).toEqual({ tone: "error", message: DATABEND_DSN_REFUSALS.userinfo });
+    expect(result.current.type).toBe("postgres");
+    expect(result.current.host).toBe("localhost");
+    expect(result.current.password).toBe("");
+    expect(result.current.database).toBe("");
+    expect(result.current.pasteInput).toBe(text);
+  });
+
+  test("percent-encoded, an @ in a parameter after the sign-in fills the fields", () => {
+    const result = paste("databend://root:pw@db.example.com:8000/default?role=analyst%40corp");
     expect(result.current.type).toBe("databend");
     expect(result.current.host).toBe("db.example.com");
     expect(result.current.port).toBe("8000");

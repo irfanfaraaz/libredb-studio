@@ -51,7 +51,7 @@ export const DATABEND_IDENTIFIER_DOLLAR =
   "A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again.";
 
 export const DATABEND_STAGE_RUN_ON =
-  "A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again.";
+  "A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space, or write the location quoted ('@stage/path') where the statement takes one, and run again.";
 
 export const DATABEND_HINT_SEMICOLON =
   "An optimizer hint (/*+ ... */) in this text holds a semicolon, which Databend reads as code and Studio as a comment. Remove the semicolon from the hint and run again.";

@@ -120,6 +120,7 @@ import {
 } from "./session";
 import { databendStatementRefusal } from "./sql-text";
 import {
+  type DatabendCloseStep,
   DatabendError,
   type DatabendNotice,
   type DatabendTransport,
@@ -132,10 +133,9 @@ const DATABEND = "databend";
 
 const databendLimiter = engineLimiter(DATABEND, DATABEND_LIMITER_OPTIONS);
 
-/** The steps a `close-failed` or `close-skipped` notice names, as a sentence says them. */
-const CLOSE_STEPS: Readonly<Record<Extract<DatabendNotice, { kind: "close-failed" }>["step"], string>> = {
+/** The steps a `close-failed`, `close-refused` or `close-skipped` notice names, as a sentence says them. */
+const CLOSE_STEPS: Readonly<Record<DatabendCloseStep, string>> = {
   final: "close the finished statement (final)",
-  kill: "stop the statement (kill)",
   rollback: "roll back the transaction it left open",
   logout: "end its session (logout)",
 };
@@ -147,10 +147,12 @@ export const DATABEND_PROVIDER_SENTENCES = Object.freeze({
     `The result reached Studio's statement budget of ${DATABEND_OBJECT_SENTENCES.bound(cut)}, so only the rows before it are shown.`,
   closeFailed: (step: keyof typeof CLOSE_STEPS) =>
     `The statement finished, but Studio's request to ${CLOSE_STEPS[step]} got no answer within 5 seconds.`,
+  closeRefused: (step: keyof typeof CLOSE_STEPS) =>
+    `The statement finished, but Studio's request to ${CLOSE_STEPS[step]} was answered with an error.`,
   closeSkipped: (step: keyof typeof CLOSE_STEPS) =>
     `The statement finished, but Databend then refused the sign-in, so Studio did not send its request to ${CLOSE_STEPS[step]}, or any further request for this statement.`,
   warningsLeftOut: (count: number) =>
-    `Studio shows the first ${DATABEND_WARNING_LIMIT} different warnings of this statement and left out ${count} more that Databend sent.`,
+    `Studio shows the first ${DATABEND_WARNING_LIMIT} different warnings of this statement and left out the ${count} more that Databend sent past them, repeats included.`,
   databaseMissing: (database: string) =>
     `Database "${database}" is not in the default catalog's databases, so unqualified names will not resolve: check Database, or leave it empty.`,
   unverifiedTls:
@@ -213,6 +215,8 @@ function noticeWarning(notice: DatabendNotice): QueryWarning {
       return { message: TEMP_TABLES_DROPPED };
     case "close-failed":
       return { message: DATABEND_PROVIDER_SENTENCES.closeFailed(notice.step) };
+    case "close-refused":
+      return { message: DATABEND_PROVIDER_SENTENCES.closeRefused(notice.step) };
     case "close-skipped":
       return { message: DATABEND_PROVIDER_SENTENCES.closeSkipped(notice.step) };
     case "result-mode":

@@ -689,7 +689,7 @@ describe("query", () => {
     const result = await provider.query("SELECT 1");
     expect(result.warnings).toEqual([
       { message: TRANSACTION_MAY_STAY_OPEN },
-      { message: DATABEND_PROVIDER_SENTENCES.closeFailed("logout") },
+      { message: DATABEND_PROVIDER_SENTENCES.closeRefused("logout") },
     ]);
   });
 
@@ -702,7 +702,7 @@ describe("query", () => {
       { message: DATABEND_PROVIDER_SENTENCES.warningsLeftOut(3) },
     ]);
     expect(DATABEND_PROVIDER_SENTENCES.warningsLeftOut(3)).toBe(
-      "Studio shows the first 100 different warnings of this statement and left out 3 more that Databend sent.",
+      "Studio shows the first 100 different warnings of this statement and left out the 3 more that Databend sent past them, repeats included.",
     );
   });
 
@@ -723,9 +723,12 @@ describe("query", () => {
     await provider.connect();
     const result = await provider.query("SELECT 1");
     expect(result.warnings).toEqual([
-      { message: DATABEND_PROVIDER_SENTENCES.closeFailed("final") },
+      { message: DATABEND_PROVIDER_SENTENCES.closeRefused("final") },
       { message: DATABEND_PROVIDER_SENTENCES.closeSkipped("logout") },
     ]);
+    expect(DATABEND_PROVIDER_SENTENCES.closeRefused("final")).toBe(
+      "The statement finished, but Studio's request to close the finished statement (final) was answered with an error.",
+    );
     expect(fake.events.filter((event) => event.endsWith("/v1/session/logout"))).toEqual([]);
     expect(DATABEND_PROVIDER_SENTENCES.closeSkipped("logout")).toBe(
       "The statement finished, but Databend then refused the sign-in, so Studio did not send its request to end its session (logout), or any further request for this statement.",

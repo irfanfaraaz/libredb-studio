@@ -256,9 +256,11 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_PROVIDER_SENTENCES.resultCut(CELLS_CUT),
       DATABEND_PROVIDER_SENTENCES.resultCut(ROWS_CUT),
       DATABEND_PROVIDER_SENTENCES.closeFailed("final"),
-      DATABEND_PROVIDER_SENTENCES.closeFailed("kill"),
       DATABEND_PROVIDER_SENTENCES.closeFailed("rollback"),
       DATABEND_PROVIDER_SENTENCES.closeFailed("logout"),
+      DATABEND_PROVIDER_SENTENCES.closeRefused("final"),
+      DATABEND_PROVIDER_SENTENCES.closeRefused("rollback"),
+      DATABEND_PROVIDER_SENTENCES.closeRefused("logout"),
       DATABEND_PROVIDER_SENTENCES.closeSkipped("logout"),
       DATABEND_PROVIDER_SENTENCES.warningsLeftOut(slot("[count]")),
       DATABEND_PROVIDER_SENTENCES.databaseMissing("[database]"),
@@ -578,16 +580,15 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(read("access_token=t&role=r")?.refusal).toBe(DATABEND_DSN_REFUSALS.signIn);
   });
 
-  test("an @ past the address part is refused only when the address part holds none (RI-1)", () => {
+  test("an @ past the address part is refused whatever the address part holds, and reads one way encoded", () => {
     const prose = flat(sectionOf(DOC, "### 4.1 Configuration fields"));
-    const signedIn = "databend://root:pw@host:443/db?role=analyst@corp";
+    const encoded = "databend://root:pw@host:443/db?role=analyst%40corp";
     expect(prose).toContain(
-      `An \`@\` past the address part is refused only when the address part holds none, since the text then reads two ways; a DSN that signs in, as \`${signedIn}\` does, is read as the URL parser splits it.`,
+      `An \`@\` past the address part is refused even after the sign-in's own \`@\`, since a password can hold an unencoded \`@\` before its \`/\`; percent-encoded, as in \`${encoded}\`, the text reads one way.`,
     );
-    expect(parseConnectionString(signedIn)?.refusal).toBeUndefined();
-    expect(parseConnectionString("databend://host:443/db?role=analyst@corp")?.refusal).toBe(
-      DATABEND_DSN_REFUSALS.userinfo,
-    );
+    expect(parseConnectionString(encoded)?.refusal).toBeUndefined();
+    for (const text of ["databend://root:pw@host:443/db?role=analyst@corp", "databend://root:p@ss/x@host:443/db"])
+      expect(parseConnectionString(text)?.refusal).toBe(DATABEND_DSN_REFUSALS.userinfo);
   });
 
   test("every exported sentence record is quoted whole, key for key", () => {
@@ -660,6 +661,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "params",
         "resultCut",
         "closeFailed",
+        "closeRefused",
         "closeSkipped",
         "warningsLeftOut",
         "databaseMissing",
