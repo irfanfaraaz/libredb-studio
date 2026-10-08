@@ -7,12 +7,11 @@
  * what the pinned server answered. Time is injected (`transportDeps`), so no deadline fires unless a test fires it.
  * `mock.module()` is not used.
  *
- * The captures were taken on 2026-10-07 by tests/live/databend-evidence.ts from the `databend-http` fixture of
- * docker/databend/README.md (`tests/fixtures/databend/local-2026-10-07-v1.2.951-nightly/manifest.json`):
- * datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b.
- * Two more, the scenarios the harness plan runs on the local target only, were captured on 2026-10-08 from the same
- * image and fixture through the same scrub (`local-2026-10-08-v1.2.951-nightly/`): `insert`, an INSERT into a table
- * that outlives its session, and `final-kill`, the kill that follows a page of a finalized statement.
+ * The captures were taken on 2026-10-08 by tests/live/databend-evidence.ts from the `databend-http` fixture of
+ * docker/databend/README.md (`tests/fixtures/databend/local-2026-10-08-v1.2.951-nightly/manifest.json`):
+ * datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b,
+ * every scenario the plan runs on the local target, `insert` (an INSERT into a table that outlives its session) and
+ * `final-kill` (the kill that follows a page of a finalized statement) among them.
  *
  * A statement is answered by its text, not by its position. What is BUILT rather than captured: the connect caution's
  * `auth_type` read and every object-surface read (`system.catalogs`, `system.databases`, `system.tables`,
@@ -424,7 +423,7 @@ async function until(ready: () => boolean): Promise<void> {
 test("the header names the image and the date the manifest records", () => {
   const manifest = loadDatabendManifest();
   expect(`${manifest.image} ${manifest.capturedAt}`).toBe(
-    "datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b 2026-10-07",
+    "datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b 2026-10-08",
   );
 });
 

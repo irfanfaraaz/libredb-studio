@@ -1,9 +1,8 @@
 /**
  * The reader of the Databend captures for the replay (design 9, 11 #8), and the recording query server that replays
- * them; tests/helpers/databend-node-transport.ts `capturedAnswer` reads single answers of the 2026-10-07 run on its
- * own. The captures are what the pinned `datafuselabs/databend:v1.2.951-nightly` answered tests/live/databend-evidence.ts
- * on 2026-10-07 (tests/fixtures/databend/local-2026-10-07-v1.2.951-nightly/), plus the two its plan runs locally only,
- * recorded on 2026-10-08 from the same image and fixture through the same scrub (local-2026-10-08-v1.2.951-nightly/):
+ * them; tests/helpers/databend-node-transport.ts `capturedAnswer` reads single answers of the same run on its own.
+ * The captures are what the pinned `datafuselabs/databend:v1.2.951-nightly` answered tests/live/databend-evidence.ts
+ * on 2026-10-08 (tests/fixtures/databend/local-2026-10-08-v1.2.951-nightly/), every scenario the local target runs:
  * one scenario per file, with ids, node ids and user names replaced by placeholders (`<query-2>`, `<session-5>`,
  * `<node-1>`, `<user-2>`), numbered per run. A missing or mislabelled file, or a scenario name of two runs, fails the
  * suite that reads it; nothing here falls back.
@@ -45,10 +44,7 @@ import { TEST_NODE, wireIds } from "./databend-node-transport";
 const DATABEND_CAPTURES_DIR = join(import.meta.dir, "..", "fixtures", "databend");
 
 /** The capture runs the replay reads, each a directory with its manifest; a scenario name belongs to one run. */
-export const DATABEND_CAPTURE_RUNS = [
-  "local-2026-10-07-v1.2.951-nightly",
-  "local-2026-10-08-v1.2.951-nightly",
-] as const;
+export const DATABEND_CAPTURE_RUNS = ["local-2026-10-08-v1.2.951-nightly"] as const;
 type DatabendCaptureRun = (typeof DATABEND_CAPTURE_RUNS)[number];
 
 export interface DatabendCapturedExchange {

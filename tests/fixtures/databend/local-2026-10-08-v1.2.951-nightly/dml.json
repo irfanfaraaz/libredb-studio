@@ -11,7 +11,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "body": {
           "sql": "CREATE TEMP TABLE ev_dml (a INT)",
@@ -29,7 +29,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
           "x-databend-session-id": "<session-2>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -81,7 +81,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 5
+            "running_time_ms": 6
           },
           "stats_uri": "/v1/query/<query-7>",
           "final_uri": "/v1/query/<query-7>/final",
@@ -99,7 +99,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "dropped": []
       },
@@ -111,7 +111,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
           "x-databend-session-id": "<session-2>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -154,7 +154,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 5
+            "running_time_ms": 6
           },
           "stats_uri": "/v1/query/<query-7>",
           "final_uri": "/v1/query/<query-7>/final",
@@ -172,12 +172,22 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "body": {
           "sql": "INSERT INTO ev_dml VALUES (1), (2), (3)",
           "pagination": {
             "wait_time_secs": 10
+          },
+          "session": {
+            "catalog": "default",
+            "database": "default",
+            "role": "account_admin",
+            "settings": {},
+            "txn_state": "AutoCommit",
+            "need_sticky": true,
+            "need_keep_alive": true,
+            "internal": "{\"has_temp_table\":true,\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-7>\"]}"
           }
         },
         "dropped": []
@@ -190,7 +200,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "1",
           "x-databend-session-id": "<session-2>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -251,7 +261,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 10
+            "running_time_ms": 9
           },
           "stats_uri": "/v1/query/<query-8>",
           "final_uri": "/v1/query/<query-8>/final",
@@ -269,7 +279,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "dropped": []
       },
@@ -281,7 +291,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
           "x-databend-session-id": "<session-2>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -329,7 +339,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 10
+            "running_time_ms": 9
           },
           "stats_uri": "/v1/query/<query-8>",
           "final_uri": "/v1/query/<query-8>/final",
@@ -347,7 +357,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "body": {},
         "dropped": []
@@ -357,7 +367,7 @@
         "headers": {
           "content-type": "application/json; charset=utf-8",
           "x-databend-session-id": "<session-2>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTI-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {

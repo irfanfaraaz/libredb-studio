@@ -16,7 +16,7 @@ The date is the UTC day of the run and the version is the server's `x-databend-v
 A capture whose `uncommitted` list is not empty is not reproducible from its commit alone; capture again from the commit that holds those files.
 A scenario whose answers do not show what the plan expects stops the run, and nothing is written.
 
-The replay reads `local-2026-10-07-v1.2.951-nightly/` for the fifteen scenarios both targets run and `local-2026-10-08-v1.2.951-nightly/` for `insert` and `final-kill`, which run locally only; `DATABEND_CAPTURE_RUNS` in `tests/helpers/databend-fixtures.ts` names the two.
+The replay reads `local-2026-10-08-v1.2.951-nightly/`, every scenario the local target runs, which `DATABEND_CAPTURE_RUNS` in `tests/helpers/databend-fixtures.ts` names.
 No test replays `cloud-2026-10-08-v1.2.951-nightly/`, which is kept as the record of the Cloud acceptance of plan section 7.
 
 Each scenario file holds its exchanges in order, each with the plan step that sent it (`query`, `pages`, `next`, `final`, `kill` or `logout`), the request (method, path, allow-listed headers, body) and the answer (status, allow-listed headers, body).

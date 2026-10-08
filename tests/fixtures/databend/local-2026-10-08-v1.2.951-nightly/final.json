@@ -1,6 +1,6 @@
 {
-  "scenario": "reader",
-  "principal": "reader",
+  "scenario": "final",
+  "principal": "default",
   "clientSession": false,
   "exchanges": [
     {
@@ -12,9 +12,10 @@
           "content-type": "application/json"
         },
         "body": {
-          "sql": "SELECT current_user(), current_role(), count(*) FROM libredb_demo.every_type",
+          "sql": "SELECT number FROM numbers(25) ORDER BY number",
           "pagination": {
-            "wait_time_secs": 10
+            "wait_time_secs": 10,
+            "max_rows_per_page": 10
           }
         },
         "dropped": []
@@ -23,48 +24,65 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-query-id": "<query-18>",
-          "x-databend-query-state": "Succeeded",
-          "x-databend-query-page-rows": "1",
+          "x-databend-query-id": "<query-17>",
+          "x-databend-query-state": "Running",
+          "x-databend-query-page-rows": "10",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
-          "id": "<query-18>",
+          "id": "<query-17>",
           "session_id": "",
           "node_id": "<node-1>",
-          "state": "Succeeded",
+          "state": "Running",
           "session": {
             "catalog": "default",
             "database": "default",
-            "role": "studio_ro",
+            "role": "account_admin",
             "settings": {},
             "txn_state": "AutoCommit",
             "need_sticky": false,
             "need_keep_alive": false,
-            "internal": "{\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-18>\"]}"
+            "internal": "{\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-17>\"]}"
           },
           "error": null,
           "warnings": [],
           "has_result_set": true,
           "schema": [
             {
-              "name": "current_user()",
-              "type": "String"
-            },
-            {
-              "name": "current_role()",
-              "type": "String"
-            },
-            {
-              "name": "COUNT(*)",
+              "name": "number",
               "type": "UInt64"
             }
           ],
           "data": [
             [
-              "'<user-2>'@'%'",
-              "studio_ro",
+              "0"
+            ],
+            [
+              "1"
+            ],
+            [
+              "2"
+            ],
+            [
+              "3"
+            ],
+            [
               "4"
+            ],
+            [
+              "5"
+            ],
+            [
+              "6"
+            ],
+            [
+              "7"
+            ],
+            [
+              "8"
+            ],
+            [
+              "9"
             ]
           ],
           "affect": null,
@@ -77,40 +95,40 @@
           },
           "stats": {
             "scan_progress": {
-              "rows": 1,
-              "bytes": 1
+              "rows": 25,
+              "bytes": 200
             },
             "write_progress": {
               "rows": 0,
               "bytes": 0
             },
             "result_progress": {
-              "rows": 1,
-              "bytes": 36
+              "rows": 25,
+              "bytes": 200
             },
             "total_scan": {
-              "rows": 1,
-              "bytes": 1
+              "rows": 25,
+              "bytes": 200
             },
             "spill_progress": {
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 19
+            "running_time_ms": 3
           },
-          "stats_uri": "/v1/query/<query-18>",
-          "final_uri": "/v1/query/<query-18>/final",
-          "next_uri": "/v1/query/<query-18>/final",
-          "kill_uri": "/v1/query/<query-18>/kill"
+          "stats_uri": "/v1/query/<query-17>",
+          "final_uri": "/v1/query/<query-17>/final",
+          "next_uri": "/v1/query/<query-17>/page/1",
+          "kill_uri": "/v1/query/<query-17>/kill"
         },
         "dropped": []
       }
     },
     {
-      "step": "pages",
+      "step": "final",
       "request": {
         "method": "GET",
-        "path": "/v1/query/<query-18>/final",
+        "path": "/v1/query/<query-17>/final",
         "headers": {
           "content-type": "application/json"
         },
@@ -120,13 +138,13 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-query-id": "<query-18>",
+          "x-databend-query-id": "<query-17>",
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
-          "id": "<query-18>",
+          "id": "<query-17>",
           "session_id": "",
           "node_id": "<node-1>",
           "state": "Succeeded",
@@ -136,15 +154,7 @@
           "has_result_set": true,
           "schema": [
             {
-              "name": "current_user()",
-              "type": "String"
-            },
-            {
-              "name": "current_role()",
-              "type": "String"
-            },
-            {
-              "name": "COUNT(*)",
+              "name": "number",
               "type": "UInt64"
             }
           ],
@@ -159,31 +169,56 @@
           },
           "stats": {
             "scan_progress": {
-              "rows": 1,
-              "bytes": 1
+              "rows": 25,
+              "bytes": 200
             },
             "write_progress": {
               "rows": 0,
               "bytes": 0
             },
             "result_progress": {
-              "rows": 1,
-              "bytes": 36
+              "rows": 25,
+              "bytes": 200
             },
             "total_scan": {
-              "rows": 1,
-              "bytes": 1
+              "rows": 25,
+              "bytes": 200
             },
             "spill_progress": {
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 19
+            "running_time_ms": 3
           },
-          "stats_uri": "/v1/query/<query-18>",
-          "final_uri": "/v1/query/<query-18>/final",
+          "stats_uri": "/v1/query/<query-17>",
+          "final_uri": "/v1/query/<query-17>/final",
           "next_uri": null,
-          "kill_uri": "/v1/query/<query-18>/kill"
+          "kill_uri": "/v1/query/<query-17>/kill"
+        },
+        "dropped": []
+      }
+    },
+    {
+      "step": "next",
+      "request": {
+        "method": "GET",
+        "path": "/v1/query/<query-17>/page/1",
+        "headers": {
+          "content-type": "application/json"
+        },
+        "dropped": []
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8",
+          "x-databend-version": "1.2.951-nightly"
+        },
+        "body": {
+          "error": {
+            "code": 400,
+            "message": "Query <query-17> is closed for finalized"
+          }
         },
         "dropped": []
       }

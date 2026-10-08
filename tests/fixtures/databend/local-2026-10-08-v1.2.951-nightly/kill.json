@@ -63,8 +63,8 @@
           },
           "stats": {
             "scan_progress": {
-              "rows": 809500672,
-              "bytes": 6476005376
+              "rows": 821493760,
+              "bytes": 6571950080
             },
             "write_progress": {
               "rows": 0,
@@ -82,7 +82,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 1001
+            "running_time_ms": 1000
           },
           "stats_uri": "/v1/query/<query-16>",
           "final_uri": "/v1/query/<query-16>/final",

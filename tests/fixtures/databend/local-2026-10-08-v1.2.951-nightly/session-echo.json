@@ -11,7 +11,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "body": {
           "sql": "SELECT current_database(), now()",
@@ -37,7 +37,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "1",
           "x-databend-session-id": "<session-5>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -74,7 +74,7 @@
           "data": [
             [
               "libredb_demo",
-              "2026-10-08 01:49:39.997336"
+              "2026-10-08 04:56:54.397844"
             ]
           ],
           "affect": null,
@@ -106,7 +106,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 2
+            "running_time_ms": 1
           },
           "stats_uri": "/v1/query/<query-14>",
           "final_uri": "/v1/query/<query-14>/final",
@@ -124,7 +124,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "dropped": []
       },
@@ -136,7 +136,7 @@
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
           "x-databend-session-id": "<session-5>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
@@ -188,7 +188,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 2
+            "running_time_ms": 1
           },
           "stats_uri": "/v1/query/<query-14>",
           "final_uri": "/v1/query/<query-14>/final",
@@ -206,7 +206,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9"
         },
         "body": {},
         "dropped": []
@@ -216,7 +216,7 @@
         "headers": {
           "content-type": "application/json; charset=utf-8",
           "x-databend-session-id": "<session-5>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTMzNzl9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTU-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTR9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {

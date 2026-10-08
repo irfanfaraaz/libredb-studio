@@ -37,7 +37,7 @@ import {
 import type { DatabendTransport, StatementOrigin, StatementRequest } from "@/lib/db/providers/sql/databend/transport";
 import { type DatabaseConnection, TUNNEL_FAR_END, type TunnelFarEnd } from "@/lib/types";
 
-const CAPTURES = join(import.meta.dir, "..", "fixtures", "databend", "local-2026-10-07-v1.2.951-nightly");
+const CAPTURES = join(import.meta.dir, "..", "fixtures", "databend", "local-2026-10-08-v1.2.951-nightly");
 
 export interface RecordedRequest {
   readonly method: "GET" | "POST";

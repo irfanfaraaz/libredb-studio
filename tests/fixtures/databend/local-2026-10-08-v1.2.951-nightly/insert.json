@@ -11,7 +11,7 @@
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTk2MjN9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTY-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTV9"
         },
         "body": {
           "sql": "INSERT INTO studio_demo.notes VALUES (3, 'third'), (4, 'fourth'), (5, 'fifth')",
@@ -25,16 +25,16 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-query-id": "<query-1>",
+          "x-databend-query-id": "<query-19>",
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "1",
-          "x-databend-session-id": "<session-1>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTk2MjN9",
+          "x-databend-session-id": "<session-6>",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTY-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTV9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
-          "id": "<query-1>",
-          "session_id": "<session-1>",
+          "id": "<query-19>",
+          "session_id": "<session-6>",
           "node_id": "<node-1>",
           "state": "Succeeded",
           "session": {
@@ -45,7 +45,7 @@
             "txn_state": "AutoCommit",
             "need_sticky": false,
             "need_keep_alive": false,
-            "internal": "{\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-1>\"]}"
+            "internal": "{\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-19>\"]}"
           },
           "error": null,
           "warnings": [],
@@ -90,12 +90,12 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 18
+            "running_time_ms": 16
           },
-          "stats_uri": "/v1/query/<query-1>",
-          "final_uri": "/v1/query/<query-1>/final",
-          "next_uri": "/v1/query/<query-1>/final",
-          "kill_uri": "/v1/query/<query-1>/kill"
+          "stats_uri": "/v1/query/<query-19>",
+          "final_uri": "/v1/query/<query-19>/final",
+          "next_uri": "/v1/query/<query-19>/final",
+          "kill_uri": "/v1/query/<query-19>/kill"
         },
         "dropped": []
       }
@@ -104,11 +104,11 @@
       "step": "pages",
       "request": {
         "method": "GET",
-        "path": "/v1/query/<query-1>/final",
+        "path": "/v1/query/<query-19>/final",
         "headers": {
           "content-type": "application/json",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTk2MjN9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTY-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTV9"
         },
         "dropped": []
       },
@@ -116,16 +116,16 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-query-id": "<query-1>",
+          "x-databend-query-id": "<query-19>",
           "x-databend-query-state": "Succeeded",
           "x-databend-query-page-rows": "0",
-          "x-databend-session-id": "<session-1>",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MTk2MjN9",
+          "x-databend-session-id": "<session-6>",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTY-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ2MTV9",
           "x-databend-version": "1.2.951-nightly"
         },
         "body": {
-          "id": "<query-1>",
-          "session_id": "<session-1>",
+          "id": "<query-19>",
+          "session_id": "<session-6>",
           "node_id": "<node-1>",
           "state": "Succeeded",
           "session": null,
@@ -168,12 +168,12 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 18
+            "running_time_ms": 16
           },
-          "stats_uri": "/v1/query/<query-1>",
-          "final_uri": "/v1/query/<query-1>/final",
+          "stats_uri": "/v1/query/<query-19>",
+          "final_uri": "/v1/query/<query-19>/final",
           "next_uri": null,
-          "kill_uri": "/v1/query/<query-1>/kill"
+          "kill_uri": "/v1/query/<query-19>/kill"
         },
         "dropped": []
       }
