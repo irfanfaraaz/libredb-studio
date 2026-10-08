@@ -278,7 +278,7 @@ A refused sign-in is latched (section 3.7) and reads:
 
 > Databend refused the sign-in for this user.
 
-The server's own text follows, and under a password policy that locked the user, so does:
+The server's own text follows as a sentence of its own, and under a password policy that locked the user, so does:
 
 > Under a password policy, five failed sign-ins lock the user for 15 minutes for every client, and the right password is refused until then.
 

@@ -66,7 +66,7 @@ describe("a refused sign-in", () => {
     const { script, transport } = transportHarness([{ method: "POST", path: "/v1/query", reply: WRONG_PASSWORD }]);
     const refused = await failure(transport.run(statement("SELECT 1")));
     expect(refused.category).toBe("auth");
-    expect(refused.message).toBe(`${S.signInRefused} Authentication failed: incorrect password`);
+    expect(refused.message).toBe(`${S.signInRefused} Authentication failed: incorrect password.`);
     expect(script.requests).toHaveLength(1);
     // Basic is always sent (I10).
     expect(script.requests[0].headers.authorization).toStartWith("Basic ");
@@ -117,7 +117,7 @@ describe("a refused sign-in", () => {
       { method: "POST", path: "/v1/query", reply: { status: 500, body: { error: { code: 2215, message: "locked" } } } },
     ]);
     const error = await failure(transport.run(statement("SELECT 1")));
-    expect(error.message).toBe(`${S.signInRefused} locked ${S.possibleLockout}`);
+    expect(error.message).toBe(`${S.signInRefused} locked. ${S.possibleLockout}`);
     expect((await failure(transport.run(statement("SELECT 1")))).message).toStartWith(
       "Databend refused this sign-in at",
     );
@@ -147,7 +147,7 @@ describe("a refused sign-in", () => {
       },
     ]);
     expect((await failure(transport.run(statement("SELECT 1")))).message).toBe(
-      `${S.signInRefused} no ${S.cloudSqlUser}`,
+      `${S.signInRefused} no. ${S.cloudSqlUser}`,
     );
     await failure(transport.run(statement("SELECT 1")));
     expect(script.requests).toHaveLength(1);
@@ -175,7 +175,7 @@ describe("a refused sign-in", () => {
     );
     const refused = await failure(transport.run(statement("SELECT 1")));
     expect(refused.category).toBe("auth");
-    expect(refused.message).toBe(`${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`);
+    expect(refused.message).toBe(`${S.signInRefused} Authentication failed: incorrect password. ${S.cloudSqlUser}`);
     expect((await failure(transport.run(statement("SELECT 1")))).message).toStartWith(
       "Databend refused this sign-in at",
     );

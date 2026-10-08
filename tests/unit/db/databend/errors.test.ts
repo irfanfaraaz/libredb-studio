@@ -98,7 +98,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
         refusal({ status: 401, code, text: "Authentication failed: incorrect password" }),
         context(),
       );
-      expectRow(error, "auth", AuthenticationError, `${S.signInRefused} Authentication failed: incorrect password`);
+      expectRow(error, "auth", AuthenticationError, `${S.signInRefused} Authentication failed: incorrect password.`);
       expect(error.code).toBe(code);
       expect(error.status).toBe(401);
       expect(error.detail).toBe("Authentication failed: incorrect password");
@@ -111,7 +111,14 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
       refusalError(refusal({ status: 500, code: 2215, text }), context()),
       "auth",
       AuthenticationError,
-      `${S.signInRefused} ${text} ${S.possibleLockout}`,
+      `${S.signInRefused} ${text}. ${S.possibleLockout}`,
+    );
+  });
+
+  test("the server's words end a sentence before the next one, without a second full stop", () => {
+    const text = "User 'no_such_user'@'%' does not exist.";
+    expect(refusalError(refusal({ status: 401, code: 5100, text }), context({ warehouse: "wh" })).message).toBe(
+      `${S.signInRefused} ${text} ${S.cloudSqlUser}`,
     );
   });
 
@@ -133,7 +140,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
         ),
         "auth",
         AuthenticationError,
-        `${S.signInRefused} Please check your username and password ${S.cloudSqlUser}`,
+        `${S.signInRefused} Please check your username and password. ${S.cloudSqlUser}`,
       );
     });
   }
@@ -154,7 +161,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
       error,
       "auth",
       AuthenticationError,
-      `${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`,
+      `${S.signInRefused} Authentication failed: incorrect password. ${S.cloudSqlUser}`,
     );
     expect(error.code).toBe(5100);
     expect(error.status).toBe(401);
@@ -174,7 +181,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
       }),
       context({ warehouse: "default" }),
     );
-    expectRow(error, "auth", AuthenticationError, `${S.signInRefused} ${text} ${S.possibleLockout} ${S.cloudSqlUser}`);
+    expectRow(error, "auth", AuthenticationError, `${S.signInRefused} ${text}. ${S.possibleLockout} ${S.cloudSqlUser}`);
     expect(error.code).toBe(2215);
   });
 
@@ -190,7 +197,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
       }),
       context(),
     );
-    expect(error.message).toBe(`${S.signInRefused} ${WITHHELD} ${S.cloudSqlUser}`);
+    expect(error.message).toBe(`${S.signInRefused} ${WITHHELD}. ${S.cloudSqlUser}`);
     expect(error.message).not.toContain(TEST_PASSWORD);
   });
 
@@ -907,7 +914,7 @@ describe("the configured credential never reaches a sentence", () => {
 
   test("a refused sign-in's detail is scrubbed too", () => {
     const error = refusalError(refusal({ status: 401, code: 5100, text: `bad ${TEST_PASSWORD}` }), context());
-    expect(error.message).toBe(`${S.signInRefused} ${WITHHELD}`);
+    expect(error.message).toBe(`${S.signInRefused} ${WITHHELD}.`);
     expect(error.detail).toBe(WITHHELD);
   });
 });

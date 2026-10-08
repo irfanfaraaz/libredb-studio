@@ -241,6 +241,11 @@ function scrubbed(text: string, ctx: DatabendFailureContext, max: number, decode
   return safe.length > max ? `${safe.slice(0, max)}...` : safe;
 }
 
+/** The server's words as a sentence of their own, so the sentence after them does not run on from them. */
+function asSentence(text: string): string {
+  return text === "" || /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
 /** A UTC time as the latched sentence says it: `2026-10-08 01:20`. */
 function utc(time: Date): string {
   return time.toISOString().slice(0, 16).replace("T", " ");
@@ -297,7 +302,7 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
   if (gatewayKind === GATEWAY_RESUMING) return unavailableError(gatewayKind, ctx, details);
   const gatewayAuth = GATEWAY_AUTH.has(gatewayKind ?? undefined);
   if (latchesSignIn(signInAnswerOf(refusal))) {
-    const parts = [sentences.signInRefused, detail];
+    const parts = [sentences.signInRefused, asSentence(detail)];
     if (code === LOCKOUT_CODE) parts.push(sentences.possibleLockout);
     if (gatewayAuth || ctx.warehouse) parts.push(sentences.cloudSqlUser);
     return new DatabendError("auth", parts.filter((part) => part !== "").join(" "), details);

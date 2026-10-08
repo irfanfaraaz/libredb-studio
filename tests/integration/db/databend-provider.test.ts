@@ -680,7 +680,9 @@ describe("Databend v1.2.951-nightly, replayed", () => {
     const { provider, server, record } = replay({}, { answer: () => ({ capture: "auth-401", index: 0 }) });
     const refused = await rejection(provider.connect());
     expect(refused).toBeInstanceOf(AuthenticationError);
-    expect(refused.message).toBe(`${DATABEND_ERROR_SENTENCES.signInRefused} Authentication failed: incorrect password`);
+    expect(refused.message).toBe(
+      `${DATABEND_ERROR_SENTENCES.signInRefused} Authentication failed: incorrect password.`,
+    );
     // No kill, ROLLBACK or logout: each would carry the refused credential again.
     expect(paths(server.requests)).toEqual(["POST /v1/query"]);
 

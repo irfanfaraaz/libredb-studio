@@ -529,12 +529,12 @@ describe("the Databend Cloud gateway's envelope (I19, C4)", () => {
     } as const;
     const S = DATABEND_ERROR_SENTENCES;
     const cases: readonly [keyof typeof CLOUD, string, string][] = [
-      ["wrongPassword", "auth", `${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`],
+      ["wrongPassword", "auth", `${S.signInRefused} Authentication failed: incorrect password. ${S.cloudSqlUser}`],
       ["unknownUser", "auth", `${S.signInRefused} User 'no_such_user_libredb'@'%' does not exist. ${S.cloudSqlUser}`],
       [
         "lockout",
         "auth",
-        `${S.signInRefused} Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails ${S.possibleLockout} ${S.cloudSqlUser}`,
+        `${S.signInRefused} Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails. ${S.possibleLockout} ${S.cloudSqlUser}`,
       ],
       ["noAuthorization", "config", S.signInMissing],
       ["noWarehouse", "config", S.warehouseRefused("default")],
