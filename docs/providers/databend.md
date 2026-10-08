@@ -177,7 +177,7 @@ Studio retries on its own (the connection pulse, the fleet check, a tree read an
 Each Studio process holds a latch of its own, so several replicas each send a refused password once per 15 minutes, and five or more can still lock the user ([D252](../BACKLOG.md)).
 A gateway's sign-in refusal latches over any HTTP status, 200 included, and only an answer proves a sign-in, never a refusal.
 Two connections with the same key share the latch, a disconnect does not clear it, and a restart does.
-The key is SHA-256 over the scheme, the far end, the SSH bastion route, the user and the password; no secret is kept.
+The key is an HMAC-SHA-256, keyed by random bytes each process draws once, over the scheme, the far end, the SSH bastion route, the user and the password; no secret is kept, and a key seen outside the process cannot be used to test a guessed password.
 The far end's host is framed in one spelling: an IPv6 address however it is written, and a host name with or without its final dot, are one key, while an error still names the host as configured.
 Until a key has had an answer, one statement holds it and the others wait until it has sent its last request, its closes included, so a refused password is sent once.
 The latch holds 256 keys: a new one takes the place of an expired key first, then of the oldest proven one, and of the oldest latched one only when every key is latched and live; a proof never takes a latched key's place, so its key stays unproven.

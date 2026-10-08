@@ -9,7 +9,9 @@
  * the latch lives in the process, not in a provider: two instances on one key share it, a disconnect does not clear
  * it, and a restart does.
  *
- * The key is SHA-256 over the length-framed scheme, far end, bastion route, user and password [X03]. The far end is
+ * The key is an HMAC-SHA-256, keyed by 32 random bytes the process draws once, over the length-framed scheme, far end,
+ * bastion route, user and password [X03], so a key seen outside the process, in a heap snapshot or a log line, cannot
+ * be used to test a guessed password (the pattern of src/lib/auth-compare.ts). The far end is
  * the tunnel's when an SSH tunnel carries the connection, never the local forward, which is a new port for every
  * tunnel and every Test Connection; its host is framed in one spelling, so one server written two ways is one key.
  * The warehouse is not framed, because the user is locked whatever compute is named. No secret is kept: the map holds
@@ -24,7 +26,7 @@
  * one, and the oldest latched one only when every entry is latched and live [X30]. A proof is never kept at the cost
  * of a latch: with every entry latched and live it is not written, and its key stays unproven.
  */
-import { createHash } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { latchedError, latchesSignIn, type SignInAnswer } from "./errors";
 import type { DatabendError } from "./transport";
 
@@ -78,13 +80,21 @@ function canonicalHost(host: string): string {
   return host.endsWith(".") ? host.slice(0, -1) : host;
 }
 
-/** The key of one identity: SHA-256 hex over the length-framed fields, so no field slides into the next. */
+/** The process's key of the latch keys; the memo is load-bearing, since a new key per call would split one identity. */
+let processKey: Buffer | null = null;
+
+function latchKeyKey(): Buffer {
+  if (processKey === null) processKey = randomBytes(32);
+  return processKey;
+}
+
+/** The key of one identity: HMAC-SHA-256 hex over the length-framed fields, so no field slides into the next. */
 export function authLatchKey(identity: AuthLatchIdentity): string {
   const { scheme, host, port, route, user, password } = identity;
   const framed = [scheme, canonicalHost(host), String(port), route, user, password].map(
     (value) => `${value.length}:${value}`,
   );
-  return createHash("sha256").update(framed.join(""), "utf8").digest("hex");
+  return createHmac("sha256", latchKeyKey()).update(framed.join(""), "utf8").digest("hex");
 }
 
 interface Entry {

@@ -5,6 +5,7 @@
  * then the oldest proven one, and a latched one last [X30], and single flight per unproven key [X14]. No test waits on
  * a real timer.
  */
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
   AUTH_LATCH_MAX_ENTRIES,
@@ -103,9 +104,15 @@ async function refusal(promise: Promise<unknown>): Promise<DatabendError> {
 }
 
 describe("authLatchKey", () => {
-  test("is a SHA-256 hex digest that holds neither the password nor the user", () => {
+  test("is a hex digest keyed per process, holding neither the password nor the user", () => {
     const key = authLatchKey(IDENTITY);
     expect(key).toMatch(/^[0-9a-f]{64}$/);
+    expect(authLatchKey({ ...IDENTITY })).toBe(key);
+    // Keyed: the bare SHA-256 of the same framed fields is not the key, so a key seen outside the process cannot be
+    // used to test a guessed password.
+    const { scheme, host, port, route, user, password } = IDENTITY;
+    const framed = [scheme, host, String(port), route, user, password].map((value) => `${value.length}:${value}`);
+    expect(key).not.toBe(createHash("sha256").update(framed.join(""), "utf8").digest("hex"));
     expect(key).not.toContain(TEST_PASSWORD);
     expect(key).not.toContain(TEST_USER);
     expect(key).not.toContain(Buffer.from(`${TEST_USER}:${TEST_PASSWORD}`).toString("hex"));

@@ -21,6 +21,7 @@ import {
   type DatabendTruncation,
   type StatementOutcome,
 } from "@/lib/db/providers/sql/databend/transport";
+import { TEST_PASSWORD } from "../../../helpers/databend-node-transport";
 
 /** The en dash and the em dash, built from their code points so this file holds neither. */
 const DASHES = new RegExp("[\\u2013\\u2014]");
@@ -311,7 +312,7 @@ describe("countObjects", () => {
   });
 
   test("an unknown table_type passes serverText with the connection's forms and the refusal's cut (HASIM-D-5)", async () => {
-    const password = "stand-in-1";
+    const password = TEST_PASSWORD;
     const forms = secretForms([password, `reader:${password}`]);
     const unknown = async (spelling: string) => {
       const { runner } = scripted(

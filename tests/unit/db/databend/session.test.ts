@@ -16,6 +16,7 @@ import {
   USE_NOT_CARRIED,
 } from "@/lib/db/providers/sql/databend/session";
 import { secretForms, serverText } from "@/lib/db/utils/server-text";
+import { TEST_PASSWORD } from "../../../helpers/databend-node-transport";
 
 /** A connection with no password, whose secret forms are none. */
 const NO_FORMS: readonly string[] = [];
@@ -133,7 +134,7 @@ describe("the warnings of design 3.7", () => {
   });
 
   test("each key SET GLOBAL changed passes serverText with the connection's forms and the refusal's cut (HASIM-D-5)", () => {
-    const password = "stand-in-1";
+    const password = TEST_PASSWORD;
     const forms = secretForms([password, `reader:${password}`]);
     const affect = {
       type: "ChangeSettings",
