@@ -391,3 +391,159 @@ describe("the result-mode echo (design section 4, I6)", () => {
     );
   });
 });
+
+/** The Cloud gateway's refusals as measured on a test tenant (I19, C4), host and tenant replaced. */
+const CLOUD = {
+  wrongPassword: [
+    401,
+    String.raw`{"error":{"kind":"AuthorizationFailed","message":"status: 401, message: {\"error\":{\"code\":5100,\"message\":\"Authentication failed: incorrect password\"}}: Authorization failed"}}`,
+  ],
+  unknownUser: [
+    401,
+    String.raw`{"error":{"kind":"AuthorizationFailed","message":"status: 401, message: {\"error\":{\"code\":2201,\"message\":\"User 'no_such_user_libredb'@'%' does not exist.\"}}: Authorization failed"}}`,
+  ],
+  lockout: [
+    500,
+    String.raw`{"error":{"kind":"Unexpected","message":"status: 500, message: {\"error\":{\"code\":2215,\"message\":\"Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails\"}}: Unexpected"}}`,
+  ],
+  noAuthorization: [
+    401,
+    `{"error":{"kind":"AuthorizationRequired","message":"no Password or Authorization provided: Authorization is required"}}`,
+  ],
+  noWarehouse: [400, `{"error":{"kind":"WarehouseHeaderRequired","message":"X-DATABEND-WAREHOUSE is required"}}`],
+  badWarehouse: [
+    400,
+    `{"error":{"kind":"BadWarehouse","message":"warehouse <tenant> no_such_wh_a72e8a not found: Bad warehouse"}}`,
+  ],
+  forbidden: [403, `{"error":{"kind":"ForbiddenAccessUser","message":"Permission denied"}}`],
+} as const satisfies Record<string, readonly [number, string]>;
+
+function cloudRefusal(name: keyof typeof CLOUD) {
+  const [status, body] = CLOUD[name];
+  const reading = readAnswer(response(status, "application/json", body));
+  if (reading.kind !== "refusal") throw new Error("expected a refusal");
+  return reading.refusal;
+}
+
+describe("the Databend Cloud gateway's envelope (I19, C4)", () => {
+  test("a wrapped upstream refusal gives the nested kind, the upstream status, code and message", () => {
+    expect(cloudRefusal("wrongPassword")).toEqual({
+      status: 401,
+      contentType: "application/json",
+      code: null,
+      gatewayKind: "AuthorizationFailed",
+      text: 'status: 401, message: {"error":{"code":5100,"message":"Authentication failed: incorrect password"}}: Authorization failed',
+      upstreamStatus: 401,
+      upstreamCode: 5100,
+      upstreamMessage: "Authentication failed: incorrect password",
+    });
+    expect(cloudRefusal("unknownUser")).toMatchObject({
+      gatewayKind: "AuthorizationFailed",
+      upstreamStatus: 401,
+      upstreamCode: 2201,
+      upstreamMessage: "User 'no_such_user_libredb'@'%' does not exist.",
+    });
+    expect(cloudRefusal("lockout")).toMatchObject({
+      status: 500,
+      gatewayKind: "Unexpected",
+      upstreamStatus: 500,
+      upstreamCode: 2215,
+      upstreamMessage: "Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails",
+    });
+  });
+
+  test("an unwrapped gateway refusal gives the nested kind and its text, with no upstream fields", () => {
+    for (const [name, kind, text] of [
+      ["noAuthorization", "AuthorizationRequired", "no Password or Authorization provided: Authorization is required"],
+      ["noWarehouse", "WarehouseHeaderRequired", "X-DATABEND-WAREHOUSE is required"],
+      ["badWarehouse", "BadWarehouse", "warehouse <tenant> no_such_wh_a72e8a not found: Bad warehouse"],
+      ["forbidden", "ForbiddenAccessUser", "Permission denied"],
+    ] as const) {
+      const refusal = cloudRefusal(name);
+      expect(refusal).toEqual({
+        status: CLOUD[name][0],
+        contentType: "application/json",
+        code: null,
+        gatewayKind: kind,
+        text,
+      });
+      expect(refusal.upstreamCode).toBeUndefined();
+    }
+  });
+
+  test("a 200 whose body nests a kind and has no state is a refusal", () => {
+    expect(readAnswer(json({ error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } }))).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "ProvisionWarehouseTimeout",
+        text: "resuming",
+      },
+    });
+  });
+
+  test("a 200 whose error has a code and no state is still protocol, not a refusal", () => {
+    const error = protocolOf(() => readAnswer(json({ id: "q", error: { code: 1005, message: "bad" } })));
+    expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field("state")));
+  });
+
+  test.each([
+    ["no JSON after message:", "status: 401, message: not json: Authorization failed"],
+    ["JSON that does not parse", 'status: 401, message: {"error":{"code":5100,: Authorization failed'],
+    ["a __proto__ key", 'status: 401, message: {"__proto__":{"code":5100,"message":"x"}}: Authorization failed'],
+    ["no error object", 'status: 401, message: {"code":5100,"message":"x"}: Authorization failed'],
+    [
+      "a code that is not a number",
+      'status: 401, message: {"error":{"code":"5100","message":"x"}}: Authorization failed',
+    ],
+    ["a message that is not text", 'status: 401, message: {"error":{"code":5100,"message":7}}: Authorization failed'],
+    ["no words after the JSON", 'status: 401, message: {"error":{"code":5100,"message":"x"}}'],
+    ["a status of other than three digits", 'status: 4010, message: {"error":{"code":5100,"message":"x"}}: words'],
+    ["text before the wrapper", 'proxy said status: 401, message: {"error":{"code":5100,"message":"x"}}: words'],
+  ])("a message with %s stays plain text with no upstream fields", (_label, message) => {
+    const reading = readAnswer(json({ error: { kind: "AuthorizationFailed", message } }, 401));
+    expect(reading).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 401,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "AuthorizationFailed",
+        text: message,
+      },
+    });
+    if (reading.kind === "refusal") expect(reading.refusal.upstreamStatus).toBeUndefined();
+  });
+
+  test("each measured envelope reaches its row of the error table", () => {
+    const ctx = {
+      request: "post",
+      origin: "user",
+      sql: "SHOW WAREHOUSES",
+      warehouse: "default",
+      endpoint: { host: "h", port: 443 },
+      timeoutMs: 1000,
+      secretForms: secretForms(["pw", "cloudapp:pw"]),
+    } as const;
+    const S = DATABEND_ERROR_SENTENCES;
+    const cases: readonly [keyof typeof CLOUD, string, string][] = [
+      ["wrongPassword", "auth", `${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`],
+      ["unknownUser", "auth", `${S.signInRefused} User 'no_such_user_libredb'@'%' does not exist. ${S.cloudSqlUser}`],
+      [
+        "lockout",
+        "auth",
+        `${S.signInRefused} Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails ${S.possibleLockout} ${S.cloudSqlUser}`,
+      ],
+      ["noAuthorization", "config", S.signInMissing],
+      ["noWarehouse", "config", S.warehouseRefused("default")],
+      ["badWarehouse", "config", S.warehouseRefused("default")],
+      ["forbidden", "statement", S.statementForbidden("Permission denied")],
+    ];
+    for (const [name, category, message] of cases) {
+      const error = refusalError(cloudRefusal(name), ctx);
+      expect([name, error.category, error.message]).toEqual([name, category, message]);
+    }
+  });
+});

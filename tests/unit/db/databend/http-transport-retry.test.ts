@@ -91,6 +91,32 @@ describe("the statement POST (C10)", () => {
     expect(time.sleeps).toEqual([800]);
   });
 
+  test.each([
+    ["a 503", 503],
+    ["a 200", 200],
+  ])(
+    "a ProvisionWarehouseTimeout nested under error, as Databend Cloud nests its kinds, over %s is resent (I19)",
+    async (_label, status) => {
+      const { script, time, transport } = transportHarness(
+        [
+          {
+            method: "POST",
+            path: "/v1/query",
+            reply: { status, body: { error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } } },
+          },
+          { method: "POST", path: "/v1/query", reply: ok(FIRST) },
+        ],
+        { random: 0 },
+      );
+      await transport.run(statement("SELECT 1"));
+      script.expectDone();
+      const [one, two] = script.requests;
+      expect(two.headers).toEqual(one.headers);
+      expect(two.body).toBe(one.body);
+      expect(time.sleeps).toEqual([800]);
+    },
+  );
+
   test("a ProvisionWarehouseTimeout past the deadline is unavailable, with nothing more sent", async () => {
     const warehouse = testOptions({ warehouse: "wh" }, { queryTimeout: 1000 });
     const { script, transport } = transportHarness(

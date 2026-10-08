@@ -25,6 +25,7 @@ import {
   latchesSignIn,
   protocolError,
   refusalError,
+  signInAnswerOf,
   stopError,
   toDatabaseError,
   transportFailure,
@@ -123,7 +124,7 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
     );
   });
 
-  for (const kind of ["PasswordAuthFailed", "JWTVerificationFailed", "ForbiddenAccessUser"]) {
+  for (const kind of ["AuthorizationFailed", "PasswordAuthFailed", "JWTVerificationFailed"]) {
     test(`the gateway kind ${kind} is auth, read as Cloud`, () => {
       expectRow(
         refusalError(
@@ -137,12 +138,124 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
     });
   }
 
+  test("a Cloud refusal wrapping 401 with 5100 is auth with the upstream message as its detail (I19)", () => {
+    const error = refusalError(
+      refusal({
+        status: 401,
+        gatewayKind: "AuthorizationFailed",
+        text: 'status: 401, message: {"error":{"code":5100,"message":"Authentication failed: incorrect password"}}: Authorization failed',
+        upstreamStatus: 401,
+        upstreamCode: 5100,
+        upstreamMessage: "Authentication failed: incorrect password",
+      }),
+      context({ warehouse: "default" }),
+    );
+    expectRow(
+      error,
+      "auth",
+      AuthenticationError,
+      `${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`,
+    );
+    expect(error.code).toBe(5100);
+    expect(error.status).toBe(401);
+    expect(error.detail).toBe("Authentication failed: incorrect password");
+  });
+
+  test("a Cloud Unexpected wrapping 500 with 2215 is auth and adds the possible lockout (I19)", () => {
+    const text = "Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails";
+    const error = refusalError(
+      refusal({
+        status: 500,
+        gatewayKind: "Unexpected",
+        text: `status: 500, message: {"error":{"code":2215,"message":"${text}"}}: Unexpected`,
+        upstreamStatus: 500,
+        upstreamCode: 2215,
+        upstreamMessage: text,
+      }),
+      context({ warehouse: "default" }),
+    );
+    expectRow(error, "auth", AuthenticationError, `${S.signInRefused} ${text} ${S.possibleLockout} ${S.cloudSqlUser}`);
+    expect(error.code).toBe(2215);
+  });
+
+  test("a wrapped upstream message is scrubbed before it is shown", () => {
+    const error = refusalError(
+      refusal({
+        status: 401,
+        gatewayKind: "AuthorizationFailed",
+        text: "wrapper",
+        upstreamStatus: 401,
+        upstreamCode: 5100,
+        upstreamMessage: `bad password ${TEST_PASSWORD}`,
+      }),
+      context(),
+    );
+    expect(error.message).toBe(`${S.signInRefused} ${WITHHELD} ${S.cloudSqlUser}`);
+    expect(error.message).not.toContain(TEST_PASSWORD);
+  });
+
   test("another 401 is a refused follow-up request, protocol", () => {
     expectRow(
       refusalError(refusal({ status: 401, code: 5104, text: "session mismatch" }), context({ request: "get" })),
       "protocol",
       ConnectionError,
       S.followUpRefused,
+    );
+  });
+});
+
+describe("the gateway's statement and sign-in kinds (I19)", () => {
+  test("ForbiddenAccessUser is a refused statement with the gateway's text, never auth", () => {
+    const error = refusalError(
+      refusal({ status: 403, gatewayKind: "ForbiddenAccessUser", text: "Permission denied" }),
+      context({ warehouse: "default" }),
+    );
+    expectRow(error, "statement", QueryError, S.statementForbidden("Permission denied"));
+    expect(S.statementForbidden("Permission denied")).toBe(
+      "Databend Cloud refused this statement for this user: Permission denied.",
+    );
+  });
+
+  test("ForbiddenAccessUser's text is scrubbed", () => {
+    const error = refusalError(
+      refusal({ status: 403, gatewayKind: "ForbiddenAccessUser", text: `denied for ${TEST_USER}:${TEST_PASSWORD}` }),
+      context(),
+    );
+    expect(error.message).toBe(S.statementForbidden(serverText(`denied for ${TEST_USER}:${TEST_PASSWORD}`, FORMS)));
+    expect(error.message).not.toContain(TEST_PASSWORD);
+  });
+
+  test("ForbiddenAccessUser stays a refused statement when its message wraps a sign-in code (I19: never latched)", () => {
+    const error = refusalError(
+      refusal({
+        status: 403,
+        gatewayKind: "ForbiddenAccessUser",
+        text: 'status: 401, message: {"error":{"code":5100,"message":"x"}}: y',
+        upstreamStatus: 401,
+        upstreamCode: 5100,
+        upstreamMessage: "x",
+      }),
+      context({ warehouse: "default" }),
+    );
+    expectRow(error, "statement", QueryError, S.statementForbidden("x"));
+  });
+
+  test("AuthorizationRequired is config: no sign-in reached Databend Cloud", () => {
+    expectRow(
+      refusalError(
+        refusal({
+          status: 401,
+          gatewayKind: "AuthorizationRequired",
+          text: "no Password or Authorization provided: Authorization is required",
+        }),
+        context({ warehouse: "default" }),
+      ),
+      "config",
+      DatabaseConfigError,
+      S.signInMissing,
+    );
+    expect(S.signInMissing).toBe(
+      "No sign-in reached Databend Cloud: a proxy between Studio and Databend may drop the Authorization header.",
     );
   });
 });
@@ -346,7 +459,17 @@ describe("latchesSignIn, the one latching rule that refusalError and the latch b
     ["500 with 2215", { status: 500, code: 2215 }],
     ["gateway PasswordAuthFailed", { status: 401, gatewayKind: "PasswordAuthFailed" }],
     ["gateway JWTVerificationFailed", { status: 401, gatewayKind: "JWTVerificationFailed" }],
-    ["gateway ForbiddenAccessUser", { status: 403, gatewayKind: "ForbiddenAccessUser" }],
+    ["gateway AuthorizationFailed", { status: 401, gatewayKind: "AuthorizationFailed" }],
+    [
+      "wrapped 401 with 5100",
+      { status: 401, gatewayKind: "AuthorizationFailed", upstreamStatus: 401, upstreamCode: 5100 },
+    ],
+    [
+      "wrapped 401 with 2201",
+      { status: 401, gatewayKind: "AuthorizationFailed", upstreamStatus: 401, upstreamCode: 2201 },
+    ],
+    ["wrapped 500 with 2215", { status: 500, gatewayKind: "Unexpected", upstreamStatus: 500, upstreamCode: 2215 }],
+    ["a wrapped 401 with 5101 under another gateway status", { status: 502, upstreamStatus: 401, upstreamCode: 5101 }],
     ["401 with 5100 beside an unrelated gateway kind", { status: 401, code: 5100, gatewayKind: "SomethingElse" }],
     ["500 with 2215 beside an unrelated gateway kind", { status: 500, code: 2215, gatewayKind: "SomethingElse" }],
   ])("%s latches", (_label, answer) => {
@@ -362,18 +485,72 @@ describe("latchesSignIn, the one latching rule that refusalError and the latch b
     ["5100 over a 500", { status: 500, code: 5100 }],
     ["a 503", { status: 503 }],
     ["another gateway kind", { status: 400, gatewayKind: "WarehouseNotFound" }],
+    ["gateway ForbiddenAccessUser, a refused statement", { status: 403, gatewayKind: "ForbiddenAccessUser" }],
+    ["gateway AuthorizationRequired, no sign-in sent", { status: 401, gatewayKind: "AuthorizationRequired" }],
+    [
+      "a wrapped 500 with another code",
+      { status: 500, gatewayKind: "Unexpected", upstreamStatus: 500, upstreamCode: 1001 },
+    ],
+    [
+      "a wrapped 2215 over an upstream 401",
+      { status: 500, gatewayKind: "Unexpected", upstreamStatus: 401, upstreamCode: 2215 },
+    ],
+    [
+      "a wrapped 5100 over an upstream 500",
+      { status: 401, gatewayKind: "Unexpected", upstreamStatus: 500, upstreamCode: 5100 },
+    ],
+    [
+      "gateway ForbiddenAccessUser over a wrapped 401 with 5100",
+      { status: 403, gatewayKind: "ForbiddenAccessUser", upstreamStatus: 401, upstreamCode: 5100 },
+    ],
+    [
+      "gateway ForbiddenAccessUser beside 401 with 5100",
+      { status: 401, code: 5100, gatewayKind: "ForbiddenAccessUser" },
+    ],
   ])("%s does not latch", (_label, answer) => {
     expect(latchesSignIn(answer)).toBe(false);
+  });
+
+  test("signInAnswerOf carries every field of a refusal the rule reads, upstream ones included", () => {
+    const lockout = refusal({
+      status: 500,
+      gatewayKind: "Unexpected",
+      upstreamStatus: 500,
+      upstreamCode: 2215,
+      upstreamMessage: "Disable login",
+    });
+    expect(signInAnswerOf(lockout)).toEqual({
+      status: 500,
+      code: undefined,
+      gatewayKind: "Unexpected",
+      upstreamStatus: 500,
+      upstreamCode: 2215,
+    });
+    expect(latchesSignIn(signInAnswerOf(lockout))).toBe(true);
+    expect(signInAnswerOf(refusal({ status: 401, code: 5100 }))).toEqual({
+      status: 401,
+      code: 5100,
+      gatewayKind: undefined,
+      upstreamStatus: undefined,
+      upstreamCode: undefined,
+    });
   });
 
   test("every answer that latches is the auth refusal, and every one that does not is another category", () => {
     for (const answer of [
       { status: 401, code: 5100 },
       { status: 500, code: 2215 },
-      { status: 403, gatewayKind: "ForbiddenAccessUser" },
+      { status: 401, gatewayKind: "AuthorizationFailed" },
+      { status: 500, gatewayKind: "Unexpected", upstreamStatus: 500, upstreamCode: 2215 },
     ]) {
       const error = refusalError(
-        refusal({ status: answer.status, code: answer.code ?? null, gatewayKind: answer.gatewayKind ?? null }),
+        refusal({
+          status: answer.status,
+          code: answer.code ?? null,
+          gatewayKind: answer.gatewayKind ?? null,
+          upstreamStatus: answer.upstreamStatus,
+          upstreamCode: answer.upstreamCode,
+        }),
         context(),
       );
       expect(latchesSignIn(answer)).toBe(true);
@@ -386,6 +563,10 @@ describe("latchesSignIn, the one latching rule that refusalError and the latch b
     ]) {
       expect(latchesSignIn(answer)).toBe(false);
       expect(refusalError(refusal({ status: answer.status, code: answer.code }), context()).category).not.toBe("auth");
+    }
+    for (const kind of ["ForbiddenAccessUser", "AuthorizationRequired"]) {
+      expect(latchesSignIn({ status: 403, gatewayKind: kind })).toBe(false);
+      expect(refusalError(refusal({ status: 403, gatewayKind: kind }), context()).category).not.toBe("auth");
     }
   });
 });
@@ -700,6 +881,29 @@ describe("the configured credential never reaches a sentence", () => {
       expect(error.message).not.toContain(form);
     });
   }
+
+  // A password with a quote and a backslash is escaped inside a gateway wrapper's JSON, where no secret form matches it.
+  const QUOTED_PASSWORD = 'p"w\\1';
+  const QUOTED_FORMS = secretForms([QUOTED_PASSWORD, `${TEST_USER}:${QUOTED_PASSWORD}`]);
+  const QUOTED_WITHHELD = serverText(QUOTED_PASSWORD, QUOTED_FORMS);
+  const wrapped = (inner: unknown) => `status: 401, message: ${JSON.stringify(inner)}: Forbidden`;
+
+  test.each([
+    ["a code that is not a number", wrapped({ error: { code: "5100", message: `bad ${QUOTED_PASSWORD}` } })],
+    [
+      "a wrapper nested twice",
+      wrapped({ error: { code: 5100, message: wrapped({ error: { code: 1, message: QUOTED_PASSWORD } }) } }),
+    ],
+    ["no wrapper at all, escaped JSON", JSON.stringify({ note: `bad ${QUOTED_PASSWORD}` })],
+    ["a \\u escape", String.raw`status: 401, message: {"error":{"code":"x","message":"bad p\u0022w\\1\n"}}: y`],
+  ])("an escaped password in a gateway text that is not unwrapped (%s) gives the withheld sentence", (_label, text) => {
+    expect(text).not.toContain(QUOTED_PASSWORD);
+    for (const gatewayKind of ["ForbiddenAccessUser", "Unexpected"]) {
+      const error = refusalError(refusal({ status: 418, gatewayKind, text }), context({ secretForms: QUOTED_FORMS }));
+      expect(error.message).toContain(QUOTED_WITHHELD);
+      expect(error.message).not.toContain("bad");
+    }
+  });
 
   test("a refused sign-in's detail is scrubbed too", () => {
     const error = refusalError(refusal({ status: 401, code: 5100, text: `bad ${TEST_PASSWORD}` }), context());

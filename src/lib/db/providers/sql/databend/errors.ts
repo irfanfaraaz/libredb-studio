@@ -44,6 +44,9 @@ export const DATABEND_ERROR_SENTENCES = Object.freeze({
   possibleLockout:
     "Under a password policy, five failed sign-ins lock the user for 15 minutes for every client, and the right password is refused until then.",
   cloudSqlUser: "On Databend Cloud, sign in with a SQL user of the warehouse; the console login is not a SQL user.",
+  statementForbidden: (text: string) => `Databend Cloud refused this statement for this user: ${text}.`,
+  signInMissing:
+    "No sign-in reached Databend Cloud: a proxy between Studio and Databend may drop the Authorization header.",
   followUpRefused: "Databend refused a follow-up request of this statement.",
   warehouseRefused: (name: string) =>
     `Databend Cloud refused the warehouse "${name}": check Warehouse against the DSN on the warehouse's Connect page.`,
@@ -99,10 +102,14 @@ const ABORTED_CODE = 1043;
 
 /** The Databend Cloud gateway's kinds for a refused credential. */
 const GATEWAY_AUTH: ReadonlySet<string | undefined> = new Set([
+  "AuthorizationFailed",
   "PasswordAuthFailed",
   "JWTVerificationFailed",
-  "ForbiddenAccessUser",
 ]);
+/** A valid sign-in refused one statement (I19): never latched, so a statement a user may not run locks nothing. */
+const GATEWAY_FORBIDDEN = "ForbiddenAccessUser";
+/** No credential reached the gateway, though Studio always sends Basic (I10): something between dropped it. */
+const GATEWAY_NO_SIGN_IN = "AuthorizationRequired";
 const GATEWAY_WAREHOUSE: ReadonlySet<string> = new Set([
   "WarehouseNotFound",
   "BadWarehouse",
@@ -117,26 +124,51 @@ const GATEWAY_FAILURE_STATUSES: ReadonlySet<number> = new Set([502, 504, 520]);
 /** Statuses a GET is retried on and, past its retries, reads as a warehouse that did not come up (design 3.11). */
 const BUSY_STATUSES: ReadonlySet<number> = new Set([429, 503]);
 
-/** The part of an answer that decides a sign-in: its status, Databend's code, and a gateway's kind. */
+/**
+ * The part of an answer that decides a sign-in: its status, Databend's code, a gateway's kind, and the query node's
+ * status and code when the gateway wrapped its refusal (I19).
+ */
 export interface SignInAnswer {
   readonly status: number;
   readonly code?: number;
   readonly gatewayKind?: string;
+  readonly upstreamStatus?: number;
+  readonly upstreamCode?: number;
+}
+
+/** A 401 signed with a sign-in code, or the lockout over HTTP 500. */
+function signedSignIn(status: number | undefined, code: number | undefined): boolean {
+  return (status === 401 && SIGN_IN_CODES.has(code ?? 0)) || (status === 500 && code === LOCKOUT_CODE);
 }
 
 /**
- * Whether an answer refuses the credential itself (design 3.5, 3.13): a gateway's credential kind, a 401 signed with
- * a sign-in code, or the lockout over HTTP 500. Any one of the three is enough, so a code still counts beside an
- * unrelated gateway kind. This is the one rule: `refusalError` makes exactly these `auth`, and the sign-in latch of
- * `auth-latch.ts` latches exactly these (I18).
+ * Whether an answer refuses the credential itself (design 3.5, 3.13): a gateway's credential kind, or a 401 signed
+ * with a sign-in code or the lockout over HTTP 500, direct or wrapped by the gateway. Any one is enough, so a code
+ * still counts beside an unrelated gateway kind, but never beside ForbiddenAccessUser, which refuses a statement for a
+ * valid sign-in (I19). This is the one rule: `refusalError` makes exactly these `auth`, and
+ * the sign-in latch of `auth-latch.ts` latches exactly these (I18).
  */
 export function latchesSignIn(answer: SignInAnswer): boolean {
-  const { status, code, gatewayKind } = answer;
+  if (answer.gatewayKind === GATEWAY_FORBIDDEN) return false;
   return (
-    GATEWAY_AUTH.has(gatewayKind) ||
-    (status === 401 && SIGN_IN_CODES.has(code ?? 0)) ||
-    (status === 500 && code === LOCKOUT_CODE)
+    GATEWAY_AUTH.has(answer.gatewayKind) ||
+    signedSignIn(answer.status, answer.code) ||
+    signedSignIn(answer.upstreamStatus, answer.upstreamCode)
   );
+}
+
+/**
+ * The sign-in part of a refusal, upstream status and code included: the transport settles the latch with exactly what
+ * `refusalError` classifies, so the two cannot drift (I18).
+ */
+export function signInAnswerOf(refusal: DatabendRefusal): SignInAnswer {
+  return {
+    status: refusal.status,
+    code: refusal.code ?? undefined,
+    gatewayKind: refusal.gatewayKind ?? undefined,
+    upstreamStatus: refusal.upstreamStatus,
+    upstreamCode: refusal.upstreamCode,
+  };
 }
 
 /** What every classification needs to know about the request that failed. */
@@ -173,13 +205,38 @@ function seconds(ms: number): string {
   return String(ms / 1000);
 }
 
+/** A JSON string escape: `\\uXXXX` or a backslash before one of `"\\/bfnrt`. */
+const JSON_ESCAPE = /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g;
+const CONTROL_ESCAPES: Readonly<Record<string, string>> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+/** How many times a text is unescaped: a gateway wrapper nests its JSON once per hop. */
+const MAX_ESCAPE_LEVELS = 8;
+
+/**
+ * A text with its JSON string escapes undone, once per level until nothing changes: JSON a gateway left inside a
+ * message, a wrapper that did not unwrap among it, holds a form with a quote or a backslash escaped, where the form
+ * itself is not found (I19).
+ */
+function unescapedLevels(text: string): string[] {
+  const levels: string[] = [];
+  let current = text;
+  for (let level = 0; level < MAX_ESCAPE_LEVELS; level++) {
+    const next = current.replace(JSON_ESCAPE, (_match, hex: string | undefined, char: string) =>
+      hex === undefined ? (CONTROL_ESCAPES[char] ?? char) : String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+    if (next === current) break;
+    levels.push(next);
+    current = next;
+  }
+  return levels;
+}
+
 /**
  * `serverText` first, then the cut, so a form is never cut in half and shown. `decoded` is a JSON refusal's strings
  * as parsed: its raw text holds them escaped, where a form with a quote, a backslash, a slash or a non-ASCII
  * character is not found, so a form in any of them withholds the text too.
  */
 function scrubbed(text: string, ctx: DatabendFailureContext, max: number, decoded: readonly string[] = []): string {
-  const leak = decoded.find((value) => serverText(value, ctx.secretForms) !== value);
+  const leak = [...decoded, ...unescapedLevels(text)].find((value) => serverText(value, ctx.secretForms) !== value);
   const safe = serverText(leak ?? text, ctx.secretForms);
   return safe.length > max ? `${safe.slice(0, max)}...` : safe;
 }
@@ -231,19 +288,24 @@ export function protocolError(what: string, cause?: unknown, status?: number): D
  * signal that sets the sign-in latch (design 3.5).
  */
 export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureContext): DatabendError {
-  const { status, code: rawCode, gatewayKind } = refusal;
-  const code = rawCode ?? undefined;
-  const detail = scrubbed(refusal.text, ctx, MAX_REFUSAL_TEXT, refusal.decoded);
+  const { status, gatewayKind } = refusal;
+  const code = refusal.code ?? refusal.upstreamCode;
+  // A wrapped refusal shows the query node's own message, not the gateway's wrapper (I19).
+  const detail = scrubbed(refusal.upstreamMessage ?? refusal.text, ctx, MAX_REFUSAL_TEXT, refusal.decoded);
   const details = { code, status, detail };
 
   if (gatewayKind === GATEWAY_RESUMING) return unavailableError(gatewayKind, ctx, details);
   const gatewayAuth = GATEWAY_AUTH.has(gatewayKind ?? undefined);
-  if (latchesSignIn({ status, code, gatewayKind: gatewayKind ?? undefined })) {
+  if (latchesSignIn(signInAnswerOf(refusal))) {
     const parts = [sentences.signInRefused, detail];
     if (code === LOCKOUT_CODE) parts.push(sentences.possibleLockout);
     if (gatewayAuth || ctx.warehouse) parts.push(sentences.cloudSqlUser);
     return new DatabendError("auth", parts.filter((part) => part !== "").join(" "), details);
   }
+  if (gatewayKind === GATEWAY_FORBIDDEN) {
+    return new DatabendError("statement", sentences.statementForbidden(detail), details);
+  }
+  if (gatewayKind === GATEWAY_NO_SIGN_IN) return new DatabendError("config", sentences.signInMissing, details);
   if (gatewayKind !== null && GATEWAY_WAREHOUSE.has(gatewayKind)) {
     const message = ctx.warehouse ? sentences.warehouseRefused(ctx.warehouse) : sentences.warehouseRequired;
     return new DatabendError("config", message, details);

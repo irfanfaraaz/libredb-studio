@@ -61,7 +61,7 @@ import {
   latchesSignIn,
   protocolError,
   refusalError,
-  type SignInAnswer,
+  signInAnswerOf,
   stopError,
   transportFailure,
   unsentStopError,
@@ -200,10 +200,6 @@ interface Gathered {
   readonly warnings: Set<string>;
 }
 
-function signInOf(refusal: DatabendRefusal): SignInAnswer {
-  return { status: refusal.status, code: refusal.code ?? undefined, gatewayKind: refusal.gatewayKind ?? undefined };
-}
-
 /** A refusal of the node transport before any socket, such as the egress guard's, which names no address. */
 function configError(error: unknown): DatabendError {
   return new DatabendError("config", (error as Error).message, { cause: error });
@@ -283,7 +279,7 @@ class StatementRun {
     }
     const reading = first.reading as DatabendReading;
     if (reading.kind === "refusal") {
-      hold.settle(signInOf(reading.refusal));
+      hold.settle(signInAnswerOf(reading.refusal));
       const error = refusalError(reading.refusal, this.context("post"));
       // A status that says nothing about whether the POST reached Databend: the statement may be running.
       if (error.category === "outcome-unknown" || error.category === "network") await this.closeUnanswered();
@@ -449,7 +445,7 @@ class StatementRun {
     }
     const reading = exchanged.reading as DatabendReading;
     if (reading.kind === "refusal") {
-      const signIn = signInOf(reading.refusal);
+      const signIn = signInAnswerOf(reading.refusal);
       (this.hold as AuthAttempt).settle(signIn);
       const error = refusalError(reading.refusal, this.context("get"));
       // A close would carry the refused credential again, only to be refused and counted toward a lockout.

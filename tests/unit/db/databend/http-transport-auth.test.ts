@@ -25,6 +25,18 @@ const WRONG_PASSWORD = {
   body: { error: { code: 5100, message: "Authentication failed: incorrect password" } },
 };
 
+/** Databend Cloud's lockout as measured (I19): a 500 Unexpected wrapping the query node's 500 with 2215. */
+const CLOUD_LOCKOUT = {
+  status: 500,
+  body: {
+    error: {
+      kind: "Unexpected",
+      message:
+        'status: 500, message: {"error":{"code":2215,"message":"Disable login before 2026-10-08 00:54:35.574391755 UTC because of too many password fails"}}: Unexpected',
+    },
+  },
+};
+
 async function failure(promise: Promise<unknown>): Promise<DatabendError> {
   const error = await promise.then(
     () => {
@@ -118,6 +130,85 @@ describe("a refused sign-in", () => {
     );
     await failure(transport.run(statement("SELECT 1")));
     expect(script.requests).toHaveLength(1);
+  });
+
+  test("a Databend Cloud AuthorizationFailed on the POST latches: the next statement sends nothing (I19)", async () => {
+    const { script, transport } = transportHarness(
+      [
+        {
+          method: "POST",
+          path: "/v1/query",
+          reply: {
+            status: 401,
+            body: {
+              error: {
+                kind: "AuthorizationFailed",
+                message:
+                  'status: 401, message: {"error":{"code":5100,"message":"Authentication failed: incorrect password"}}: Authorization failed',
+              },
+            },
+          },
+        },
+      ],
+      { options: testOptions({ warehouse: "default" }) },
+    );
+    const refused = await failure(transport.run(statement("SELECT 1")));
+    expect(refused.category).toBe("auth");
+    expect(refused.message).toBe(`${S.signInRefused} Authentication failed: incorrect password ${S.cloudSqlUser}`);
+    expect((await failure(transport.run(statement("SELECT 1")))).message).toStartWith(
+      "Databend refused this sign-in at",
+    );
+    expect(script.requests).toHaveLength(1);
+    script.expectDone();
+  });
+
+  test("a Databend Cloud ForbiddenAccessUser refuses the statement and does not latch: the next one is sent (I19)", async () => {
+    const { script, transport } = transportHarness([
+      {
+        method: "POST",
+        path: "/v1/query",
+        reply: { status: 403, body: { error: { kind: "ForbiddenAccessUser", message: "Permission denied" } } },
+      },
+      { method: "POST", path: "/v1/query", reply: ok(idsOf(2)) },
+    ]);
+    const refused = await failure(transport.run(statement("SHOW WAREHOUSES")));
+    expect(refused.category).toBe("statement");
+    expect(refused.message).toBe(S.statementForbidden("Permission denied"));
+    await transport.run(statement("SELECT 1"));
+    expect(script.requests).toHaveLength(2);
+    script.expectDone();
+  });
+
+  test("a Databend Cloud lockout, wrapped under the Unexpected kind, latches on the POST: one request (I19)", async () => {
+    const { script, transport } = transportHarness([{ method: "POST", path: "/v1/query", reply: CLOUD_LOCKOUT }], {
+      options: testOptions({ warehouse: "default" }),
+    });
+    const refused = await failure(transport.run(statement("SELECT 1")));
+    expect(refused.category).toBe("auth");
+    expect(refused.message).toContain(S.possibleLockout);
+    expect((await failure(transport.run(statement("SELECT 1")))).message).toBe(
+      S.latched("2026-10-08 02:00", "2026-10-08 02:15"),
+    );
+    expect(script.requests).toHaveLength(1);
+    script.expectDone();
+  });
+
+  test("a Databend Cloud lockout on a page latches, and no kill, ROLLBACK or logout repeats the credential", async () => {
+    const P = pathsOf(FIRST.queryId);
+    const session = { txn_state: "Active", need_keep_alive: true, settings: { http_json_result_mode: "display" } };
+    const { script, transport } = transportHarness(
+      [
+        { method: "POST", path: "/v1/query", reply: ok(FIRST, { state: "Running", session, next_uri: P.page(0) }) },
+        { method: "GET", path: P.page(0), reply: CLOUD_LOCKOUT },
+      ],
+      { options: testOptions({ warehouse: "default" }) },
+    );
+    expect((await failure(transport.run(statement("SELECT 1")))).category).toBe("auth");
+    expect((await failure(transport.run(statement("SELECT 1")))).message).toStartWith(
+      "Databend refused this sign-in at",
+    );
+    expect(script.requests).toHaveLength(2);
+    script.expectDone();
   });
 
   test("a sign-in refused on a page also latches, and no kill, ROLLBACK or logout repeats the credential", async () => {

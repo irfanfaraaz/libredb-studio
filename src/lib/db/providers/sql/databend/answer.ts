@@ -2,9 +2,11 @@
  * Reading one HTTP answer of Databend's query API (design 3.12, section 4).
  *
  * Only a 200 `application/json` body is an answer. Anything else is a refusal, read by its status, then its content
- * type: a JSON refusal names Databend's code (`{"error":{"code","message"}}`), the Cloud gateway's kind
- * (`{"kind","message"}`) or databend-go's string shape (`{"error","message"}`), and a text one (a panic is 500
- * `text/plain`, 07 M04e) keeps its body as its text. A 200 that is not JSON, a body that does not parse (a
+ * type: a JSON refusal names Databend's code (`{"error":{"code","message"}}`), the Cloud gateway's kind (measured
+ * nested as `{"error":{"kind","message"}}`, I19, and read top-level too) or databend-go's string shape
+ * (`{"error","message"}`), and a text one (a panic is 500 `text/plain`, 07 M04e) keeps its body as its text. The
+ * gateway wraps a query node's refusal as `status: <n>, message: <json>: <words>`: that one shape is unwrapped into
+ * the upstream status, code and message, and no other message text is read. A 200 that is not JSON, a body that does not parse (a
  * `RangeError` included), a key named `__proto__` anywhere, a field of the wrong type, a cell that is not text or
  * null, or a row of another width than the schema is `protocol`.
  *
@@ -64,6 +66,12 @@ export interface DatabendRefusal {
    * holds them escaped and `errors.ts` checks both against the secret forms (design 3.13).
    */
   readonly decoded?: readonly string[];
+  /** The query node's HTTP status, when the gateway wrapped its refusal (I19). */
+  readonly upstreamStatus?: number;
+  /** The query node's code, when the gateway wrapped its refusal. */
+  readonly upstreamCode?: number;
+  /** The query node's message, raw server text, when the gateway wrapped its refusal. */
+  readonly upstreamMessage?: string;
 }
 
 export type DatabendReading =
@@ -97,13 +105,15 @@ function isJson(contentType: string | null): boolean {
   return contentType?.split(";")[0].trim().toLowerCase() === "application/json";
 }
 
+function refuseProtoKey(key: string, value: unknown): unknown {
+  if (key === "__proto__") throw new PrototypeKey();
+  return value;
+}
+
 /** `JSON.parse` refusing a `__proto__` key at any depth; every failure, a `RangeError` included, is `protocol`. */
 function parse(text: string, status: number): unknown {
   try {
-    return JSON.parse(text, (key, value: unknown) => {
-      if (key === "__proto__") throw new PrototypeKey();
-      return value;
-    });
+    return JSON.parse(text, refuseProtoKey);
   } catch (error) {
     const fault =
       error instanceof PrototypeKey ? DATABEND_PROTOCOL_FAULTS.prototypeKey : DATABEND_PROTOCOL_FAULTS.notJson;
@@ -246,7 +256,37 @@ function decodedStrings(root: unknown): string[] {
   return found;
 }
 
-/** A refusal's code, gateway kind and message from a JSON body, else the raw text. */
+/** The gateway's wrapper of a query node's refusal (I19): `status: 401, message: {...}: Authorization failed`. */
+const UPSTREAM_WRAPPER = /^status: (\d{3}), message: (\{[\s\S]*\}): ([\s\S]+)$/;
+
+type Upstream = Pick<DatabendRefusal, "upstreamStatus" | "upstreamCode" | "upstreamMessage">;
+
+/**
+ * The query node's status, code and message from a gateway message in the wrapper, parsed as strictly as an answer (a
+ * `__proto__` key refuses it); anything else, a wrapper whose JSON does not parse or lacks the code or message among
+ * it, is no upstream.
+ */
+function upstreamOf(message: string): Upstream {
+  const match = UPSTREAM_WRAPPER.exec(message);
+  if (match === null) return {};
+  let inner: unknown;
+  try {
+    inner = JSON.parse(match[2], refuseProtoKey);
+  } catch {
+    return {};
+  }
+  const error = isRecord(inner) && isRecord(inner.error) ? inner.error : null;
+  if (typeof error?.code !== "number" || typeof error.message !== "string") return {};
+  return { upstreamStatus: Number(match[1]), upstreamCode: error.code, upstreamMessage: error.message };
+}
+
+/** The gateway kind, nested under `error` as Databend Cloud sends it (I19) or top-level. */
+function gatewayKindOf(body: Body | null, error: Body | null): string | null {
+  const kind = [error?.kind, body?.kind].find((value) => typeof value === "string");
+  return typeof kind === "string" ? kind : null;
+}
+
+/** A refusal's code, gateway kind, message and wrapped upstream from a JSON body, else the raw text. */
 function refusalOf(response: NodeResponse): DatabendRefusal {
   let parsed: unknown;
   if (isJson(response.contentType)) {
@@ -263,9 +303,10 @@ function refusalOf(response: NodeResponse): DatabendRefusal {
     status: response.status,
     contentType: response.contentType,
     code: typeof error?.code === "number" ? error.code : null,
-    gatewayKind: typeof body?.kind === "string" ? body.kind : null,
+    gatewayKind: gatewayKindOf(body, error),
     text: typeof message === "string" ? message : response.text,
     decoded: typeof message === "string" || parsed === undefined ? undefined : decodedStrings(parsed),
+    ...(typeof message === "string" ? upstreamOf(message) : {}),
   };
 }
 
@@ -275,8 +316,10 @@ export function readAnswer(response: NodeResponse): DatabendReading {
   if (!isJson(response.contentType)) throw protocolError(DATABEND_PROTOCOL_FAULTS.notAnswer, undefined, 200);
   const body = parse(response.text, 200);
   if (!isRecord(body)) return wrongType("answer");
-  // The Cloud gateway's refusal may come over any status, ProvisionWarehouseTimeout among them (design 3.11).
-  if (typeof body.kind === "string" && body.state === undefined)
+  // The Cloud gateway's refusal may come over any status, ProvisionWarehouseTimeout among them (design 3.11), with
+  // its kind top-level or nested under `error` (I19).
+  const nested = isRecord(body.error) ? body.error : null;
+  if (gatewayKindOf(body, nested) !== null && body.state === undefined)
     return { kind: "refusal", refusal: refusalOf(response) };
   return { kind: "answer", answer: readBody(body) };
 }
