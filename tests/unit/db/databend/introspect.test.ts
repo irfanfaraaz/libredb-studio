@@ -298,13 +298,15 @@ describe("each panel degrades to empty on the unavailable codes and propagates t
   }
 
   test("any other error propagates", async () => {
-    for (const error of [failure(1065), new DatabendError("timeout", "late"), new Error("boom")]) {
-      const runner: DatabendStatementRunner = async () => {
-        throw error;
-      };
-      await expect(getSlowQueries(runner)).rejects.toBe(error);
-      await expect(getOverview(runner)).rejects.toBe(error);
-    }
+    await Promise.all(
+      [failure(1065), new DatabendError("timeout", "late"), new Error("boom")].map(async (error) => {
+        const runner: DatabendStatementRunner = async () => {
+          throw error;
+        };
+        await expect(getSlowQueries(runner)).rejects.toBe(error);
+        await expect(getOverview(runner)).rejects.toBe(error);
+      }),
+    );
   });
 
   test("a cut table list is refused, not shown in part", async () => {

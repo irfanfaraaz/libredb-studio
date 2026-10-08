@@ -238,17 +238,18 @@ export async function getActiveSessions(
     const queryStart = readInstant(row.created_time);
     // `time` is seconds since the session was created, and a session lives for one request, so it is the age.
     const durationMs = (readNumber(row.elapsed_seconds) ?? 0) * 1000;
-    return {
+    const session: ActiveSessionDetails = {
       pid: readText(row.session_id),
       user: readText(row.user_name),
       database: readText(row.database_name),
-      ...(host === "" ? {} : { clientAddr: host }),
       state: queryId === "" ? status : DATABEND_MONITORING_SENTENCES.sessionState(status, queryId),
       query: readText(row.query_text),
-      ...(queryStart === undefined ? {} : { queryStart }),
       duration: formatDuration(durationMs),
       durationMs,
     };
+    if (host !== "") session.clientAddr = host;
+    if (queryStart !== undefined) session.queryStart = queryStart;
+    return session;
   });
 }
 
@@ -267,16 +268,15 @@ export async function getTableStats(
     const tableBytes = readNumber(row.data_compressed_size);
     const indexBytes = readNumber(row.index_size);
     const totalBytes = (tableBytes ?? 0) + (indexBytes ?? 0);
-    return {
+    const stats: TableStats = {
       schemaName: readText(row.schema_name),
       tableName: readText(row.table_name),
       // Required by the type; a table without statistics (an external one) reports NULL.
       rowCount: readNumber(row.num_rows) ?? 0,
-      ...sizeFields("tableSize", tableBytes),
-      ...sizeFields("indexSize", indexBytes),
       totalSize: formatBytes(totalBytes),
       totalSizeBytes: totalBytes,
     };
+    return Object.assign(stats, sizeFields("tableSize", tableBytes), sizeFields("indexSize", indexBytes));
   });
 }
 

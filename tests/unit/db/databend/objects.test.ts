@@ -507,13 +507,15 @@ describe("describeObjects", () => {
   });
 
   test("a limit that is not a positive safe whole number is refused before any statement", async () => {
-    for (const limit of [0, -1, 1.5, Number.NaN, 1e21]) {
-      const { runner, calls } = scripted();
-      await expect(describeObjects(runner, CONTAINER, "table", limit)).rejects.toThrow(
-        DATABEND_OBJECT_SENTENCES.badLimit(limit),
-      );
-      expect(calls).toHaveLength(0);
-    }
+    await Promise.all(
+      [0, -1, 1.5, Number.NaN, 1e21].map(async (limit) => {
+        const { runner, calls } = scripted();
+        await expect(describeObjects(runner, CONTAINER, "table", limit)).rejects.toThrow(
+          DATABEND_OBJECT_SENTENCES.badLimit(limit),
+        );
+        expect(calls).toHaveLength(0);
+      }),
+    );
   });
 });
 
@@ -560,15 +562,17 @@ describe("readObjectSource", () => {
   });
 
   test("no definition answered is a refusal part, never an empty text", async () => {
-    for (const rows of [[], [["o", "  "]], [["o", null]]]) {
-      const { runner } = scripted(outcome(SOURCE_SCHEMA, rows));
-      const [part] = (await readObjectSource(runner, CONTAINER, "view", OBJECT)).parts;
-      expect(part).toEqual({
-        id: SOURCE_PART_ID,
-        label: DATABEND_OBJECT_SENTENCES.sourceLabel,
-        unavailable: DATABEND_OBJECT_SENTENCES.noDefinition,
-      });
-    }
+    await Promise.all(
+      [[], [["o", "  "]], [["o", null]]].map(async (rows) => {
+        const { runner } = scripted(outcome(SOURCE_SCHEMA, rows));
+        const [part] = (await readObjectSource(runner, CONTAINER, "view", OBJECT)).parts;
+        expect(part).toEqual({
+          id: SOURCE_PART_ID,
+          label: DATABEND_OBJECT_SENTENCES.sourceLabel,
+          unavailable: DATABEND_OBJECT_SENTENCES.noDefinition,
+        });
+      }),
+    );
   });
 });
 

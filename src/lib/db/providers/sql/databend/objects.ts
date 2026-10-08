@@ -307,13 +307,9 @@ export async function listObjects(
     const name = readText(row.object_name);
     const rowCount = readNumber(row.num_rows);
     const sizeBytes = readNumber(row.data_compressed_size);
-    return {
-      path: [container.catalog, container.database, name],
-      name,
-      kind,
-      ...(rowCount === undefined ? {} : { rowCount }),
-      ...(sizeBytes === undefined ? {} : { sizeBytes }),
-    };
+    const object: DatabaseObject = { path: [container.catalog, container.database, name], name, kind };
+    const counted = rowCount === undefined ? {} : { rowCount };
+    return Object.assign(object, counted, sizeBytes === undefined ? {} : { sizeBytes });
   });
 }
 
