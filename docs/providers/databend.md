@@ -573,6 +573,7 @@ The query timeout is sent as `max_execute_time_in_seconds` and is also Studio's 
 > The statement did not finish within [seconds] seconds, so Studio cancelled it.
 
 With no first answer by then the cause reads "no first answer within [seconds] seconds".
+That sentence reaches a caller of the provider itself, such as an embedded host's route; Studio's own query route answers a deadline with HTTP 408 and its own sentence, "Query timed out. Please try a simpler query or increase timeout.", and Chromium sends a POST answered 408 on a kept-alive connection again, so in the browser a statement that reaches its deadline can run up to three times, each with its kill ([X27](../BACKLOG.md)).
 A statement that waits for a permit longer than its deadline sends nothing:
 
 > Studio's Databend statement slots stayed busy for [seconds] seconds, so nothing was sent. Try again when a running statement finishes.
@@ -873,6 +874,7 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - The SQL INSERT export cannot write `Array`, `Map`, `Tuple`, `Bitmap`, `Interval`, geo or `Vector` values: each such row is skipped by name.
 - A kill stops the session's current statement, not the session, though the Sessions panel's dialog and toast speak of ending it ([U98](../BACKLOG.md)): a session of another client, such as BendSQL, runs its next statement.
 - Every budget was verified locally and through Databend Cloud's gateway on one warehouse; a cold start through Studio and multi-node paging are not run yet.
+- In the browser a statement that reaches its deadline can run up to three times: the query route answers a deadline with HTTP 408, which Chromium sends again on a kept-alive connection ([X27](../BACKLOG.md)).
 - A seed edited to add a Warehouse while it is open keeps its pulse until the page is reloaded ([U97](../BACKLOG.md)).
 - The sign-in latch is one Studio process's: several replicas each send a refused password once per 15 minutes, so five or more can still lock a user under a password policy ([D252](../BACKLOG.md)).
 - Driver-based SQL providers hold a whole result with no cell or byte budget, which Databend's provider has ([D247](../BACKLOG.md)), and the pulse of other engines resends a refused password, which the latch prevents here within one Studio process ([D248](../BACKLOG.md)).
