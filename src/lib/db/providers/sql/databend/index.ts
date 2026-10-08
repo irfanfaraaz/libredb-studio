@@ -28,7 +28,12 @@
  * connection comes from `connect()`, before any socket.
  */
 import { QueryError } from "@/lib/db/errors";
-import { assertContainerPathShape, assertObjectPathShape, findKind } from "@/lib/db/object-kinds";
+import {
+  assertContainerPathShape,
+  assertObjectPathShape,
+  type ContainerPathShapeEngine,
+  findKind,
+} from "@/lib/db/object-kinds";
 import type {
   ActiveSessionDetails,
   Container,
@@ -164,7 +169,11 @@ const GENERATED_DATABASES: ReadonlySet<string> = new Set(["system", "information
 const SCHEMA_REFRESH_PATTERN = "^\\s*(CREATE|DROP|ALTER|RENAME|UNDROP|TRUNCATE|REPLACE)\\b";
 
 /** How `assertContainerPathShape` and `assertObjectPathShape` name this engine in a refusal. */
-const CONTAINER_ENGINE = { code: DATABEND, label: "A Databend", shapeNames: "label" } as const;
+const DATABEND_CONTAINER_PATH_ENGINE: ContainerPathShapeEngine = {
+  code: DATABEND,
+  label: "A Databend",
+  shapeNames: "label",
+};
 const OBJECT_ENGINE = { code: DATABEND, label: "A Databend", attachedSegment: "required" } as const;
 
 /** One relation kind of design 2.4: columns and source, no row or source writes. */
@@ -530,7 +539,7 @@ export class DatabendProvider extends SQLBaseProvider {
   // ==========================================================================
 
   private container(container: readonly string[]): DatabendContainer {
-    assertContainerPathShape(this.getCapabilities(), container, CONTAINER_ENGINE);
+    assertContainerPathShape(this.getCapabilities(), container, DATABEND_CONTAINER_PATH_ENGINE);
     return { catalog: container[0], database: container[1] };
   }
 
