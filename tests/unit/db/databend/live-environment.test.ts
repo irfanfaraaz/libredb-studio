@@ -1070,6 +1070,26 @@ describe("the captures under tests/fixtures/databend", () => {
     }
   });
 
+  test("every query after a scenario's first carries the newest session an answer held since the last logout", () => {
+    const root = path.join(ROOT, "tests/fixtures/databend");
+    const findings: string[] = [];
+    for (const run of readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+      for (const file of readdirSync(path.join(root, run.name)).filter((name) => name !== "manifest.json")) {
+        const capture = JSON.parse(readFileSync(path.join(root, run.name, file), "utf8")) as DatabendCapture;
+        let newest: unknown;
+        let queries = 0;
+        capture.exchanges.forEach(({ step, request, response }, index) => {
+          if (step === "query" && queries++ > 0 && !Bun.deepEquals(request.body?.session, newest))
+            findings.push(`${run.name}/${file} exchange ${index} carries ${JSON.stringify(request.body?.session)}`);
+          const answered = (response.body as { session?: unknown } | null)?.session;
+          if (step === "logout") newest = undefined;
+          else if (answered !== null && answered !== undefined) newest = answered;
+        });
+      }
+    }
+    expect(findings).toEqual([]);
+  });
+
   test("each replayed capture is sent as its local scenario sends it and shows what that scenario expects", () => {
     expect(real.captures.length).toBeGreaterThan(0);
     clean(captureFindings(real));

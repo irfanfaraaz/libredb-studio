@@ -12,7 +12,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9"
         },
         "body": {
           "sql": "CREATE TEMP TABLE ev_ddl (a INT, b VARCHAR)",
@@ -29,7 +29,7 @@
           "x-databend-query-id": "<query-6>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9",
           "x-databend-session-id": "<session-1>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -82,7 +82,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 12
+            "running_time_ms": 9
           },
           "stats_uri": "/v1/query/<query-6>",
           "final_uri": "/v1/query/<query-6>/final",
@@ -101,7 +101,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9"
         },
         "dropped": []
       },
@@ -112,7 +112,7 @@
           "x-databend-query-id": "<query-6>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9",
           "x-databend-session-id": "<session-1>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -156,7 +156,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 12
+            "running_time_ms": 9
           },
           "stats_uri": "/v1/query/<query-6>",
           "final_uri": "/v1/query/<query-6>/final",
@@ -175,7 +175,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9"
         },
         "body": {},
         "dropped": []
@@ -184,7 +184,7 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMDh9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTE-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTB9",
           "x-databend-session-id": "<session-1>",
           "x-databend-version": "1.2.951-nightly"
         },

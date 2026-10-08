@@ -304,7 +304,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 136
+            "running_time_ms": 79
           },
           "stats_uri": "/v1/query/<query-3>",
           "final_uri": "/v1/query/<query-3>/final",
@@ -483,7 +483,7 @@
               "file_nums": 0,
               "bytes": 0
             },
-            "running_time_ms": 136
+            "running_time_ms": 79
           },
           "stats_uri": "/v1/query/<query-3>",
           "final_uri": "/v1/query/<query-3>/final",

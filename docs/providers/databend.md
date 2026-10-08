@@ -21,7 +21,7 @@ This document is the single reference point for the provider: design, architectu
 | **Transactions** | Not exposed: a transaction a statement leaves open is rolled back when the statement ends ([3.5](#35-what-a-statement-leaves-open-is-closed)) |
 | **Maintenance** | `kill` only: `KILL QUERY` on a session id from the Sessions panel ([8](#8-maintenance)) |
 | **Query cancellation** | Yes: Stop sends the statement's kill link and reports a cancel only when the kill answered ([5.8](#58-cancellation-and-deadlines)) |
-| **Verified against** | `datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b`, the pinned image of the local fixture (`version()` answers `v1.2.951-nightly-9b7eeff9a8`), and the version floor `datafuselabs/databend:v1.2.881@sha256:847b20b0cfbadaa8dd87fc5c023db1d07042e9be6231dfc8303e75feefd94bf8` (`v1.2.881-ca29960f5c`), each run by digest through the live check on 2026-10-08 ([11.3](#113-the-live-check)). Databend Cloud: probed on 2026-10-08 on a throwaway test tenant, which runs `1.2.951-nightly-9b7eeff9a8`, the pinned build: paging through the gateway, the session and query ids, the error envelopes and the monitoring grants were measured ([4.4](#44-databend-cloud-warehouse-cold-start-and-billing)); a cold start, paging on a multi-node warehouse, the billed request count, a warehouse name with `_` and a plain-HTTP request are not run yet |
+| **Verified against** | `datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b`, the pinned image of the local fixture (`version()` answers `v1.2.951-nightly-9b7eeff9a8`), and the version floor `datafuselabs/databend:v1.2.881@sha256:847b20b0cfbadaa8dd87fc5c023db1d07042e9be6231dfc8303e75feefd94bf8` (`v1.2.881-ca29960f5c`), each run by digest through the live check on 2026-10-08 ([11.3](#113-the-live-check)). Databend Cloud: on 2026-10-08 a throwaway test tenant running `1.2.951-nightly-9b7eeff9a8`, the pinned build, passed the live check through its gateway, 22 of 22 checks with the cold start skipped, and all 18 evidence scenarios ([11.3](#113-the-live-check)); one resume was timed outside Studio ([4.4](#44-databend-cloud-warehouse-cold-start-and-billing)), and a cold start through Studio, paging on a multi-node warehouse, the billed request count, a warehouse name with `_` and a plain-HTTP request are not run yet |
 | **Source** | [`src/lib/db/providers/sql/databend/`](../../src/lib/db/providers/sql/databend/) and [`src/lib/explain/databend-text.ts`](../../src/lib/explain/databend-text.ts) |
 | **Tests** | [`tests/integration/db/databend-provider.test.ts`](../../tests/integration/db/databend-provider.test.ts) + [`tests/unit/db/databend/`](../../tests/unit/db/databend/) + [`tests/unit/lib/explain/databend-text.test.ts`](../../tests/unit/lib/explain/databend-text.test.ts) |
 
@@ -335,6 +335,9 @@ A valid sign-in that may not run a statement is refused 403 `ForbiddenAccessUser
 No `Authorization` reaching the gateway is 401 `AuthorizationRequired`; Studio always sends one (section 3.9), so something in between dropped it:
 
 > No sign-in reached Databend Cloud: a proxy between Studio and Databend may drop the Authorization header.
+
+After the warehouse was suspended in the console, the first `SELECT 1` from a plain HTTP client answered in 4.33 s and the next two in 0.19 s each: the gateway held the POST while the warehouse resumed, with no 503, 429 or `ProvisionWarehouseTimeout` (measured, C2).
+A user granted only its own database is refused `USE default` and `USE system` there (1063), so set Database to that database.
 
 ### 4.5 Connect-time cautions
 
@@ -690,7 +693,7 @@ bun run test
 `tests/live/databend-live-check.ts --target <name>` runs every scenario through a real `DatabendProvider` against a running server, and writes only to `studio_demo`.
 On 2026-10-08 it passed 22 of 22 checks on the pinned v1.2.951-nightly and 21 of 21 on v1.2.881, by digest; the cold start was skipped on both, since it needs a warehouse to suspend, and the materialized-view check on v1.2.881, which has none.
 It covered DDL, DML and MERGE in `studio_demo`; 100,000 rows over 10 pages; a statement past the 16 MiB budget of answer text cut and marked limited; Load More; an unknown table and a syntax error with its position; a wrong password latched so that a second instance sent no request; a cancel and a server deadline, each with one kill answered 200; a lone `BEGIN` rolled back; `USE` and the session echo; the seven pinned settings echoed as sent; a least-privilege user refused a write; the tree, columns and DDL of a table, a materialized view and a view over a dropped table; and the every-type export replay of section 5.7.
-On Databend Cloud the probes of section 4.4 ran on a test tenant; a suspended warehouse's cold start, multi-node paging and the budgets through the gateway are not run yet.
+On Databend Cloud, on 2026-10-08, it passed 22 of 22 checks on a test tenant of the same build through the gateway, the 100,000 rows and the 16 MiB budget included, as a user that owns `studio_demo` through its role; the cold start was skipped, since the tenant's SQL user may not suspend its warehouse, and multi-node paging is not run yet.
 [`docker/databend/README.md`](../../docker/databend/README.md) has the commands, the floor build's included.
 
 ## 12. Usage examples
@@ -731,6 +734,8 @@ curl -sS -u "$DATABEND_USER:$DATABEND_PASSWORD" -H 'content-type: application/js
 ```
 
 On a server of your own, create a SQL user with `CREATE USER <name> IDENTIFIED BY '<password>'` and grant it what Studio should reach; serve TLS on the HTTP handler whenever Studio is not on the same machine.
+Create the objects a least-privilege user reads from a session whose current role is not `public`: an object is owned by the role that was current when it was created, and every user holds `public`, so every user may write what `public` owns.
+On the Databend Cloud test tenant, a database and tables created as `cloudapp`, whose current role was `public`, were writable by a user granted only `SELECT` (measured 2026-10-08).
 
 ### 12.3 A seed connection
 
@@ -782,7 +787,7 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - The monitoring panels and sums cover the default catalog only.
 - The SQL INSERT export cannot write `Array`, `Map`, `Tuple`, `Bitmap`, `Interval`, geo or `Vector` values: each such row is skipped by name.
 - A kill stops the session's current statement, not the session: a session of another client, such as BendSQL, runs its next statement.
-- Every budget was verified locally; through Databend Cloud's gateway only paging was measured, and a cold start and multi-node paging are not run yet.
+- Every budget was verified locally and through Databend Cloud's gateway on one warehouse; a cold start through Studio and multi-node paging are not run yet.
 - A seed edited to add a Warehouse while it is open keeps its pulse until the page is reloaded ([U97](../BACKLOG.md)).
 - Driver-based SQL providers hold a whole result with no cell or byte budget, which Databend's provider has ([D247](../BACKLOG.md)), and the pulse of other engines resends a refused password, which the latch prevents here ([D248](../BACKLOG.md)).
 

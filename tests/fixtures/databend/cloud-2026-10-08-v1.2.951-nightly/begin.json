@@ -12,7 +12,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9"
         },
         "body": {
           "sql": "BEGIN",
@@ -29,7 +29,7 @@
           "x-databend-query-id": "<query-12>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9",
           "x-databend-session-id": "<session-4>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -101,7 +101,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9"
         },
         "dropped": []
       },
@@ -112,7 +112,7 @@
           "x-databend-query-id": "<query-12>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9",
           "x-databend-session-id": "<session-4>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -175,12 +175,22 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9"
         },
         "body": {
           "sql": "ROLLBACK",
           "pagination": {
             "wait_time_secs": 10
+          },
+          "session": {
+            "catalog": "default",
+            "database": "default",
+            "role": "studio_rw",
+            "settings": {},
+            "txn_state": "Active",
+            "need_sticky": true,
+            "need_keep_alive": true,
+            "internal": "{\"last_node_id\":\"<node-1>\",\"last_query_ids\":[\"<query-12>\"]}"
           }
         },
         "dropped": []
@@ -192,7 +202,7 @@
           "x-databend-query-id": "<query-13>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9",
           "x-databend-session-id": "<session-4>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -264,7 +274,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9"
         },
         "dropped": []
       },
@@ -275,7 +285,7 @@
           "x-databend-query-id": "<query-13>",
           "x-databend-query-page-rows": "0",
           "x-databend-query-state": "Succeeded",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9",
           "x-databend-session-id": "<session-4>",
           "x-databend-version": "1.2.951-nightly"
         },
@@ -338,7 +348,7 @@
           "content-type": "application/json",
           "x-databend-warehouse": "default",
           "x-databend-client-caps": "session_header",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9"
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9"
         },
         "body": {},
         "dropped": []
@@ -347,7 +357,7 @@
         "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8",
-          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjIzMTF9",
+          "x-databend-session": "eyJpZCI6IjxzZXNzaW9uLTQ-IiwibGFzdF9yZWZyZXNoX3RpbWUiOjE3OTE0MjQ3NTN9",
           "x-databend-session-id": "<session-4>",
           "x-databend-version": "1.2.951-nightly"
         },

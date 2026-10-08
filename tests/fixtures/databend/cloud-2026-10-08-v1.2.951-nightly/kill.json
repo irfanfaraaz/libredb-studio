@@ -64,8 +64,8 @@
           },
           "stats": {
             "scan_progress": {
-              "rows": 4307156992,
-              "bytes": 34457255936
+              "rows": 5377622016,
+              "bytes": 43020976128
             },
             "write_progress": {
               "rows": 0,

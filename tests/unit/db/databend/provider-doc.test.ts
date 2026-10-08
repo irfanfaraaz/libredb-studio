@@ -123,6 +123,23 @@ const FLAT_DOC = flat(DOC);
 const MIB = 1024 * 1024;
 
 /** The section under the heading line `heading`, up to the next heading of its level or above. */
+/** The Cloud acceptance's capture run (plan section 7), which the replay does not read. */
+const CLOUD_CAPTURE_RUN = "cloud-2026-10-08-v1.2.951-nightly";
+
+interface CloudManifest {
+  readonly target: string;
+  readonly uncommitted: readonly string[];
+  readonly serverVersion: string;
+  readonly capturedAt: string;
+  readonly scenarios: readonly { readonly name: string; readonly result: string }[];
+}
+
+function loadCloudManifest(): CloudManifest {
+  return JSON.parse(
+    readFileSync(path.join(ROOT, "tests/fixtures/databend", CLOUD_CAPTURE_RUN, "manifest.json"), "utf8"),
+  ) as CloudManifest;
+}
+
 function sectionOf(text: string, heading: string): string {
   const lines = text.split("\n");
   const start = lines.indexOf(heading);
@@ -308,12 +325,36 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     const floor = /datafuselabs\/databend:(v1\.2\.881@sha256:[0-9a-f]{64})/.exec(FIXTURE_README)?.[1];
     expect(floor).toBeDefined();
     expect(verified).toContain(`\`datafuselabs/databend:${floor}\``);
-    // The Cloud probes of 2026-10-08 (I19) ran on a test tenant on the pinned build; the rest of the acceptance did not.
+    // The Cloud acceptance of plan section 7 ran through the provider on a test tenant of the pinned build; its
+    // evidence is the committed capture run, so the date, the build and the scenario count are read from its manifest.
+    const cloud = loadCloudManifest();
+    expect(cloud.target).toBe("cloud");
+    expect(cloud.uncommitted).toEqual([]);
+    expect(cloud.scenarios.every((scenario) => scenario.result === "pass")).toBe(true);
+    const build = /^Databend Query v(\d+\.\d+\.\d+-nightly-[0-9a-f]+)\(/.exec(cloud.serverVersion)?.[1];
+    expect(build).toBe("1.2.951-nightly-9b7eeff9a8");
     expect(verified).toContain(
-      "Databend Cloud: probed on 2026-10-08 on a throwaway test tenant, which runs `1.2.951-nightly-9b7eeff9a8`, the pinned build",
+      `Databend Cloud: on ${cloud.capturedAt} a throwaway test tenant running \`${build}\`, the pinned build, passed the live check through its gateway, 22 of 22 checks with the cold start skipped, and all ${cloud.scenarios.length} evidence scenarios`,
     );
     expect(verified).toContain("not run yet");
     expect(RESULT_MODE_FLOOR).toBe("v1.2.881");
+  });
+
+  test("the Cloud results the doc states are the ones measured", () => {
+    const cloudSection = flat(sectionOf(DOC, "### 4.4 Databend Cloud: warehouse, cold start and billing"));
+    // C2 (I19): the one resume timed, with a plain HTTP client, after the warehouse was suspended in the console.
+    expect(cloudSection).toContain("answered in 4.33 s");
+    expect(cloudSection).toContain("(1063)");
+    const live = flat(sectionOf(DOC, "### 11.3 The live check"));
+    expect(live).toContain(`On Databend Cloud, on ${loadCloudManifest().capturedAt}, it passed 22 of 22 checks`);
+    expect(live).not.toContain("budgets through the gateway are not run yet");
+    // D14c: an object created while the current role is `public` is owned by `public`, which every user holds.
+    expect(flat(sectionOf(DOC, "### 12.2 Running Databend for Studio"))).toContain(
+      "whose current role is not `public`",
+    );
+    const limits = flat(sectionOf(DOC, "## 13. Known limitations"));
+    expect(limits).not.toContain("only paging was measured");
+    expect(limits).toContain("a cold start through Studio and multi-node paging are not run yet");
   });
 
   test("the programmatic example names the factory's entry point and no line of it", () => {
