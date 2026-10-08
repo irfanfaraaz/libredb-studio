@@ -2,7 +2,7 @@
  * The evidence scrub of the Databend harness (design 8, C23): what tests/live/databend-evidence.ts may write under
  * tests/fixtures/databend/. Only allow-listed fields and headers are kept; query, session and node ids, IP addresses,
  * user names and the tenant become stable placeholders; and no file is written while any of them holds a secret
- * form, the host, the tenant, the warehouse, an email address or the egress IP.
+ * form, the host, the tenant, the warehouse, the region, an email address or the egress IP.
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -11,6 +11,7 @@ import {
   EvidenceScrubber,
   type EvidenceSecrets,
   type RawExchange,
+  redactForTerminal,
 } from "../../../helpers/databend-evidence-scrub";
 
 const QUERY = "01a1187f71477350a2d078634d6b91c7";
@@ -31,6 +32,7 @@ const CLOUD: EvidenceSecrets = {
   host: "tn3ftqihs--ingest.gw.aws-us-east-2.default.databend.com",
   tenant: "tn3ftqihs",
   warehouse: "ingest",
+  region: "aws-us-east-2",
   egressIp: "203.0.113.7",
 };
 
@@ -132,6 +134,24 @@ describe("the allow-list", () => {
     ]);
   });
 
+  test("keeps the warehouse header, the tenant's own warehouse as <warehouse> and any other name as sent", () => {
+    const sent = (warehouse: string): RawExchange => {
+      const raw = exchange();
+      return {
+        ...raw,
+        request: { ...raw.request, headers: { ...raw.request.headers, "X-Databend-Warehouse": warehouse } },
+      };
+    };
+    const scrubber = new EvidenceScrubber(CLOUD);
+    expect(scrubber.exchange(sent("ingest")).request.headers["x-databend-warehouse"]).toBe("<warehouse>");
+    expect(scrubber.exchange(sent("studio_no_such_wh")).request.headers["x-databend-warehouse"]).toBe(
+      "studio_no_such_wh",
+    );
+    const stock = new EvidenceScrubber({ ...CLOUD, warehouse: "default" });
+    expect(stock.exchange(sent("default")).request.headers["x-databend-warehouse"]).toBe("default");
+    expect(scrubber.exchange(exchange()).request.headers).not.toHaveProperty("x-databend-warehouse");
+  });
+
   test("keeps the named body fields, nested ones included, and lists the names it dropped", () => {
     const scrubbed = new EvidenceScrubber(SECRETS).exchange(exchange());
     const body = scrubbed.response.body as Record<string, unknown>;
@@ -149,6 +169,13 @@ describe("the allow-list", () => {
     expect(scrubbed.response.body).toEqual({
       error: { code: 5100, message: "Authentication failed: incorrect password" },
     });
+  });
+
+  test("keeps the Databend Cloud gateway's kind, nested under error with its message (I19)", () => {
+    const body = JSON.stringify({ error: { kind: "BadWarehouse", message: "bad warehouse", trace: "dropped" } });
+    const scrubbed = new EvidenceScrubber(SECRETS).exchange(exchange(body));
+    expect(scrubbed.response.body).toEqual({ error: { kind: "BadWarehouse", message: "bad warehouse" } });
+    expect(scrubbed.response.dropped).toEqual(["error.trace"]);
   });
 
   test("keeps a body that is not JSON as text, through the same placeholders", () => {
@@ -249,6 +276,7 @@ describe("nothing is written on a leak", () => {
     ["host", (CLOUD.host as string).toUpperCase()],
     ["tenant", "TN3FTQIHS"],
     ["warehouse", "ingest"],
+    ["region", "AWS-US-EAST-2"],
     ["email", "someone@example.com"],
     ["egress IP", "203-0-113-7"],
   ];
@@ -289,8 +317,51 @@ describe("nothing is written on a leak", () => {
     expect(rendered["manifest.json"]).toBe('{\n  "ok": true\n}\n');
   });
 
+  test("a warehouse named default, Databend Cloud's stock name, is not looked for, since every catalog is named so", () => {
+    const scrubber = new EvidenceScrubber({ ...CLOUD, warehouse: "default" });
+    const rendered = scrubber.render({ "a.json": { catalog: "default", database: "DEFAULT" } });
+    expect(rendered["a.json"]).toContain('"catalog": "default"');
+    expect(leakOf(() => scrubber.render({ "b.json": { seen: CLOUD.host } })).findings).toContain(
+      "b.json holds the host",
+    );
+  });
+
   test("a local run without cloud names checks only the credentials and email addresses", () => {
     const scrubber = new EvidenceScrubber(SECRETS);
     expect(scrubber.render({ "a.json": { word: "ingest" } })["a.json"]).toContain("ingest");
+  });
+});
+
+describe("a line for the operator's terminal", () => {
+  test("names no password, credential, host, tenant, region, warehouse or egress IP, in any case", () => {
+    const line = [
+      `getaddrinfo ENOTFOUND ${CLOUD.host}`,
+      "Hostname/IP does not match certificate's altnames: DNS:*.gw.AWS-US-EAST-2.default.databend.com",
+      `tenant TN3FTQIHS, warehouse ingest, password ${PASSWORD}`,
+      `Basic ${Buffer.from(`studio_reader:Reader123pass!`).toString("base64")}`,
+      "from 203.0.113.7",
+    ].join("\n");
+    const redacted = redactForTerminal(line, CLOUD);
+    for (const value of [
+      CLOUD.host as string,
+      "tn3ftqihs",
+      "aws-us-east-2",
+      "ingest",
+      PASSWORD,
+      "Reader123pass!",
+      Buffer.from(`studio_reader:Reader123pass!`).toString("base64"),
+      "203.0.113.7",
+    ])
+      expect(redacted.toLowerCase()).not.toContain(value.toLowerCase());
+    expect(redacted).toContain("getaddrinfo ENOTFOUND <host>");
+    expect(redacted).toContain("DNS:*.gw.<region>.default.databend.com");
+    expect(redacted).toContain("tenant <tenant>, warehouse <warehouse>, password <password>");
+  });
+
+  test("leaves the stock warehouse name default and a local run's text alone", () => {
+    expect(redactForTerminal("catalog default", { ...CLOUD, warehouse: "default" })).toBe("catalog default");
+    expect(redactForTerminal("connect ECONNREFUSED 127.0.0.1:8000", SECRETS)).toBe(
+      "connect ECONNREFUSED 127.0.0.1:8000",
+    );
   });
 });

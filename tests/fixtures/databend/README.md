@@ -6,8 +6,10 @@ The Databend transport tests and the replay read these files; no test here reach
 ## Where they come from
 
 `tests/live/databend-evidence.ts --target local` runs every scenario of `tests/live/databend-evidence-plan.ts` against the `databend-http` fixture of `docker/databend/README.md` and writes `<target>-<date>-v<version>/<scenario>.json` for each, plus `manifest.json`.
+`--target cloud` runs the same list against a Databend Cloud tenant set up as plan section 7 says, over HTTPS on 443 with the system trust store, through `scenariosFor("cloud")`: every name of `libredb_demo` reads `studio_demo`, three scenarios run on Cloud only, and a gateway refusal is checked as the gateway wraps it.
+Its inputs come from the environment only, never from a file of this repository: `DATABEND_CLOUD_HOST`, `DATABEND_CLOUD_PORT` and `DATABEND_CLOUD_WAREHOUSE`, and the user and password pairs `DATABEND_CLOUD_STUDIO_*`, `DATABEND_CLOUD_RO_*` and `DATABEND_CLOUD_SCRATCH_*`, plus `DATABEND_CLOUD_USER` and `DATABEND_CLOUD_PASSWORD` when set, which only the scrub reads.
 The date is the UTC day of the run and the version is the server's `x-databend-version` header.
-`manifest.json` names the target, the Studio commit the harness ran from, the harness files (`database-compose.yml`, `docker/databend/`, the plan, the scrub and the harness) that differ from that commit or are not in it, the image as `tag@digest`, the answer of `SELECT version()`, the date, and each scenario's result, time in milliseconds and number of exchanges.
+`manifest.json` names the target, the Studio commit the harness ran from, the harness files (`database-compose.yml`, `docker/databend/`, the plan, the scrub and the harness) that differ from that commit or are not in it, the image as `tag@digest` (on Cloud, `Databend Cloud`, with a `region` field that is always the placeholder `<region>`), the answer of `SELECT version()`, the date, and each scenario's result, time in milliseconds and number of exchanges.
 A capture whose `uncommitted` list is not empty is not reproducible from its commit alone; capture again from the commit that holds those files.
 A scenario whose answers do not show what the plan expects stops the run, and nothing is written.
 
@@ -17,11 +19,15 @@ A body that is not JSON, such as the empty answer to a kill, is kept as `{"text"
 ## The scrub
 
 Every exchange passes through `tests/helpers/databend-evidence-scrub.ts` before it is written (C23).
-Only the named request headers (`content-type`, `x-databend-client-caps`, `x-databend-session`, `x-databend-query-id`), the named answer headers (`content-type` and the `x-databend-query-*`, `x-databend-session*` and `x-databend-version` headers) and the named fields of the request and of the answer are kept; `dropped` lists the field names that were not.
+Only the named request headers (`content-type`, `x-databend-client-caps`, `x-databend-session`, `x-databend-query-id`, `x-databend-warehouse`), the named answer headers (`content-type` and the `x-databend-query-*`, `x-databend-session*` and `x-databend-version` headers) and the named fields of the request and of the answer are kept; `dropped` lists the field names that were not.
 `authorization`, cookies and dates never reach a file.
 Query, session and node ids become `<query-N>`, `<session-N>` and `<node-N>`, the same placeholder for the same id across every file of a run, inside links, `session.internal` and the base64 `x-databend-session` header too, which is encoded again with its `=` padding so a replay can send it.
-IP addresses become `<ip-N>`, user names `<user-N>` (`<user-1>` is the default user `libredb`, `<user-2>` is `studio_reader`) and a Cloud tenant `<tenant>`.
-The harness writes nothing at all while any file holds a password or a `user:password`, raw, percent-encoded in either case, form-encoded or in standard or URL-safe base64 with or without padding, the host, the tenant, the warehouse, an email address or the egress IP, decoded base64 included.
+IP addresses become `<ip-N>`, user names `<user-N>` and a Cloud tenant `<tenant>`.
+Locally `<user-1>` is the default user `libredb` and `<user-2>` is `studio_reader`; on Cloud `<user-1>` is `studio`, `<user-2>` is `studio_reader` and `<user-3>` is `studio_scratch`, the user the wrong password is sent for.
+The `x-databend-warehouse` request header shows what each Cloud request named: the tenant's own warehouse becomes `<warehouse>`, while the stock name `default` and the plan's unknown `studio_no_such_wh` are kept as sent, and `no-warehouse` sends none.
+The harness writes nothing at all while any file holds a password or a `user:password`, raw, percent-encoded in either case, form-encoded or in standard or URL-safe base64 with or without padding, the host, the tenant, the warehouse, the region, an email address or the egress IP, decoded base64 included.
+A warehouse named `default`, Databend Cloud's stock name, is not looked for, since every catalog a capture shows is named so; the host still carries the tenant and the region, and they are.
+An error the harness stops on is printed with the same names replaced, so a DNS or TLS failure does not show the host on the terminal either.
 
 ## The scenarios
 
@@ -38,9 +44,14 @@ The harness writes nothing at all while any file holds a password or a `user:pas
 | `begin` | `BEGIN` answering `txn_state: Active`, then `ROLLBACK` answering `AutoCommit` |
 | `session-echo` | Pinned session settings echoed back, the unknown `no_such_setting` dropped from the echo |
 | `error-position` | An in-body 1005 over HTTP 200 whose message carries `--> SQL:1:10` |
-| `auth-401` | A wrong password: HTTP 401 with 5100 |
+| `auth-401` | A wrong password: HTTP 401 with 5100; on Cloud the gateway's `AuthorizationFailed` envelope, with the 5100 in its message |
 | `kill` | A running query, its kill (an empty 200), and the 400 its next page answers afterwards |
 | `final` | A query closed by its final link after the first of three pages, and the 400 its next page answers afterwards |
 | `reader` | `studio_reader` reading `libredb_demo` as `studio_ro` |
+| `no-warehouse` | Cloud only: no `x-databend-warehouse` header, refused by the gateway with HTTP 400 and `error.kind` `WarehouseHeaderRequired` |
+| `unknown-warehouse` | Cloud only: `x-databend-warehouse: studio_no_such_wh`, refused with HTTP 400 and `error.kind` `BadWarehouse`, the name in the message |
+| `forbidden` | Cloud only: `SHOW WAREHOUSES` as `studio`, refused with HTTP 403 and `error.kind` `ForbiddenAccessUser` |
+
+The answer's `error` keeps `code`, `kind`, `message` and `detail`: the Cloud gateway's own refusals carry a `kind` and no `code` (I19).
 
 The temporary tables are the harness's only writes, and they end with their client session.

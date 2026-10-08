@@ -1,0 +1,123 @@
+{
+  "target": "cloud",
+  "studioCommit": "133811ed337d25d06ef79badcf67d117026e4258",
+  "uncommitted": [
+    "tests/helpers/databend-evidence-scrub.ts",
+    "tests/live/databend-evidence-plan.ts",
+    "tests/live/databend-evidence.ts"
+  ],
+  "image": "Databend Cloud",
+  "region": "<region>",
+  "serverVersion": "Databend Query v1.2.951-nightly-9b7eeff9a8(rust-1.100.0-nightly-2026-10-04T22:15:22.302305300Z)",
+  "capturedAt": "2026-10-08",
+  "scenarios": [
+    {
+      "name": "version",
+      "result": "pass",
+      "ms": 380,
+      "exchanges": 2
+    },
+    {
+      "name": "select-pages",
+      "result": "pass",
+      "ms": 736,
+      "exchanges": 4
+    },
+    {
+      "name": "every-type",
+      "result": "pass",
+      "ms": 516,
+      "exchanges": 2
+    },
+    {
+      "name": "show-create-every-type",
+      "result": "pass",
+      "ms": 398,
+      "exchanges": 2
+    },
+    {
+      "name": "show-create-materialized-view",
+      "result": "pass",
+      "ms": 385,
+      "exchanges": 2
+    },
+    {
+      "name": "ddl",
+      "result": "pass",
+      "ms": 606,
+      "exchanges": 3
+    },
+    {
+      "name": "dml",
+      "result": "pass",
+      "ms": 1268,
+      "exchanges": 5
+    },
+    {
+      "name": "temp-table-logout",
+      "result": "pass",
+      "ms": 1472,
+      "exchanges": 6
+    },
+    {
+      "name": "begin",
+      "result": "pass",
+      "ms": 944,
+      "exchanges": 5
+    },
+    {
+      "name": "session-echo",
+      "result": "pass",
+      "ms": 568,
+      "exchanges": 3
+    },
+    {
+      "name": "error-position",
+      "result": "pass",
+      "ms": 365,
+      "exchanges": 2
+    },
+    {
+      "name": "auth-401",
+      "result": "pass",
+      "ms": 192,
+      "exchanges": 1
+    },
+    {
+      "name": "kill",
+      "result": "pass",
+      "ms": 1568,
+      "exchanges": 3
+    },
+    {
+      "name": "final",
+      "result": "pass",
+      "ms": 562,
+      "exchanges": 3
+    },
+    {
+      "name": "reader",
+      "result": "pass",
+      "ms": 432,
+      "exchanges": 2
+    },
+    {
+      "name": "no-warehouse",
+      "result": "pass",
+      "ms": 174,
+      "exchanges": 1
+    },
+    {
+      "name": "unknown-warehouse",
+      "result": "pass",
+      "ms": 179,
+      "exchanges": 1
+    },
+    {
+      "name": "forbidden",
+      "result": "pass",
+      "ms": 180,
+      "exchanges": 1
+    }
+  ]
+}

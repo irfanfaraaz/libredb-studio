@@ -12,10 +12,19 @@
  * The harness never writes to the fixture: a scenario changes nothing but a temporary table it created in its own
  * client session, which ends with the session; the live-environment test holds that rule. `expect` is what the
  * scenario's answers must show, checked before anything is written.
+ *
+ * The Cloud target of plan section 7 runs the same list through `scenariosFor("cloud")`: the tenant has no
+ * `libredb_demo`, so every name of it reads `studio_demo`, where the Cloud setup put the fixture's objects; a scenario
+ * with `targets` runs only on those; and `cloudExpect`, where a scenario has one, replaces `expect`, since the
+ * gateway wraps a refusal in an envelope of its own (I19). `warehouse` says what a Cloud scenario sends as
+ * `x-databend-warehouse` instead of the tenant's warehouse: nothing, or a name the tenant does not have.
  */
 
 /** `default` is the server's default user, `reader` the least-privilege `studio_reader`, `wrong` a bad password. */
 export type EvidencePrincipal = "default" | "reader" | "wrong";
+
+/** The local `databend-http` fixture, or the Databend Cloud tenant of plan section 7. */
+export type EvidenceTarget = "local" | "cloud";
 
 export interface EvidencePagination {
   readonly wait_time_secs: number;
@@ -38,6 +47,8 @@ export interface EvidenceExpectation {
   readonly status?: number;
   /** The error code of the first answer, in-body or not. */
   readonly code?: number;
+  /** The Databend Cloud gateway's kind of the first answer, nested under `error` (I19). */
+  readonly kind?: string;
   /** Text the first answer's error message holds. */
   readonly message?: string;
   /** The `txn_state` of each query step's first answer, in order. */
@@ -65,7 +76,19 @@ export interface EvidenceScenario {
   readonly clientSession: boolean;
   readonly steps: readonly EvidenceStep[];
   readonly expect: EvidenceExpectation;
+  /** The targets the scenario runs on; every target when absent. */
+  readonly targets?: readonly EvidenceTarget[];
+  /** What the Cloud gateway's answers show instead of `expect`. */
+  readonly cloudExpect?: EvidenceExpectation;
+  /** On Cloud: send no `x-databend-warehouse`, or a warehouse the tenant does not have, instead of its own. */
+  readonly warehouse?: "omit" | "unknown";
 }
+
+/** The database the fixture reads locally, and where the Cloud setup of plan section 7 put the same objects. */
+const LOCAL_DEMO = "libredb_demo";
+export const CLOUD_DEMO_DATABASE = "studio_demo";
+/** A warehouse no tenant is given: Cloud warehouse names are chosen by their owner, and this one is the harness's. */
+export const UNKNOWN_WAREHOUSE = "studio_no_such_wh";
 
 const WAIT = { wait_time_secs: 10 } as const;
 const PAGED = { wait_time_secs: 10, max_rows_per_page: 10 } as const;
@@ -210,6 +233,8 @@ export const EVIDENCE_SCENARIOS: readonly EvidenceScenario[] = [
     clientSession: false,
     steps: [{ kind: "query", sql: "SELECT 1", pagination: WAIT }],
     expect: { status: 401, code: 5100 },
+    // The gateway's envelope wraps the query node's own 401 and its 5100 in the message (I19).
+    cloudExpect: { status: 401, kind: "AuthorizationFailed", message: "5100" },
   },
   {
     name: "kill",
@@ -243,4 +268,45 @@ export const EVIDENCE_SCENARIOS: readonly EvidenceScenario[] = [
     ],
     expect: { status: 200, state: "Succeeded", rows: 1 },
   },
+  {
+    name: "no-warehouse",
+    principal: "default",
+    clientSession: false,
+    targets: ["cloud"],
+    warehouse: "omit",
+    steps: [{ kind: "query", sql: "SELECT 1", pagination: WAIT }],
+    expect: { status: 400, kind: "WarehouseHeaderRequired" },
+  },
+  {
+    name: "unknown-warehouse",
+    principal: "default",
+    clientSession: false,
+    targets: ["cloud"],
+    warehouse: "unknown",
+    steps: [{ kind: "query", sql: "SELECT 1", pagination: WAIT }],
+    expect: { status: 400, kind: "BadWarehouse" },
+  },
+  {
+    name: "forbidden",
+    principal: "default",
+    clientSession: false,
+    targets: ["cloud"],
+    steps: [{ kind: "query", sql: "SHOW WAREHOUSES", pagination: WAIT }],
+    expect: { status: 403, kind: "ForbiddenAccessUser" },
+  },
 ];
+
+function onCloud(text: string): string {
+  return text.replace(new RegExp(`\\b${LOCAL_DEMO}\\b`, "g"), CLOUD_DEMO_DATABASE);
+}
+
+/** The scenarios that run on `target`, as that target runs them. */
+export function scenariosFor(target: EvidenceTarget): readonly EvidenceScenario[] {
+  const runs = EVIDENCE_SCENARIOS.filter((scenario) => scenario.targets?.includes(target) ?? true);
+  if (target === "local") return runs;
+  return runs.map((scenario) => {
+    // A scenario is plain JSON, so a copy through its text renames the database in every statement and session.
+    const copy = JSON.parse(onCloud(JSON.stringify(scenario))) as EvidenceScenario;
+    return Object.assign(copy, { expect: scenario.cloudExpect ?? scenario.expect });
+  });
+}

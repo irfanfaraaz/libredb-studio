@@ -13,7 +13,7 @@
  * plan mode refuses a superuser).
  *
  * The last block holds the write surface of tests/live/databend-*.ts: only `databend-live-check.ts` writes, and only
- * to `studio_demo` and `libredb_demo`; the evidence plan writes nothing but temporary tables it created in the same
+ * to `studio_demo` and `libredb_demo`, besides its own scratch user and that user's password policy; the evidence plan writes nothing but temporary tables it created in the same
  * scenario; every other file names no write.
  *
  * Each rule is a pure function from the parsed fixtures to a list of findings, so it is proven both ways: the real
@@ -24,7 +24,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import { parse as parseYaml } from "yaml";
-import { EVIDENCE_SCENARIOS, type EvidenceScenario } from "../../../live/databend-evidence-plan";
+import {
+  CLOUD_DEMO_DATABASE,
+  EVIDENCE_SCENARIOS,
+  type EvidenceScenario,
+  scenariosFor,
+} from "../../../live/databend-evidence-plan";
 
 const ROOT = path.resolve(import.meta.dir, "../../../..");
 const DATABEND_DIR = path.join(ROOT, "docker/databend");
@@ -372,16 +377,53 @@ const WRITE_WORDS =
 const WRITE_TARGET =
   /^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|REPLACE\s+INTO|TRUNCATE\s+TABLE|ALTER\s+TABLE|DROP\s+(?:TABLE|VIEW)|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW))\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(\S+)/i;
 
+/**
+ * The one principal the live check may create and drop besides its tables: S7's `studio_scratch`, under a password
+ * policy of its own, so a wrong password counts toward a lockout of that user only and never of `libredb` or
+ * `studio_reader`.
+ */
+const SCRATCH_PRINCIPAL = [
+  /^DROP (?:USER|PASSWORD POLICY) IF EXISTS studio_scratch(?:_policy)?$/,
+  /^CREATE PASSWORD POLICY studio_scratch_policy PASSWORD_MAX_RETRIES = \d+$/,
+  /^CREATE USER studio_scratch IDENTIFIED BY '\$\{\w+\}' WITH SET PASSWORD POLICY = 'studio_scratch_policy'$/,
+];
+
+/**
+ * The table argument of every `replay(...)` call: the export replay's INSERTs are built at run time, so no literal
+ * holds them, and the table they write is bounded here instead, as a `studio_demo.<name>` literal.
+ */
+function replayTargetsOf(name: string, text: string): string[] {
+  const source = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true);
+  const targets: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "replay") {
+      const table = node.arguments[3];
+      targets.push(table !== undefined && ts.isStringLiteral(table) ? table.text : (table?.getText(source) ?? ""));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return targets;
+}
+
+const REPLAY_TARGET = /^studio_demo\.\w+$/;
+
 function writeSurfaceFindings({ live }: DatabendFixtures): string[] {
   const findings: string[] = [];
   for (const [name, text] of Object.entries(live)) {
     if (name === PLAN) continue;
+    if (name === LIVE_CHECK)
+      for (const target of replayTargetsOf(name, text))
+        if (!REPLAY_TARGET.test(target))
+          findings.push(`tests/live/${LIVE_CHECK} replays an export into ${target}, not a studio_demo table literal`);
     for (const literal of literalsOf(name, text)) {
       if (!WRITE_WORDS.test(literal)) continue;
       if (name !== LIVE_CHECK) {
         findings.push(`tests/live/${name} names a write: ${literal.slice(0, 60)}`);
         continue;
       }
+      // A `DROP USER studio_scratch` must not pass as a `DROP` of the qualified name it does not have.
+      if (SCRATCH_PRINCIPAL.some((pattern) => pattern.test(literal))) continue;
       const target = WRITE_TARGET.exec(literal)?.[1];
       const database = target?.split(".")[0];
       if (
@@ -695,6 +737,63 @@ describe("the write surface of tests/live/databend-*.ts", () => {
     finds(writeSurfaceFindings(unparsed), "writes outside", "GRANT");
   });
 
+  test("databend-live-check.ts creates and drops only its own scratch user and that user's password policy", () => {
+    const scratch = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = [
+        'const a = "DROP USER IF EXISTS studio_scratch";',
+        'const b = "DROP PASSWORD POLICY IF EXISTS studio_scratch_policy";',
+        'const c = "CREATE PASSWORD POLICY studio_scratch_policy PASSWORD_MAX_RETRIES = 5";',
+        "const d = `CREATE USER studio_scratch IDENTIFIED BY '${p}' WITH SET PASSWORD POLICY = 'studio_scratch_policy'`;",
+      ].join("\n");
+    });
+    clean(writeSurfaceFindings(scratch));
+    const fixtureUser = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = 'const a = "DROP USER studio_reader";\n';
+    });
+    finds(writeSurfaceFindings(fixtureUser), "writes outside", "DROP USER studio_reader");
+    const defaultUser = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = "const a = `CREATE OR REPLACE USER libredb IDENTIFIED BY '${p}'`;\n";
+    });
+    finds(writeSurfaceFindings(defaultUser), "writes outside", "USER libredb");
+    const otherPolicy = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = 'const a = "CREATE PASSWORD POLICY strict PASSWORD_MAX_RETRIES = 1";\n';
+    });
+    finds(writeSurfaceFindings(otherPolicy), "writes outside", "POLICY strict");
+    const otherPolicyOnScratch = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] =
+        "const a = `CREATE USER studio_scratch IDENTIFIED BY '${p}' WITH SET PASSWORD POLICY = 'strict'`;\n";
+    });
+    finds(writeSurfaceFindings(otherPolicyOnScratch), "writes outside", "studio_scratch");
+    const grant = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = 'const a = "GRANT ROLE account_admin TO studio_scratch";\n';
+    });
+    finds(writeSurfaceFindings(grant), "writes outside", "GRANT ROLE");
+    const harness = planted(real, (draft) => {
+      draft.live["databend-evidence.ts"] += '\nconst sql = "DROP USER IF EXISTS studio_scratch";\n';
+    });
+    finds(writeSurfaceFindings(harness), "tests/live/databend-evidence.ts names a write");
+  });
+
+  test("every export replay of databend-live-check.ts writes into a studio_demo table named in a literal", () => {
+    const qualified = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] =
+        'await replay(admin, writer, "SELECT 1", "studio_demo.every_type_replay", "SELECT 1");\n';
+    });
+    clean(writeSurfaceFindings(qualified));
+    const unqualified = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = 'await replay(admin, writer, "SELECT 1", "every_type_replay", "SELECT 1");\n';
+    });
+    finds(writeSurfaceFindings(unqualified), "replays an export into every_type_replay");
+    const elsewhere = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = 'await replay(admin, writer, "SELECT 1", "libredb_demo.every_type", "SELECT 1");\n';
+    });
+    finds(writeSurfaceFindings(elsewhere), "replays an export into libredb_demo.every_type");
+    const computed = planted(real, (draft) => {
+      draft.live[LIVE_CHECK] = "await replay(admin, writer, sql, name, readBack);\n";
+    });
+    finds(writeSurfaceFindings(computed), "replays an export into name");
+  });
+
   test("the evidence plan writes only temporary tables it created in the same client session", () => {
     clean(planWriteFindings(real));
     const persistent = planted(real, (draft) => {
@@ -710,6 +809,40 @@ describe("the write surface of tests/live/databend-*.ts", () => {
       draft.scenarios[0].steps.push({ kind: "query", sql: "INSERT INTO t_unknown VALUES (1)" });
     });
     finds(planWriteFindings(otherTable), "writes: INSERT INTO t_unknown");
+  });
+});
+
+describe("the Cloud target of the evidence plan (plan section 7)", () => {
+  const cloud = scenariosFor("cloud");
+  const local = scenariosFor("local");
+
+  test("the local target runs every scenario that names no target, unchanged", () => {
+    expect(local).toEqual(EVIDENCE_SCENARIOS.filter((scenario) => scenario.targets === undefined));
+    expect(local.some((scenario) => scenario.warehouse !== undefined)).toBe(false);
+  });
+
+  test("on Cloud no statement and no session names libredb_demo, which the tenant does not have", () => {
+    const named = cloud.filter((scenario) => JSON.stringify(scenario.steps).includes("libredb_demo"));
+    expect(named.map((scenario) => scenario.name)).toEqual([]);
+    const echo = cloud.find((scenario) => scenario.name === "session-echo");
+    const first = echo?.steps[0];
+    expect(first?.kind === "query" ? first.session?.database : undefined).toBe(CLOUD_DEMO_DATABASE);
+  });
+
+  test("on Cloud a scenario expects the gateway's envelope where it has one, and its own expectation otherwise", () => {
+    const auth = cloud.find((scenario) => scenario.name === "auth-401");
+    expect(auth?.expect).toEqual({ status: 401, kind: "AuthorizationFailed", message: "5100" });
+    const version = cloud.find((scenario) => scenario.name === "version");
+    expect(version?.expect).toEqual(EVIDENCE_SCENARIOS[0].expect);
+  });
+
+  test("the warehouse refusals and the forbidden statement run on Cloud only", () => {
+    const only = cloud.filter((scenario) => scenario.targets !== undefined).map((scenario) => scenario.name);
+    expect(only).toEqual(["no-warehouse", "unknown-warehouse", "forbidden"]);
+    expect(cloud.filter((scenario) => scenario.warehouse !== undefined).map((scenario) => scenario.warehouse)).toEqual([
+      "omit",
+      "unknown",
+    ]);
   });
 });
 

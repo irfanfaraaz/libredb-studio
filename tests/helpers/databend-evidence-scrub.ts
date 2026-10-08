@@ -12,19 +12,25 @@
  * `render` turns a set of files into text and refuses the whole set, writing nothing, while any file holds a secret
  * form (each password, raw, percent-encoded in any case, form-encoded or in standard or URL-safe base64 with or
  * without padding, anywhere in a string, and each `user:password`, read after its user's placeholder, and in the
- * same base64 spellings), the host, the tenant, the warehouse, an email address or the egress IP in any spelling the placeholders
- * missed. Every string that reads as base64 is also scanned decoded. The error names the file and what it holds,
- * never the value.
+ * same base64 spellings), the host, the tenant, the warehouse, the region, an email address or the egress IP in any spelling
+ * the placeholders missed. Every string that reads as base64 is also scanned decoded. The error names the file and what
+ * it holds, never the value. A warehouse named `default`, the name Databend Cloud gives a tenant's first warehouse, is
+ * not looked for: it identifies no tenant, and every capture names the catalog `default`.
  */
 
-/** What a run sends or meets that must never reach a capture. Cloud runs name the last four. */
+/** What a run sends or meets that must never reach a capture. Cloud runs name the last five. */
 export interface EvidenceSecrets {
   readonly users: readonly { readonly user: string; readonly password: string }[];
   readonly host?: string;
   readonly tenant?: string;
   readonly warehouse?: string;
+  /** The Cloud region, such as `aws-us-east-2`, which the host also carries. */
+  readonly region?: string;
   readonly egressIp?: string;
 }
+
+/** Databend Cloud's name for a tenant's first warehouse, also the name of every catalog a capture shows. */
+const STOCK_WAREHOUSE = "default";
 
 /** One request and its answer, as the harness saw them. */
 export interface RawExchange {
@@ -59,7 +65,7 @@ export interface ScrubbedExchange {
 }
 
 export const EVIDENCE_LEAK_SENTENCE =
-  "The evidence holds a secret, the host, the tenant, the warehouse, an email address or the egress IP: nothing was written.";
+  "The evidence holds a secret, the host, the tenant, the warehouse, the region, an email address or the egress IP: nothing was written.";
 
 export class EvidenceLeakError extends Error {
   constructor(readonly findings: readonly string[]) {
@@ -68,7 +74,13 @@ export class EvidenceLeakError extends Error {
   }
 }
 
-const REQUEST_HEADERS = ["content-type", "x-databend-client-caps", "x-databend-session", "x-databend-query-id"];
+const REQUEST_HEADERS = [
+  "content-type",
+  "x-databend-client-caps",
+  "x-databend-session",
+  "x-databend-query-id",
+  "x-databend-warehouse",
+];
 const RESPONSE_HEADERS = [
   "content-type",
   "x-databend-query-id",
@@ -79,6 +91,8 @@ const RESPONSE_HEADERS = [
   "x-databend-version",
 ];
 const SESSION_HEADER = "x-databend-session";
+/** Kept so a capture shows which warehouse it named; the tenant's own name becomes `<warehouse>` unless it is `default`. */
+const WAREHOUSE_HEADER = "x-databend-warehouse";
 
 /** An allow-list: `true` keeps the value whole, an object keeps only its own fields of an object value. */
 type Shape = { readonly [field: string]: true | Shape };
@@ -100,7 +114,7 @@ const ANSWER: Shape = {
     need_keep_alive: true,
     internal: true,
   },
-  error: { code: true, message: true, detail: true },
+  error: { code: true, kind: true, message: true, detail: true },
   warnings: true,
   has_result_set: true,
   schema: true,
@@ -148,6 +162,40 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Whether the name is the tenant's own warehouse, which a capture may not hold, rather than the stock `default`. */
+function isOwnWarehouse(name: string, secrets: EvidenceSecrets): boolean {
+  return (
+    secrets.warehouse !== undefined &&
+    secrets.warehouse.toLowerCase() !== STOCK_WAREHOUSE &&
+    name.toLowerCase() === secrets.warehouse.toLowerCase()
+  );
+}
+
+/**
+ * A line for the operator's terminal, such as an error the harness stops on, with every password and credential form,
+ * the host, the tenant, the region, the tenant's own warehouse and the egress IP replaced, in any letter case. A DNS
+ * or TLS error names the host, and a certificate's altname names the region alone.
+ */
+export function redactForTerminal(text: string, secrets: EvidenceSecrets): string {
+  const replacements: [string, string][] = [];
+  for (const { user, password } of secrets.users) {
+    for (const form of base64Forms(`${user}:${password}`)) replacements.push([form, "<credential>"]);
+    for (const form of [password, ...percentForms(password), ...base64Forms(password)])
+      replacements.push([form, "<password>"]);
+  }
+  const { host, tenant, warehouse, region, egressIp } = secrets;
+  if (host !== undefined) replacements.push([host, "<host>"]);
+  if (tenant !== undefined) replacements.push([tenant, "<tenant>"]);
+  if (region !== undefined) replacements.push([region, "<region>"]);
+  if (warehouse !== undefined && warehouse.toLowerCase() !== STOCK_WAREHOUSE)
+    replacements.push([warehouse, "<warehouse>"]);
+  if (egressIp !== undefined)
+    replacements.push([egressIp, "<egress-ip>"], [egressIp.replaceAll(".", "-"), "<egress-ip>"]);
+  return replacements
+    .filter(([value]) => value !== "")
+    .reduce((line, [value, mask]) => line.replace(new RegExp(escapeRegExp(value), "gi"), mask), text);
+}
 
 /** The value restricted to the shape's fields, and the dotted names of those it dropped. */
 function pick(value: unknown, shape: Shape, prefix: string, dropped: string[]): unknown {
@@ -233,7 +281,9 @@ export class EvidenceScrubber {
     for (const [name, value] of Object.entries(headers)) {
       const key = name.toLowerCase();
       if (!allowed.includes(key)) continue;
-      kept[key] = key === SESSION_HEADER ? this.sessionHeader(value) : value;
+      if (key === SESSION_HEADER) kept[key] = this.sessionHeader(value);
+      else if (key === WAREHOUSE_HEADER && isOwnWarehouse(value, this.secrets)) kept[key] = "<warehouse>";
+      else kept[key] = value;
     }
     return kept;
   }
@@ -319,7 +369,7 @@ export class EvidenceScrubber {
     const lower = text.toLowerCase();
     const has = (value: string | undefined): boolean => value !== undefined && lower.includes(value.toLowerCase());
     const labels: string[] = [];
-    const { users, host, tenant, warehouse, egressIp } = this.secrets;
+    const { users, host, tenant, warehouse, region, egressIp } = this.secrets;
     if (
       users.some(({ password }) =>
         [password, ...percentForms(password), ...base64Forms(password)].some((form) => text.includes(form)),
@@ -334,7 +384,8 @@ export class EvidenceScrubber {
       labels.push("credential");
     if (has(host)) labels.push("host");
     if (has(tenant)) labels.push("tenant");
-    if (has(warehouse)) labels.push("warehouse");
+    if (warehouse?.toLowerCase() !== STOCK_WAREHOUSE && has(warehouse)) labels.push("warehouse");
+    if (has(region)) labels.push("region");
     if (EMAIL.test(text)) labels.push("email");
     if (egressIp !== undefined && [egressIp, egressIp.replaceAll(".", "-")].some(has)) labels.push("egress IP");
     return labels;

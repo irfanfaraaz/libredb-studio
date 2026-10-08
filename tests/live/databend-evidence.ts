@@ -18,33 +18,46 @@
  *
  * Run by hand, never by `bun run test` (tests/runner/discover.ts excludes tests/live/), with the fixture up and seeded:
  *   bun tests/live/databend-evidence.ts --target local
- * Only the local target exists; the Cloud acceptance of plan section 7 brings its own.
+ *
+ * The Cloud target of plan section 7 runs `scenariosFor("cloud")` over HTTPS on 443 with the system trust store, the
+ * tenant's warehouse in `x-databend-warehouse`, against the objects the Cloud setup put in `studio_demo`. Everything
+ * it needs comes from the environment, never from a file of this repository: DATABEND_CLOUD_HOST, _PORT and
+ * _WAREHOUSE, the `studio` pair DATABEND_CLOUD_STUDIO_USER and _PASSWORD, the `studio_reader` pair
+ * DATABEND_CLOUD_RO_USER and _PASSWORD, and the `studio_scratch` pair DATABEND_CLOUD_SCRATCH_USER and _PASSWORD, whose
+ * user (under no password policy) takes the one wrong password. The scrub is also given the host, the tenant (the
+ * host's first label), the warehouse and the region (the host's third label), and refuses to write any of them;
+ * the manifest names the region only as `<region>`:
+ *   (set -a; . <the operator's env file>; set +a; bun tests/live/databend-evidence.ts --target cloud)
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import {
+  EvidenceLeakError,
   EvidenceScrubber,
   type EvidenceSecrets,
   type RawExchange,
+  redactForTerminal,
   type ScrubbedExchange,
 } from "../helpers/databend-evidence-scrub";
 import {
-  EVIDENCE_SCENARIOS,
   type EvidenceExpectation,
   type EvidencePrincipal,
   type EvidenceScenario,
   type EvidenceStep,
+  type EvidenceTarget,
+  scenariosFor,
+  UNKNOWN_WAREHOUSE,
 } from "./databend-evidence-plan";
 
 const ROOT = path.resolve(import.meta.dirname, "../..");
 const OUT = path.join(ROOT, "tests/fixtures/databend");
 const CONTAINER = "libredb-databend-http";
 const SEED_CONTAINER = "libredb-databend-http-seed";
-const PORT = 8000;
 const REQUEST_TIMEOUT_MS = 60_000;
 /** Not the password of any user: the 401 capture's credential. */
 const WRONG_PASSWORD = "Wrong123pass!";
@@ -99,11 +112,82 @@ function uncommitted(): string[] {
     .sort();
 }
 
-// -- the credentials ----------------------------------------------------------------------------------------------
+// -- the targets --------------------------------------------------------------------------------------------------
 
 interface Credential {
   readonly user: string;
   readonly password: string;
+}
+
+/** Where the requests go, as whom, and what the scrub must never let through. */
+interface Endpoint {
+  readonly tls: boolean;
+  readonly host: string;
+  readonly port: number;
+  readonly warehouse: string | undefined;
+  readonly credentials: Readonly<Record<EvidencePrincipal, Credential>>;
+  readonly secrets: EvidenceSecrets;
+  /** What the manifest says ran the server. */
+  readonly image: string;
+  readonly region?: string;
+}
+
+function localEndpoint(): Endpoint {
+  const credentials = readCredentials();
+  return {
+    tls: false,
+    host: "127.0.0.1",
+    port: 8000,
+    warehouse: undefined,
+    credentials,
+    secrets: { users: [credentials.default, credentials.reader, credentials.wrong] },
+    image: pinnedImage(),
+  };
+}
+
+function environment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value === "") throw new Error(`${name} is not set: source the operator's env file first`);
+  return value;
+}
+
+function cloudEndpoint(): Endpoint {
+  const host = environment("DATABEND_CLOUD_HOST");
+  const labels = host.split(".");
+  if (labels.length !== 6 || labels[1] !== "gw" || !host.endsWith(".default.databend.com"))
+    throw new Error(
+      "DATABEND_CLOUD_HOST is not a Databend Cloud gateway host <tenant>.gw.<region>.default.databend.com",
+    );
+  const studio = {
+    user: environment("DATABEND_CLOUD_STUDIO_USER"),
+    password: environment("DATABEND_CLOUD_STUDIO_PASSWORD"),
+  };
+  const reader = { user: environment("DATABEND_CLOUD_RO_USER"), password: environment("DATABEND_CLOUD_RO_PASSWORD") };
+  const scratch = {
+    user: environment("DATABEND_CLOUD_SCRATCH_USER"),
+    password: environment("DATABEND_CLOUD_SCRATCH_PASSWORD"),
+  };
+  const wrong = { user: scratch.user, password: WRONG_PASSWORD };
+  const others = ["DATABEND_CLOUD_USER", "DATABEND_CLOUD_PASSWORD"].every((name) => process.env[name])
+    ? [{ user: environment("DATABEND_CLOUD_USER"), password: environment("DATABEND_CLOUD_PASSWORD") }]
+    : [];
+  const warehouse = environment("DATABEND_CLOUD_WAREHOUSE");
+  return {
+    tls: true,
+    host,
+    port: Number(process.env.DATABEND_CLOUD_PORT ?? "443"),
+    warehouse,
+    credentials: { default: studio, reader, wrong },
+    secrets: {
+      users: [studio, reader, wrong, scratch, ...others],
+      host,
+      tenant: labels[0],
+      warehouse,
+      region: labels[2],
+    },
+    image: "Databend Cloud",
+    region: "<region>",
+  };
 }
 
 function readCredentials(): Readonly<Record<EvidencePrincipal, Credential>> {
@@ -133,6 +217,7 @@ interface Sent {
 }
 
 function send(
+  endpoint: Endpoint,
   method: "GET" | "POST",
   target: string,
   headers: Record<string, string>,
@@ -140,9 +225,19 @@ function send(
 ): Promise<Sent> {
   const text = payload === undefined ? undefined : JSON.stringify(payload);
   const all = { ...headers, ...(text === undefined ? {} : { "content-length": String(Buffer.byteLength(text)) }) };
+  // Over TLS the system trust store verifies the gateway's certificate against the host, as verify-system does.
+  const client = endpoint.tls ? https : http;
   return new Promise((resolve, reject) => {
-    const request = http.request(
-      { host: "127.0.0.1", port: PORT, method, path: target, headers: all, timeout: REQUEST_TIMEOUT_MS, agent: false },
+    const request = client.request(
+      {
+        host: endpoint.host,
+        port: endpoint.port,
+        method,
+        path: target,
+        headers: all,
+        timeout: REQUEST_TIMEOUT_MS,
+        agent: false,
+      },
       (response) => {
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -172,7 +267,7 @@ interface Answer {
   readonly id?: string;
   readonly state?: string;
   readonly session?: Record<string, unknown> & { txn_state?: string; need_keep_alive?: boolean };
-  readonly error?: { code?: number; message?: string } | null;
+  readonly error?: { code?: number; kind?: string; message?: string } | null;
   readonly has_result_set?: boolean;
   readonly data?: unknown[];
   readonly next_uri?: string | null;
@@ -196,13 +291,16 @@ interface Exchange {
 }
 
 /** Runs one scenario's steps in order, every request with the scenario's principal and client session. */
-async function runScenario(scenario: EvidenceScenario, credential: Credential): Promise<Exchange[]> {
+async function runScenario(endpoint: Endpoint, scenario: EvidenceScenario): Promise<Exchange[]> {
+  const credential = endpoint.credentials[scenario.principal];
   const headers: Record<string, string> = {
     authorization: `Basic ${Buffer.from(`${credential.user}:${credential.password}`).toString("base64")}`,
     accept: "application/json",
     "content-type": "application/json",
     "user-agent": "libredb-studio-evidence",
   };
+  const warehouse = scenario.warehouse === "unknown" ? UNKNOWN_WAREHOUSE : endpoint.warehouse;
+  if (warehouse !== undefined && scenario.warehouse !== "omit") headers["x-databend-warehouse"] = warehouse;
   if (scenario.clientSession) {
     headers["x-databend-client-caps"] = "session_header";
     headers["x-databend-session"] = Buffer.from(
@@ -217,7 +315,7 @@ async function runScenario(scenario: EvidenceScenario, credential: Credential): 
   let last: Answer = {};
   let session: Record<string, unknown> | undefined;
   const exchange = async (kind: EvidenceStep["kind"], method: "GET" | "POST", target: string, body?: unknown) => {
-    const sent = await send(method, target, headers, body);
+    const sent = await send(endpoint, method, target, headers, body);
     const answer = parsed(sent.body);
     exchanges.push({
       raw: {
@@ -272,7 +370,7 @@ async function runScenario(scenario: EvidenceScenario, credential: Credential): 
   } catch (error) {
     // A failed scenario leaves no query running on the fixture.
     if (typeof last.kill_uri === "string" && last.state === "Running")
-      await send("GET", last.kill_uri, headers, undefined).catch(() => undefined);
+      await send(endpoint, "GET", last.kill_uri, headers, undefined).catch(() => undefined);
     throw error;
   }
   return exchanges;
@@ -289,6 +387,7 @@ function problems(expect: EvidenceExpectation, exchanges: readonly Exchange[]): 
     ["status", expect.status, first?.raw.response.status],
     ["state", expect.state, first?.answer.state],
     ["code", expect.code, first?.answer.error?.code],
+    ["kind", expect.kind, first?.answer.error?.kind],
     ["need_keep_alive", expect.needKeepAlive, first?.answer.session?.need_keep_alive],
     ["has_result_set", expect.hasResultSet, first?.answer.has_result_set],
     ["rows", expect.rows, exchanges.reduce((sum, exchange) => sum + rowsOf(exchange), 0)],
@@ -316,27 +415,29 @@ interface ScenarioResult {
   readonly exchanges: number;
 }
 
+/** What a line on the terminal may not show, once the endpoint is known: a DNS or TLS error names the host. */
+let printed: EvidenceSecrets | undefined;
+
 async function main(argv: readonly string[]): Promise<number> {
-  const target = argv[argv.indexOf("--target") + 1];
-  if (!argv.includes("--target") || target !== "local")
-    throw new Error("usage: bun tests/live/databend-evidence.ts --target local");
-  const image = pinnedImage();
-  const credentials = readCredentials();
-  const secrets: EvidenceSecrets = { users: [credentials.default, credentials.reader, credentials.wrong] };
-  const scrubber = new EvidenceScrubber(secrets);
+  const target = argv[argv.indexOf("--target") + 1] as EvidenceTarget | undefined;
+  if (!argv.includes("--target") || (target !== "local" && target !== "cloud"))
+    throw new Error("usage: bun tests/live/databend-evidence.ts --target local|cloud");
+  const endpoint = target === "cloud" ? cloudEndpoint() : localEndpoint();
+  printed = endpoint.secrets;
+  const scrubber = new EvidenceScrubber(endpoint.secrets);
   const date = new Date().toISOString().slice(0, 10);
 
   const files: Record<string, unknown> = {};
   const results: ScenarioResult[] = [];
   let version: string | undefined;
-  for (const scenario of EVIDENCE_SCENARIOS) {
+  for (const scenario of scenariosFor(target)) {
     const started = performance.now();
     // oxlint-disable-next-line no-await-in-loop -- one scenario at a time, so timings and sessions do not overlap.
-    const exchanges = await runScenario(scenario, credentials[scenario.principal]);
+    const exchanges = await runScenario(endpoint, scenario);
     const ms = Math.round(performance.now() - started);
     const found = problems(scenario.expect, exchanges);
     if (found.length > 0) throw new Error(`${scenario.name}: ${found.join("; ")}: nothing written`);
-    version ??= exchanges[0]?.raw.response.headers["x-databend-version"];
+    if (exchanges[0]?.raw.response.status === 200) version ??= exchanges[0]?.raw.response.headers["x-databend-version"];
     const scrubbed: (ScrubbedExchange & { step: EvidenceStep["kind"] })[] = exchanges.map((exchange) => {
       const { request, response } = scrubber.exchange(exchange.raw);
       return { step: exchange.step, request, response };
@@ -357,7 +458,8 @@ async function main(argv: readonly string[]): Promise<number> {
     target,
     studioCommit: studioCommit(),
     uncommitted: uncommitted(),
-    image,
+    image: endpoint.image,
+    ...(endpoint.region === undefined ? {} : { region: endpoint.region }),
     serverVersion,
     capturedAt: date,
     scenarios: results,
@@ -374,7 +476,10 @@ async function main(argv: readonly string[]): Promise<number> {
 main(process.argv.slice(2)).then(
   (code) => process.exit(code),
   (error: unknown) => {
-    console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    console.error(printed === undefined ? text : redactForTerminal(text, printed));
+    // The scrub's findings name a file and a label, never the value.
+    if (error instanceof EvidenceLeakError) for (const finding of error.findings) console.error(`  ${finding}`);
     process.exit(1);
   },
 );
