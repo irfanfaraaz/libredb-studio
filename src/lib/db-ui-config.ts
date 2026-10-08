@@ -676,7 +676,8 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     // identity `-alt` to clear tests/unit/theme-accent-contrast.test.ts.
     color: "text-hue-red-alt",
     label: "Databend",
-    // Self-hosted's HTTP handler port. Port 443 comes from TLS, a DSN or an https:// paste, never a host heuristic.
+    // Self-hosted's HTTP handler port. Port 443 comes from a DSN or an https:// paste, never from the SSL mode or a host
+    // heuristic, so a Databend Cloud connection filled in by hand sets it.
     defaultPort: "8000",
     // The connection-string box reads http:// and https:// as ClickHouse, so a pasted address belongs in the Host box,
     // which splits it (hostAcceptsUri below); a databend:// DSN is the paste handler's.

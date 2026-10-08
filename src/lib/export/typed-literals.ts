@@ -590,6 +590,18 @@ const DATABEND_QUOTED = /^(String|Date|Timestamp|Timestamp_Tz)$/;
 const DATABEND_BOOLEAN: Readonly<Record<string, string>> = { "1": "true", "0": "false", true: "true", false: "false" };
 /** Whole bytes of hex, which is all `binary_output_format` HEX prints and all `unhex` reads. */
 const HEX_BYTES = /^(?:[0-9A-Fa-f]{2})*$/;
+/** How much of a refused type's name the skipped row's comment carries; every name Databend prints is far shorter. */
+const DATABEND_TYPE_NAME_CHARS = 64;
+
+/**
+ * A refused type's name as the skipped row's comment carries it. The type is the server's own text, kept verbatim from
+ * the wire, so it is cut to a bound and everything outside printable ASCII is replaced: a line break in it would end
+ * the comment and put the rest of the type in the file as a statement.
+ */
+function databendTypeName(name: string): string {
+  const printable = name.replace(/[^\x20-\x7e]/g, "?");
+  return printable.length > DATABEND_TYPE_NAME_CHARS ? `${printable.slice(0, DATABEND_TYPE_NAME_CHARS)}...` : printable;
+}
 
 /**
  * A Databend cell by its declared type, the forms M08b inserted on the pinned image (design 7.2, X01).
@@ -620,7 +632,7 @@ function databendValue(value: unknown, declared: string, scalar: ScalarLiteral):
       : scalar(value);
   }
   if (DATABEND_QUOTED.test(name)) return scalar(value);
-  throw new UnwritableValue(`a value of type ${name}`);
+  throw new UnwritableValue(`a value of type ${databendTypeName(name)}`);
 }
 
 /** Every declared cell but bytes from a host, which the generic writer spells with `BINARY_LITERAL.databend`. */

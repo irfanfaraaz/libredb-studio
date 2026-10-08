@@ -25,6 +25,7 @@ import {
   latchesSignIn,
   protocolError,
   refusalError,
+  serverWords,
   signInAnswerOf,
   stopError,
   toDatabaseError,
@@ -916,5 +917,25 @@ describe("the configured credential never reaches a sentence", () => {
     const error = refusalError(refusal({ status: 401, code: 5100, text: `bad ${TEST_PASSWORD}` }), context());
     expect(error.message).toBe(`${S.signInRefused} ${WITHHELD}.`);
     expect(error.detail).toBe(WITHHELD);
+  });
+});
+
+describe("serverWords, a server text a sentence names on its own (HASIM-D-5)", () => {
+  test("is the text as received when it holds no form and fits", () => {
+    expect(serverWords("max_threads", FORMS)).toBe("max_threads");
+    expect(serverWords("", FORMS)).toBe("");
+  });
+
+  test.each([
+    ["the password", `x ${TEST_PASSWORD}`],
+    ["user:password in base64", Buffer.from(`${TEST_USER}:${TEST_PASSWORD}`).toString("base64")],
+    ["the password with its slash escaped", `x ${TEST_PASSWORD.replace("/", "\\/")}`],
+  ])("withholds a text holding %s, whole", (_label, text) => {
+    expect(serverWords(text, FORMS)).toBe(WITHHELD);
+  });
+
+  test("is cut at 300 characters, as a refusal's text is, after the forms are looked for", () => {
+    expect(serverWords("x".repeat(400), FORMS)).toBe(`${"x".repeat(300)}...`);
+    expect(serverWords(`${"x".repeat(400)}${TEST_PASSWORD}`, FORMS)).toBe(WITHHELD);
   });
 });

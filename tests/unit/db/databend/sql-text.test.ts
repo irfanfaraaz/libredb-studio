@@ -35,6 +35,28 @@ describe("databendStatementRefusal", () => {
     ["a form feed that ends a comment in Databend", "-- x\fDROP TABLE t", DATABEND_FORM_FEED],
     // I11: Databend's stage token takes `\'` into the name, so the `;` after it is code there.
     ["a stage name holding a backslash", "SELECT * FROM @s\\'; DROP TABLE t; --'", DATABEND_STAGE_BACKSLASH],
+    // HASIM-D-2: the stage token `@([^\s,`;'"()]|...)+` takes `--`, `/*`, `$$` and `[` into the name too, where the span
+    // reader opens a comment, a dollar string or an array. Measured on v1.2.951: each of the first four texts is 1005
+    // "unexpected" at the statement after the `;`, so Databend read that `;` as code, and the fifth fails to lex only
+    // at its last `$$`, past the hidden SELECT.
+    ["a stage name running into a -- comment", "SELECT 1 FROM @s--;DROP TABLE t", DATABEND_STAGE_BACKSLASH],
+    ["a stage name running into a block comment", "SELECT 1 FROM @s/*;DROP TABLE t;*/", DATABEND_STAGE_BACKSLASH],
+    ["a stage name running into a bracket", "SELECT 1 FROM @s[ ; SELECT 2 AS hidden ]", DATABEND_STAGE_BACKSLASH],
+    ["a stage name inside an array literal", "SELECT [@s/*, 1]; SELECT 2 AS hidden; */ 1]", DATABEND_STAGE_BACKSLASH],
+    ["a stage name running into a $$ string", "SELECT 1 FROM @s/$$ ; SELECT 2 AS hidden; $$", DATABEND_STAGE_BACKSLASH],
+    // Databend's `\s` is Unicode White_Space, which U+FEFF is not: `@abc\u{FEFF}--xyz` is the stage `abc\u{FEFF}--xyz`.
+    [
+      "a stage name running into a comment after U+FEFF",
+      "SELECT 1 FROM @s\uFEFF--;DROP TABLE t",
+      DATABEND_STAGE_BACKSLASH,
+    ],
+    // No `;` is needed: measured on v1.2.951, `EXPLAIN SELECT * FROM @~/--, numbers((SELECT count(*) FROM numbers(7)))`
+    // planned a `numbers` scan of 7 rows, so the argument subquery read here as a comment ran while binding.
+    [
+      "a stage name running into a comment that hides an argument subquery",
+      "EXPLAIN SELECT * FROM @~/--, numbers((SELECT nextval(s)))",
+      DATABEND_STAGE_BACKSLASH,
+    ],
     // I12: a hint body is tokenized by Databend, so a `;` in it is code there.
     ["an optimizer hint holding a semicolon", "SELECT /*+ SET_VAR(a=1); DROP TABLE t */ 1", DATABEND_HINT_SEMICOLON],
     // D6-1: a token in the hint body that runs past Studio's first `*/` moves Databend's hint end to a later one.
@@ -66,6 +88,18 @@ describe("databendStatementRefusal", () => {
     ["a $$ run straight after an underscore", "SELECT 1 AS _$$; SELECT 2; -- $$", DATABEND_IDENTIFIER_DOLLAR],
     ["a $$ run straight after a non-ASCII letter", "SELECT 1 AS é$$; SELECT 2; -- $$", DATABEND_IDENTIFIER_DOLLAR],
     ["a $$ run straight after a digit in a name", "SELECT 1 AS x9$$, 2 AS b -- $$", DATABEND_IDENTIFIER_DOLLAR],
+    // An array literal's contents are code to both readers, so the guard walks into one and each reading from the form
+    // feed down holds there too. Measured on v1.2.951: both texts are 1005 "unexpected `SELECT`" at `SELECT 2 AS hidden`.
+    [
+      "a tagged dollar run inside an array literal",
+      "SELECT [$a$, 1] AS shown; SELECT 2 AS hidden; -- $a$]",
+      DATABEND_TAGGED_DOLLAR,
+    ],
+    [
+      "a hint inside an array literal whose quote runs past its */",
+      "SELECT [/*+ ' */ 1] AS shown -- ' */ 1]; SELECT 2 AS hidden",
+      DATABEND_HINT_TOKEN,
+    ],
   ])("refuses %s", (_, sql, sentence) => {
     expect(databendStatementRefusal(sql)).toBe(sentence);
   });
@@ -76,6 +110,10 @@ describe("databendStatementRefusal", () => {
     ["one statement and a trailing comment", "SELECT 1; -- note"],
     ["a $$ script", "EXECUTE IMMEDIATE $$ BEGIN LET x := 1; RETURN x; END; $$"],
     ["a stage name with no backslash", "SELECT * FROM @my_stage/data.csv"],
+    ["a stage path holding single dashes, slashes and a $ that opens no tag", "SELECT * FROM @s/2026-10/x$1.csv"],
+    ["a stage name a space ends before a comment", "SELECT * FROM @s -- note"],
+    ["a stage name a line break ends before a comment", "SELECT * FROM @s\n/* note */"],
+    ["a stage name inside a comment", "SELECT [1, 2] AS a -- @s--x"],
     ["a backslash inside a literal after a stage name", "SELECT * FROM @s WHERE a = 'x\\'y'"],
     ["an @ inside a literal", "SELECT '@s\\\\x'"],
     ["an optimizer hint with no semicolon", "SELECT /*+ SET_VAR(max_threads=1) */ 1"],
@@ -96,6 +134,29 @@ describe("databendStatementRefusal", () => {
     const sql = "SELECT 'secret_marker'; SELECT 2";
 
     expect(databendStatementRefusal(sql)).not.toContain("secret_marker");
+  });
+
+  /**
+   * A timing guard: a run of `@` is one stage token, and a scan of it from every `@` in it is quadratic (measured on the
+   * scan this replaced: 3.2 seconds for a 25k run, 12.5 for 50k). The bound is loose so it cannot flake on a slow
+   * runner, and the answer is asserted with the time.
+   */
+  test("answers in bounded time on long runs of stage tokens", () => {
+    const BOUND_MS = 200;
+    const adversarial: [string, string, string | null][] = [
+      ["a 20k run of @", `SELECT 1 FROM ${"@".repeat(20_000)}`, null],
+      ["a 20k run of @ that ends in a comment", `SELECT 1 FROM ${"@".repeat(20_000)}--`, DATABEND_STAGE_BACKSLASH],
+      ["10k stage tokens glued together", `SELECT 1 FROM ${"@s".repeat(10_000)}`, null],
+    ];
+
+    for (const [label, sql, refusal] of adversarial) {
+      const started = performance.now();
+      const answer = databendStatementRefusal(sql);
+      const elapsed = performance.now() - started;
+
+      expect(answer, label).toBe(refusal);
+      expect(elapsed, `${label} took ${elapsed.toFixed(1)}ms`).toBeLessThan(BOUND_MS);
+    }
   });
 });
 

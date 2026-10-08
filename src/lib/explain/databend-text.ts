@@ -1,5 +1,5 @@
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
-import { readSqlSpan } from "@/lib/sql/spans";
+import { readSqlSpan, type SqlSpan } from "@/lib/sql/spans";
 import { readSqlWord } from "@/lib/sql/words";
 import { classifySelectPrefix } from "./select-prefix";
 import { INDENT, buildTree, cellText, isRecord, withRoot, type PlanLine } from "./text-plan";
@@ -94,18 +94,36 @@ const DOLLAR_LITERAL_OPENER = "$$";
  * strategy does not import a provider, so the screen declines them itself. A form feed
  * ends a `--` comment in Databend, a `/*+` block is an optimizer hint whose body
  * Databend tokenizes, and a stage token (`@name`) takes a backslash and the quote after
- * it into the name, up to the first of these ending characters.
+ * it, `--`, `/*`, `$$` and `[` into the name, up to the first of these ending
+ * characters, where the span reader opens a comment, a literal or an array that can end
+ * past the token. The token's `\s` is Unicode White_Space, which JavaScript's `\s` is
+ * not: measured on v1.2.951, U+0085 ends a stage name and U+FEFF does not.
  */
 const FORM_FEED = "\f";
 const HINT_OPENER = "/*+";
-const STAGE_END = /[\s,`;'"()]/;
+const STAGE_END = /[\p{White_Space},`;'"()]/u;
 
-/** Whether the stage token whose `@` is at `index` holds a backslash before it ends. */
-function stageHoldsBackslash(sql: string, index: number): boolean {
-  for (let i = index + 1; i < sql.length && !STAGE_END.test(sql[i]); i++) {
-    if (sql[i] === "\\") return true;
+/**
+ * Where the stage token whose `@` is at `index` ends, or `undefined` when the span
+ * reader reads part of it as other than plain code: a backslash, or any run it opens
+ * there, a `[` included.
+ */
+function plainStageEnd(sql: string, index: number): number | undefined {
+  let i = index + 1;
+  while (i < sql.length && !STAGE_END.test(sql[i])) {
+    if (sql[i] === "\\" || readSqlSpan(sql, i, DATABEND_GRAMMAR) !== null) return undefined;
+    i++;
   }
-  return false;
+  return i;
+}
+
+/**
+ * The span at `index`, a `[` read as the code character it is: an array subscript's
+ * contents are code, and reading one to its closing bracket at every level of a nest, or
+ * after every `(`, is quadratic.
+ */
+function codeSpan(sql: string, index: number): SqlSpan | null {
+  return sql[index] === "[" ? null : readSqlSpan(sql, index, DATABEND_GRAMMAR);
 }
 
 /** The spans the walk skips without reading: they are not the statement's own code. */
@@ -114,10 +132,10 @@ const TRIVIA = new Set(["whitespace", "line-comment", "block-comment"]);
 /** The first code word at or after `index`, comments and whitespace skipped, or `null`. */
 function nextCodeWord(sql: string, index: number): string | null {
   let i = index;
-  let span = readSqlSpan(sql, i, DATABEND_GRAMMAR);
+  let span = codeSpan(sql, i);
   while (span !== null && TRIVIA.has(span.kind)) {
     i = span.end;
-    span = readSqlSpan(sql, i, DATABEND_GRAMMAR);
+    span = codeSpan(sql, i);
   }
   return readSqlWord(sql, i)?.text ?? null;
 }
@@ -131,11 +149,13 @@ function nextCodeWord(sql: string, index: number): string | null {
 function screen(sql: string, mode: ExplainMode): boolean {
   if (sql.includes(FORM_FEED)) return false;
   let depth = 0;
+  // Where the last plain stage token ends: an `@` before it is inside that token, read with it.
+  let stageReadTo = 0;
   let i = 0;
 
   while (i < sql.length) {
-    const span = readSqlSpan(sql, i, DATABEND_GRAMMAR);
-    if (span !== null && span.kind !== "subscript") {
+    const span = codeSpan(sql, i);
+    if (span !== null) {
       if (!span.terminated) return false;
       if (span.kind === "dollar-string" && !sql.startsWith(DOLLAR_LITERAL_OPENER, i)) return false;
       if (span.kind === "block-comment" && sql.startsWith(HINT_OPENER, i)) return false;
@@ -153,7 +173,11 @@ function screen(sql: string, mode: ExplainMode): boolean {
       continue;
     }
 
-    if (sql[i] === "@" && stageHoldsBackslash(sql, i)) return false;
+    if (sql[i] === "@" && i >= stageReadTo) {
+      const end = plainStageEnd(sql, i);
+      if (end === undefined) return false;
+      stageReadTo = end;
+    }
     if (sql[i] === "(") {
       depth++;
       const opener = nextCodeWord(sql, i + 1);

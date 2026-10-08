@@ -1,3 +1,4 @@
+import { databendCloudHostWarehouse } from "@/lib/db/providers/sql/databend/cloud-host";
 import { DatabaseType, type SSLMode } from "@/lib/types";
 
 export interface ParsedConnection {
@@ -96,6 +97,12 @@ export interface ParsedConnection {
    * alone does not show.
    */
   notice?: string;
+  /**
+   * Sentences the form shows as a warning beside a paste that filled the other fields, each for a TLS parameter the
+   * paste read and did not apply, in the scheme's own words, since the form's own TLS sentences describe its modes and
+   * not the scheme's.
+   */
+  cautions?: string[];
 }
 
 /**
@@ -148,6 +155,8 @@ export const ENGINE_URI_SCHEMES: Partial<Record<DatabaseType, string>> = {
  */
 export const DATABEND_DSN_REFUSALS = Object.freeze({
   fragment: "The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field.",
+  userinfo:
+    "The DSN's user or password holds / or ?, which end the address part of a URL: percent-encode them as %2F and %3F, or type the password in its own field.",
   signIn:
     "Token and key-pair sign-in are not supported in this version: paste a DSN that signs in with a SQL user and password, or fill the fields.",
   flight: "Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443.",
@@ -162,6 +171,18 @@ export const DATABEND_DSN_REFUSALS = Object.freeze({
 export const DATABEND_SSLMODE_NOTICES = Object.freeze({
   require: "sslmode=require in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
   enable: "sslmode=enable in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
+});
+
+/**
+ * The cautions of a Databend paste (`cautions`), for the TLS parameters it reads and does not apply: a CA file path,
+ * which only the machine running BendSQL could read, and an sslmode BendSQL does not read, which the form's own TLS
+ * sentence would list among the modes it says the parameter has no equivalent in.
+ */
+export const DATABEND_DSN_CAUTIONS = Object.freeze({
+  caFile:
+    "Studio reads no CA file path from a DSN, so tls_ca_file was not applied: paste the certificate's contents into the CA field under SSL / TLS.",
+  sslmode: (mode: string) =>
+    `sslmode=${mode} is not a Databend DSN mode (BendSQL reads disable, require and enable), so SSL mode was left as it was: choose one under SSL / TLS.`,
 });
 
 /** The warning a Databend paste shows for the parameters it did not apply, named and never valued. */
@@ -735,7 +756,7 @@ function databendRefusal(key: keyof typeof DATABEND_DSN_REFUSALS): ParsedConnect
   return { type: "databend", refusal: DATABEND_DSN_REFUSALS[key] };
 }
 
-/** The DSN parameters a paste applies; every other name is reported as not applied. */
+/** The DSN parameters a paste reads, each into a field or a caution; every other name is reported as not applied. */
 const DATABEND_APPLIED_PARAMETERS = new Set(["warehouse", "sslmode", "tls_ca_file"]);
 
 /** The `sslmode` values BendSQL reads; any other refuses the DSN there. */
@@ -756,12 +777,18 @@ const DATABEND_SIGN_IN_PARAMETERS = new Set([
  * databend-go reads them, and an explicit `sslmode` wins over either. A repeated parameter takes its last value, as
  * BendSQL's does (databend-go takes the first).
  *
- * Two departures, both refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut
- * short, and BendSQL's token and key-pair sign-in have no field here. Unlike BendSQL, which decodes the password
- * only, the user is percent-decoded too, as every other scheme here does.
+ * Three departures, each refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut
+ * short; a `/` or `?` ends the address part, so with one in the user or the password the URL parser reads the rest of
+ * the password as the database or a parameter; and BendSQL's token and key-pair sign-in have no field here. Unlike
+ * BendSQL, which decodes the password only, the user is percent-decoded too, as every other scheme here does. With no
+ * `warehouse=`, the warehouse an older Databend Cloud host names (`<tenant>--<warehouse>.gw...`) fills Warehouse.
  */
 function parseDatabendDSN(uri: string): ParsedConnection | null {
   if (uri.includes("#")) return databendRefusal("fragment");
+  // An @ past the first / or ? after the scheme is the sign-in's own, so that / or ? is inside the user or password.
+  const address = uri.slice(uri.indexOf("://") + 3);
+  const addressEnd = address.search(/[/?]/);
+  if (addressEnd >= 0 && address.includes("@", addressEnd)) return databendRefusal("userinfo");
   let url: URL;
   try {
     url = new URL(uri);
@@ -778,14 +805,19 @@ function parseDatabendDSN(uri: string): ParsedConnection | null {
   const sslmode = sslmodes.find((mode) => !DATABEND_SSLMODES.has(mode)) ?? sslmodes.at(-1) ?? null;
   let tls: TLSIntent = { sslMode: uri.startsWith("databend+http://") ? "disable" : "verify-system" };
   let notice: string | undefined;
+  const cautions: string[] = [];
   if (sslmode === "disable") tls = { sslMode: "disable" };
   else if (sslmode === "require" || sslmode === "enable") {
     tls = { sslMode: "verify-system" };
     notice = DATABEND_SSLMODE_NOTICES[sslmode];
-  } else if (sslmode !== null) tls = { unmappedTLSParam: `sslmode=${sslmode}` };
+  } else if (sslmode !== null) {
+    tls = {};
+    cautions.push(DATABEND_DSN_CAUTIONS.sslmode(sslmode));
+  }
+  // BendSQL reads the CA file on its own machine; Studio reads no path, and its CA box takes the certificate itself.
+  if (url.searchParams.has("tls_ca_file")) cautions.push(DATABEND_DSN_CAUTIONS.caFile);
 
-  const warehouse = url.searchParams.getAll("warehouse").at(-1);
-  const caFile = url.searchParams.getAll("tls_ca_file").at(-1);
+  const warehouse = url.searchParams.getAll("warehouse").at(-1) || databendCloudHostWarehouse(url.hostname);
   const ignored = names.filter((name) => !DATABEND_APPLIED_PARAMETERS.has(name));
   return {
     type: "databend",
@@ -798,7 +830,7 @@ function parseDatabendDSN(uri: string): ParsedConnection | null {
     ...(warehouse ? { warehouse } : {}),
     ...tls,
     ...(notice ? { notice } : {}),
-    ...(caFile !== undefined ? { tlsFileParam: `tls_ca_file=${caFile}` } : {}),
+    ...(cautions.length > 0 ? { cautions } : {}),
     ...(ignored.length > 0 ? { ignoredParameters: ignored } : {}),
   };
 }

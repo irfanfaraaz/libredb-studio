@@ -7,20 +7,24 @@
  * of the requests (design 3.4):
  *
  * - The sign-in latch is consulted before any socket (design 3.5): a latched key is refused with no request, and an
- *   unproven key held by another run waits for it. The first answer settles the hold: a 200 proves the key, and a
- *   refusal `latchesSignIn` names latches it, so a refused password is sent once.
+ *   unproven key held by another run waits for it. Only an answer read as one proves the key; every refusal, of the
+ *   POST, a page or a close, is reported to the latch, which latches the ones `latchesSignIn` names, and after that the
+ *   run sends nothing more. An unproven key passes to a waiting run only after this run's last close, so a refused
+ *   password is sent once.
  * - The statement POST carries a closed body built field by field (design 3.3) and new ids from `session.ts`. Its
  *   first answer must be for our query id and our session, from a node id of the accepted shape; a fail-to-start answer
  *   (`id` empty) has nothing to close.
  * - The loop keeps the last echoed session, the first non-empty schema, the rows, the warnings and the affect; it
- *   follows `next_uri` alone, and stops at the row, cell and byte budgets of design 3.12 or past the poll bound.
+ *   follows `next_uri` alone, and stops at the row, cell and byte budgets of design 3.12 or past the poll bound. Every
+ *   answer is read within the page the POST asked for and the columns the cell budget keeps, so what one answer
+ *   costs before the budgets apply is bounded by them, not by the 16 MiB an answer may be.
  * - Every exit after the server registered the statement, or may have, sends one close: the final link when the
  *   server already ended it (an in-body error, a budget cut, a complete result), else the kill. A final or a kill is
  *   best effort under its own 5 s, off the statement's signal; a failed final of a complete result is a notice, never
  *   an error, which would report a committed write as failed [X02]. A POST that may have reached the server with no
  *   answer also sends one logout, since the session id is ours [X13]; a POST another status refused (`server`) is
- *   killed alone. An auth refusal, on the POST or on a page, a middleware 400 or a fail-to-start sends nothing more:
- *   a kill, ROLLBACK or logout would carry the refused credential again and count toward a lockout.
+ *   killed alone. An auth refusal, of the POST, a page or a close, a middleware 400 or a fail-to-start sends nothing
+ *   more: a kill, ROLLBACK or logout would carry the refused credential again and count toward a lockout.
  * - The end-open reads the server's flags, never SQL text: an `Active` transaction is rolled back under a new query
  *   id with its links followed inside the same 5 s, and a session still needing keep-alive is logged out, which drops
  *   its temporary tables. The echoed session never leaves `run()`.
@@ -42,9 +46,11 @@ import {
 } from "@/lib/db/http/node-transport";
 import { serverText } from "@/lib/db/utils/server-text";
 import {
+  type AnswerBounds,
   type DatabendAnswer,
   type DatabendAnswerError,
   type DatabendReading,
+  type DatabendRefusal,
   type DatabendSessionEcho,
   readAnswer,
   resultModeNotice,
@@ -57,9 +63,9 @@ import {
   DATABEND_PROTOCOL_FAULTS,
   type DatabendFailureContext,
   type DatabendStop,
-  latchesSignIn,
   protocolError,
   refusalError,
+  serverWords,
   signInAnswerOf,
   stopError,
   transportFailure,
@@ -138,6 +144,11 @@ const PROVIDER_SETTINGS = Object.freeze({
   timezone: "UTC",
 });
 
+/** The polls a chain may take under a deadline of `ms`: one per second of it, and the allowance (design 3.4). */
+function pollBound(ms: number): number {
+  return POLL_ALLOWANCE + Math.ceil(ms / 1000);
+}
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const done = (): void => {
@@ -200,9 +211,25 @@ interface Gathered {
   readonly warnings: Set<string>;
 }
 
+/**
+ * A stop that fired in the backoff between two attempts of the statement POST. Only a gateway
+ * `ProvisionWarehouseTimeout` resends a POST, and the gateway answers it without forwarding (design 3.11), so nothing
+ * that was sent can run: the run is the stop itself, with no kill and no logout.
+ */
+class StoppedBetweenAttempts extends Error {
+  constructor() {
+    super("A stop between two attempts of the statement POST");
+  }
+}
+
 /** A refusal of the node transport before any socket, such as the egress guard's, which names no address. */
 function configError(error: unknown): DatabendError {
   return new DatabendError("config", (error as Error).message, { cause: error });
+}
+
+/** The rows one page holds: one past the row cut, so that a cut is seen, and never more than a page. */
+function pageRows(request: StatementRequest): number {
+  return Math.min(request.rowCut + 1, MAX_ROWS_PER_PAGE);
 }
 
 /**
@@ -215,7 +242,7 @@ function statementBody(request: StatementRequest, timeoutMs: number, database: s
     max_execute_time_in_seconds: String(Math.ceil(timeoutMs / 1000)),
     ...(request.origin === "provider" ? PROVIDER_SETTINGS : {}),
   };
-  const page = Math.min(request.rowCut + 1, MAX_ROWS_PER_PAGE);
+  const page = pageRows(request);
   return JSON.stringify({
     sql: request.sql,
     session: { ...(database === undefined ? {} : { database }), settings },
@@ -228,9 +255,13 @@ class StatementRun {
   private readonly session: string;
   private readonly timeoutMs: number;
   private readonly endsAt: number;
+  /** What one answer of this run may hold: the page the POST asks for, and the columns the cell budget keeps. */
+  private readonly bounds: AnswerBounds;
   private readonly notices: DatabendNotice[] = [];
   private nodeId: string | null = null;
   private hold: AuthAttempt | null = null;
+  /** Set once a refusal of this run latched its sign-in: the run sends nothing after it (design 3.5). */
+  private signInRefused = false;
 
   constructor(
     private readonly options: DatabendConnectionOptions,
@@ -243,6 +274,7 @@ class StatementRun {
     this.endsAt = deps.now() + this.timeoutMs;
     this.ids = statementIds(deps.newId, deps.random());
     this.session = sessionHeader(this.ids.sessionId, deps.now());
+    this.bounds = { rows: pageRows(request), columns: options.cellBudget };
   }
 
   async run(): Promise<StatementOutcome & { readonly role: string | null }> {
@@ -254,12 +286,18 @@ class StatementRun {
       // The wait was cut short by the run's own signal: nothing was sent.
       throw unsentStopError(this.stop(), this.context("post"));
     }
-    if (this.signal.aborted) {
-      hold.abandon();
-      throw unsentStopError(this.stop(), this.context("post"));
-    }
     this.hold = hold;
+    try {
+      return await this.post();
+    } finally {
+      // An unproven key passes to the next waiter only now, after every close of this run.
+      hold.release();
+    }
+  }
 
+  /** The statement POST and everything after it, under the run's hold. */
+  private async post(): Promise<StatementOutcome & { readonly role: string | null }> {
+    if (this.signal.aborted) throw unsentStopError(this.stop(), this.context("post"));
     let first: Exchanged;
     try {
       first = await this.exchange({
@@ -274,12 +312,11 @@ class StatementRun {
         read: true,
       });
     } catch (error) {
-      hold.abandon();
       throw await this.postFailed(error);
     }
     const reading = first.reading as DatabendReading;
     if (reading.kind === "refusal") {
-      hold.settle(signInAnswerOf(reading.refusal));
+      this.refused(reading.refusal);
       const error = refusalError(reading.refusal, this.context("post"));
       // A status that says nothing about whether the POST reached Databend: the statement may be running.
       if (error.category === "outcome-unknown" || error.category === "network") await this.closeUnanswered();
@@ -287,12 +324,18 @@ class StatementRun {
       if (error.category === "server") await this.kill(false);
       throw error;
     }
-    hold.settle({ status: 200 });
+    (this.hold as AuthAttempt).prove();
     return this.follow(reading.answer, first.response);
+  }
+
+  /** Reports a refusal to the latch (design 3.5); once one latches, the run sends nothing more. */
+  private refused(refusal: DatabendRefusal): void {
+    if ((this.hold as AuthAttempt).refuse(signInAnswerOf(refusal))) this.signInRefused = true;
   }
 
   /** A POST that ended with no answer read: by the run's stop, the network, a cap, or a malformed 200. */
   private async postFailed(error: unknown): Promise<DatabendError> {
+    if (error instanceof StoppedBetweenAttempts) return unsentStopError(this.stop(), this.context("post"));
     if (error instanceof DatabendError) return this.abandon(error, null);
     if (!(error instanceof TransportError)) return configError(error);
     const unanswered = { answered: false, killAcknowledged: false };
@@ -328,9 +371,9 @@ class StatementRun {
       throw await this.abandon(protocolError(DATABEND_PROTOCOL_FAULTS.field("node_id")), null);
     }
     this.nodeId = answer.nodeId;
-    // I6: a server below the floor drops the result mode it does not know.
+    // I6: a server below the floor drops the result mode it does not know. The mode it echoed is server text.
     const mode = resultModeNotice(answer);
-    if (mode !== null) this.notices.push(mode);
+    if (mode !== null) this.notices.push({ ...mode, mode: serverWords(mode.mode, this.options.secretForms) });
 
     const gathered: Gathered = {
       session: null,
@@ -365,7 +408,7 @@ class StatementRun {
    * page that fails closes the statement and throws; every other exit is returned, for `follow` to close.
    */
   private async loop(first: DatabendAnswer, firstBytes: number, gathered: Gathered): Promise<LoopEnd> {
-    const maxPolls = POLL_ALLOWANCE + Math.ceil(this.timeoutMs / 1000);
+    const maxPolls = pollBound(this.timeoutMs);
     let current = first;
     let bytes = firstBytes;
     let polls = 0;
@@ -445,12 +488,10 @@ class StatementRun {
     }
     const reading = exchanged.reading as DatabendReading;
     if (reading.kind === "refusal") {
-      const signIn = signInAnswerOf(reading.refusal);
-      (this.hold as AuthAttempt).settle(signIn);
-      const error = refusalError(reading.refusal, this.context("get"));
-      // A close would carry the refused credential again, only to be refused and counted toward a lockout.
-      if (latchesSignIn(signIn)) throw error;
-      throw await this.abandon(error, last);
+      // After a refused sign-in the closes are skipped: they would carry the refused credential again, only to be
+      // refused and counted toward a lockout.
+      this.refused(reading.refusal);
+      throw await this.abandon(refusalError(reading.refusal, this.context("get")), last);
     }
     return { answer: reading.answer, bytes: Buffer.byteLength(exchanged.response.text) };
   }
@@ -495,7 +536,7 @@ class StatementRun {
           signal: exchange.attempt(),
           maxResponseBytes: this.options.responseCapBytes,
         });
-        const reading = response.status === 200 && !exchange.read ? null : readAnswer(response);
+        const reading = response.status === 200 && !exchange.read ? null : readAnswer(response, this.bounds);
         if (reading?.kind !== "refusal") return { response, reading };
         exchanged = { response, reading };
       } catch (error) {
@@ -521,6 +562,7 @@ class StatementRun {
       if (failure?.kind === "timeout") pageTimerRetried = true;
       // oxlint-disable-next-line no-await-in-loop -- the backoff between two attempts.
       if (decision.delayMs > 0) await this.deps.sleep(decision.delayMs, exchange.signal);
+      if (exchange.request === "query" && exchange.signal.aborted) throw new StoppedBetweenAttempts();
     }
   }
 
@@ -532,7 +574,11 @@ class StatementRun {
     };
   }
 
-  private closeExchange(
+  /**
+   * One close under its budget; its answer, or null when none arrived or the run's sign-in was refused, which sends
+   * nothing. A refusal of the close is reported to the latch like one of the POST.
+   */
+  private async closeExchange(
     request: RetryRequest,
     method: "GET" | "POST",
     path: string,
@@ -543,7 +589,8 @@ class StatementRun {
       readonly read?: boolean;
     } = {},
   ): Promise<Exchanged | null> {
-    return this.exchange({
+    if (this.signInRefused) return null;
+    const exchanged = await this.exchange({
       request,
       method,
       path,
@@ -554,6 +601,8 @@ class StatementRun {
       endsAt: budget.endsAt,
       read: extra.read ?? false,
     }).catch(() => null);
+    if (exchanged?.reading?.kind === "refusal") this.refused(exchanged.reading.refusal);
+    return exchanged;
   }
 
   /** Stops the statement; true when the kill answered 200. Before the first answer a 404 is resent (design 3.10). */
@@ -596,7 +645,8 @@ class StatementRun {
 
   /**
    * ROLLBACK under a new query id with the session echoed verbatim, its links followed to the end inside the same
-   * 5 s, with no nested end-open [X13]; whether the session still needs keep-alive afterwards.
+   * 5 s and the poll bound of that 5 s, with no nested end-open [X13]; whether the session still needs keep-alive
+   * afterwards.
    */
   private async rollback(session: DatabendSessionEcho): Promise<boolean> {
     const queryId = newQueryId(this.deps.newId);
@@ -610,10 +660,12 @@ class StatementRun {
     this.notices.push(rollbackNotice(queryId, answer && { id: answer.id, txnState: answer.session?.txnState ?? null }));
     if (answer === null) return true;
     let next = answer.nextUri;
-    while (next !== null) {
+    const maxPolls = pollBound(this.options.closeTimeoutMs);
+    for (let polls = 1; next !== null; polls += 1) {
       const link = acceptNextUri(next, queryId);
-      // oxlint-disable-next-line no-await-in-loop -- each answer names the next link.
-      const followed = link.kind === "refused" ? null : await this.followRollback(link.path, budget);
+      const followed =
+        // oxlint-disable-next-line no-await-in-loop -- each answer names the next link.
+        link.kind === "refused" || polls > maxPolls ? null : await this.followRollback(link.path, budget);
       if (followed === null) {
         this.notices.push({ kind: "close-failed", step: "rollback" });
         break;
@@ -699,7 +751,7 @@ export function createDatabendHttpTransport(
       done.then(forget, forget);
       const { role, ...outcome } = await done;
       if (request.origin === "provider" && probeRole === undefined) probeRole = role;
-      const session = sessionNotices(outcome.affect, role, probeRole ?? null);
+      const session = sessionNotices(outcome.affect, role, probeRole ?? null, options.secretForms);
       return { ...outcome, notices: [...session, ...outcome.notices] };
     },
     async close() {

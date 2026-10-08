@@ -1,11 +1,13 @@
 /**
  * Reading one HTTP answer of Databend's query API (design 3.12, section 4; I6): only a 200 `application/json` body is
  * an answer, anything else is a refusal read by status, then content type; an answer that does not have the measured
- * shape is `protocol`.
+ * shape is `protocol`. What one answer may hold is bounded before it is parsed: its rows by the page Studio asked
+ * for, its columns by the cell budget, everything else by a fixed allowance, and a refusal is read up to 64 KiB.
  */
 import { describe, expect, test } from "bun:test";
 import type { NodeResponse } from "@/lib/db/http/node-transport";
 import {
+  type AnswerBounds,
   type DatabendAnswer,
   DATABEND_ANSWER_SENTENCES,
   RESULT_MODE_FLOOR,
@@ -25,6 +27,13 @@ function response(status: number, contentType: string | null, text: string): Nod
 }
 
 const json = (body: unknown, status = 200) => response(status, "application/json", JSON.stringify(body));
+
+/** The bounds of a statement that asked for a full page, under the connection's cell budget. */
+const BOUNDS: AnswerBounds = { rows: 10_000, columns: 250_000 };
+/** The arrays, objects, keys and values an answer may hold outside its rows and columns. */
+const ALLOWANCE = 65_536;
+/** The characters of a refusal that are read. */
+const REFUSAL_CHARS = 64 * 1024;
 
 /** A first answer as the pinned image sends it (07 M12, M08). */
 const FIRST = {
@@ -62,7 +71,7 @@ const FIRST = {
 };
 
 function answerOf(body: unknown): DatabendAnswer {
-  const reading = readAnswer(json(body));
+  const reading = readAnswer(json(body), BOUNDS);
   if (reading.kind !== "answer") throw new Error("expected an answer");
   return reading.answer;
 }
@@ -110,7 +119,7 @@ describe("a 200 JSON answer", () => {
   });
 
   test("accepts a charset parameter on the content type", () => {
-    const reading = readAnswer(response(200, "application/json; charset=utf-8", JSON.stringify(FIRST)));
+    const reading = readAnswer(response(200, "application/json; charset=utf-8", JSON.stringify(FIRST)), BOUNDS);
     expect(reading.kind).toBe("answer");
   });
 
@@ -170,7 +179,9 @@ describe("a 200 JSON answer", () => {
   });
 
   test("a 200 gateway body is a refusal", () => {
-    expect(readAnswer(json({ kind: "ProvisionWarehouseTimeout", message: "provision warehouse timeout" }))).toEqual({
+    expect(
+      readAnswer(json({ kind: "ProvisionWarehouseTimeout", message: "provision warehouse timeout" }), BOUNDS),
+    ).toEqual({
       kind: "refusal",
       refusal: {
         status: 200,
@@ -185,14 +196,14 @@ describe("a 200 JSON answer", () => {
 
 describe("anything but a 200 JSON body", () => {
   test("a 200 of another content type is protocol", () => {
-    const error = protocolOf(() => readAnswer(response(200, "text/plain", "ok")));
+    const error = protocolOf(() => readAnswer(response(200, "text/plain", "ok"), BOUNDS));
     expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.notAnswer));
     expect(error.status).toBe(200);
-    protocolOf(() => readAnswer(response(200, null, "{}")));
+    protocolOf(() => readAnswer(response(200, null, "{}"), BOUNDS));
   });
 
   test("a non-200 text body is a refusal read by its status, with the body as its text", () => {
-    expect(readAnswer(response(500, "text/plain", "[HTTP-PANIC] Internal server error"))).toEqual({
+    expect(readAnswer(response(500, "text/plain", "[HTTP-PANIC] Internal server error"), BOUNDS)).toEqual({
       kind: "refusal",
       refusal: {
         status: 500,
@@ -207,6 +218,7 @@ describe("anything but a 200 JSON body", () => {
   test("a non-200 JSON body gives its code and message", () => {
     const reading = readAnswer(
       json({ error: { code: 5100, message: "Authentication failed: incorrect password" } }, 401),
+      BOUNDS,
     );
     expect(reading).toEqual({
       kind: "refusal",
@@ -221,7 +233,7 @@ describe("anything but a 200 JSON body", () => {
   });
 
   test("a gateway body gives its kind and message", () => {
-    const reading = readAnswer(json({ kind: "WarehouseNotFound", message: "warehouse not found" }, 404));
+    const reading = readAnswer(json({ kind: "WarehouseNotFound", message: "warehouse not found" }, 404), BOUNDS);
     expect(reading).toEqual({
       kind: "refusal",
       refusal: {
@@ -235,14 +247,14 @@ describe("anything but a 200 JSON body", () => {
   });
 
   test("databend-go's string error shape gives its message, else the error string", () => {
-    const withMessage = readAnswer(json({ error: "Unauthorized", message: "bad token" }, 401));
+    const withMessage = readAnswer(json({ error: "Unauthorized", message: "bad token" }, 401), BOUNDS);
     expect(withMessage.kind === "refusal" && withMessage.refusal.text).toBe("bad token");
-    const bare = readAnswer(json({ error: "Unauthorized" }, 401));
+    const bare = readAnswer(json({ error: "Unauthorized" }, 401), BOUNDS);
     expect(bare.kind === "refusal" && bare.refusal.text).toBe("Unauthorized");
   });
 
   test("a non-200 JSON body that does not parse, or names nothing, keeps the raw text", () => {
-    const broken = readAnswer(response(502, "application/json", "<html>bad gateway</html>"));
+    const broken = readAnswer(response(502, "application/json", "<html>bad gateway</html>"), BOUNDS);
     expect(broken).toEqual({
       kind: "refusal",
       refusal: {
@@ -253,7 +265,7 @@ describe("anything but a 200 JSON body", () => {
         text: "<html>bad gateway</html>",
       },
     });
-    const empty = readAnswer(response(503, "application/json", "[]"));
+    const empty = readAnswer(response(503, "application/json", "[]"), BOUNDS);
     expect(empty.kind === "refusal" && empty.refusal.text).toBe("[]");
   });
 
@@ -265,7 +277,7 @@ describe("anything but a 200 JSON body", () => {
     ];
     for (const [password, body] of cases) {
       const forms = secretForms([password, `reader:${password}`]);
-      const reading = readAnswer(response(502, "application/json", body));
+      const reading = readAnswer(response(502, "application/json", body), BOUNDS);
       if (reading.kind !== "refusal") throw new Error("expected a refusal");
       const ctx = {
         request: "get",
@@ -284,24 +296,25 @@ describe("anything but a 200 JSON body", () => {
 
 describe("protocol", () => {
   test("a 200 JSON body that does not parse", () => {
-    const error = protocolOf(() => readAnswer(response(200, "application/json", "{")));
+    const error = protocolOf(() => readAnswer(response(200, "application/json", "{"), BOUNDS));
     expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.notJson));
     expect(error.cause).toBeInstanceOf(SyntaxError);
   });
 
-  test("a RangeError while parsing", () => {
+  test("nesting deeper than an answer's allowance is refused before it is parsed", () => {
     const deep = `{"id":"q","state":"Running","x":${"[".repeat(200_000)}${"]".repeat(200_000)}}`;
-    const error = protocolOf(() => readAnswer(response(200, "application/json", deep)));
-    expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.notJson));
-    expect(error.cause).toBeInstanceOf(RangeError);
+    const error = protocolOf(() => readAnswer(response(200, "application/json", deep), BOUNDS));
+    expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field("answer")));
   });
 
-  test("__proto__ as a key, anywhere", () => {
+  test("__proto__ as a key, anywhere, however it is spelled", () => {
     for (const text of [
       '{"__proto__":{"polluted":true},"id":"q","state":"Running"}',
       '{"id":"q","state":"Running","session":{"settings":{"__proto__":"x"}}}',
+      '{"id":"q","state":"Running","x":[[{"\\u005f_proto__":1}]]}',
+      '{"id":"q","state":"Running","schema":[{"name":"a","type":"String","__proto__":"x"}]}',
     ]) {
-      const error = protocolOf(() => readAnswer(response(200, "application/json", text)));
+      const error = protocolOf(() => readAnswer(response(200, "application/json", text), BOUNDS));
       expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.prototypeKey));
     }
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
@@ -324,9 +337,9 @@ describe("protocol", () => {
   });
 
   test("a body that is not an object", () => {
-    const error = protocolOf(() => readAnswer(json([1])));
+    const error = protocolOf(() => readAnswer(json([1]), BOUNDS));
     expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field("answer")));
-    protocolOf(() => readAnswer(json(null)));
+    protocolOf(() => readAnswer(json(null), BOUNDS));
   });
 
   test("a field of the wrong type", () => {
@@ -357,6 +370,157 @@ describe("protocol", () => {
       const error = protocolOf(() => answerOf({ ...FIRST, ...patch }));
       expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field(field)));
     }
+  });
+});
+
+describe("what one answer may hold, counted before it is parsed (design 3.12; HASIM-D-2)", () => {
+  const SMALL: AnswerBounds = { rows: 2, columns: 3 };
+  const schema = [{ name: "a", type: "String" }];
+  const row = (value: string) => `[${JSON.stringify(value)}]`;
+  const body = (fields: string) => `{"id":"q","state":"Running","schema":${JSON.stringify(schema)},${fields}}`;
+  const read = (text: string, bounds = SMALL) => readAnswer(response(200, "application/json", text), bounds);
+  const fault = (what: string) => DATABEND_ERROR_SENTENCES.protocol(what);
+
+  test("data of the page's rows is read; one row more is refused, before a body that does not parse is", () => {
+    const reading = read(body(`"data":[${row("1")},${row("2")}]`));
+    expect(reading.kind === "answer" && reading.answer.data).toEqual([["1"], ["2"]]);
+    expect(protocolOf(() => read(body(`"data":[${row("1")},${row("2")},${row("3")}]`))).message).toBe(
+      fault(DATABEND_PROTOCOL_FAULTS.field("data")),
+    );
+    // The third row is counted before the text is parsed: the body never closes.
+    expect(protocolOf(() => read(`{"id":"q","state":"Running","data":[[],[],[`)).message).toBe(
+      fault(DATABEND_PROTOCOL_FAULTS.field("data")),
+    );
+  });
+
+  test("data under a key spelled with an escape is held to the page once it is parsed", () => {
+    const text = body(`"d\\u0061ta":[${row("1")},${row("2")},${row("3")}]`);
+    expect(protocolOf(() => read(text)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.field("data")));
+  });
+
+  test("a schema wider than the columns a result can keep, or a column of more keys, is refused before parsing", () => {
+    const columns = (count: number) => Array.from({ length: count }, (_, n) => ({ name: `c${n}`, type: "String" }));
+    const wide = `{"id":"q","state":"Running","schema":${JSON.stringify(columns(4))}`;
+    expect(protocolOf(() => read(wide)).message).toBe(fault(DATABEND_PROTOCOL_FAULTS.field("schema")));
+    const keyed = `{"id":"q","state":"Running","schema":[{"name":"a","type":"S","b":1,"c":2,"d":3,"e":4,"f":5,"g":6}`;
+    expect(protocolOf(() => read(keyed, { rows: 2, columns: 1 })).message).toBe(
+      fault(DATABEND_PROTOCOL_FAULTS.field("schema")),
+    );
+    const reading = read(body(`"data":[]`).replace(JSON.stringify(schema), JSON.stringify(columns(3))));
+    expect(reading.kind === "answer" && reading.answer.schema).toHaveLength(3);
+  });
+
+  test("a row's cells are held by the answer's bytes alone: a page wider than the allowance is read whole", () => {
+    const width = ALLOWANCE + 10;
+    const wide = Array.from({ length: width }, (_, n) => ({ name: `c${n}`, type: "String" }));
+    const cells = JSON.stringify(Array.from({ length: width }, () => null));
+    const reading = read(`{"id":"q","state":"Running","schema":${JSON.stringify(wide)},"data":[${cells}]}`, BOUNDS);
+    expect(reading.kind === "answer" && reading.answer.data[0]).toHaveLength(width);
+  });
+
+  test.each([
+    ["values in an array of the answer", `"x":[${"0,".repeat(ALLOWANCE)}0]`, "answer"],
+    [
+      "keys of an object of the answer",
+      `"x":{${Array.from({ length: ALLOWANCE }, (_, n) => `"k${n}":0`).join(",")}}`,
+      "answer",
+    ],
+    ["arrays inside a row", `"data":[[${"[],".repeat(ALLOWANCE)}[]]]`, "data"],
+    ["values inside a column", `"schema":[{"name":[${"0,".repeat(ALLOWANCE)}0]}]`, "schema"],
+  ])("more %s than the allowance are refused before parsing", (_label, fields, field) => {
+    expect(protocolOf(() => read(`{"id":"q","state":"Running",${fields}}`, BOUNDS)).message).toBe(
+      fault(DATABEND_PROTOCOL_FAULTS.field(field)),
+    );
+  });
+
+  test("the allowance counts only outside strings: brackets, commas and colons inside one are text", () => {
+    const text = `[{"a":1},`.repeat(ALLOWANCE);
+    const reading = read(body(`"data":[${row(text)}]`));
+    expect(reading.kind === "answer" && reading.answer.data).toEqual([[text]]);
+    const escaped = read(body(`"data":[${row(`\\"${text}`)}]`));
+    expect(escaped.kind === "answer" && escaped.answer.data[0][0]).toBe(`\\"${text}`);
+  });
+
+  test("an answer just inside the allowance is parsed", () => {
+    const reading = read(`{"id":"q","state":"Running","x":[${"0,".repeat(ALLOWANCE - 64)}0]}`, BOUNDS);
+    expect(reading.kind).toBe("answer");
+  });
+});
+
+describe("a refusal is read up to 64 KiB (HASIM-D-2)", () => {
+  test("a longer one is read by its status alone, never parsed, its text cut", () => {
+    const text = JSON.stringify({
+      error: { code: 5100, message: "Authentication failed" },
+      pad: "x".repeat(REFUSAL_CHARS),
+    });
+    expect(readAnswer(response(401, "application/json", text), BOUNDS)).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 401,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: null,
+        text: text.slice(0, REFUSAL_CHARS),
+      },
+    });
+  });
+
+  test("one of exactly 64 KiB is parsed", () => {
+    const head = '{"error":{"code":5100,"message":"Authentication failed"},"pad":"';
+    const text = `${head}${"x".repeat(REFUSAL_CHARS - head.length - 2)}"}`;
+    expect(text).toHaveLength(REFUSAL_CHARS);
+    const reading = readAnswer(response(401, "application/json", text), BOUNDS);
+    expect(reading.kind === "refusal" && reading.refusal.code).toBe(5100);
+  });
+
+  test("a message longer than 64 KiB is cut before it is read for a wrapper or shown", () => {
+    const message = `status: 401, message: {"error":{"code":5100,"message":"x"}}: ${"w".repeat(REFUSAL_CHARS)}`;
+    const reading = readAnswer(json({ error: { kind: "AuthorizationFailed", message } }), BOUNDS);
+    expect(reading).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "AuthorizationFailed",
+        text: message.slice(0, REFUSAL_CHARS),
+        upstreamStatus: 401,
+        upstreamCode: 5100,
+        upstreamMessage: "x",
+      },
+    });
+  });
+
+  test("a gateway refusal over HTTP 200 is read from the parse its answer already had, whatever its length", () => {
+    const reading = readAnswer(
+      json({ error: { kind: "ProvisionWarehouseTimeout", message: "resuming" }, pad: "x".repeat(REFUSAL_CHARS) }),
+      BOUNDS,
+    );
+    expect(reading).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "ProvisionWarehouseTimeout",
+        text: "resuming",
+      },
+    });
+  });
+
+  test("a long message-less gateway refusal over HTTP 200 is not walked for its strings", () => {
+    const text = JSON.stringify({ kind: "Unexpected", pad: "x".repeat(REFUSAL_CHARS) });
+    const reading = readAnswer(response(200, "application/json", text), BOUNDS);
+    expect(reading).toEqual({
+      kind: "refusal",
+      refusal: {
+        status: 200,
+        contentType: "application/json",
+        code: null,
+        gatewayKind: "Unexpected",
+        text: text.slice(0, REFUSAL_CHARS),
+      },
+    });
   });
 });
 
@@ -420,7 +584,7 @@ const CLOUD = {
 
 function cloudRefusal(name: keyof typeof CLOUD) {
   const [status, body] = CLOUD[name];
-  const reading = readAnswer(response(status, "application/json", body));
+  const reading = readAnswer(response(status, "application/json", body), BOUNDS);
   if (reading.kind !== "refusal") throw new Error("expected a refusal");
   return reading.refusal;
 }
@@ -472,7 +636,7 @@ describe("the Databend Cloud gateway's envelope (I19, C4)", () => {
   });
 
   test("a 200 whose body nests a kind and has no state is a refusal", () => {
-    expect(readAnswer(json({ error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } }))).toEqual({
+    expect(readAnswer(json({ error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } }), BOUNDS)).toEqual({
       kind: "refusal",
       refusal: {
         status: 200,
@@ -485,7 +649,7 @@ describe("the Databend Cloud gateway's envelope (I19, C4)", () => {
   });
 
   test("a 200 whose error has a code and no state is still protocol, not a refusal", () => {
-    const error = protocolOf(() => readAnswer(json({ id: "q", error: { code: 1005, message: "bad" } })));
+    const error = protocolOf(() => readAnswer(json({ id: "q", error: { code: 1005, message: "bad" } }), BOUNDS));
     expect(error.message).toBe(DATABEND_ERROR_SENTENCES.protocol(DATABEND_PROTOCOL_FAULTS.field("state")));
   });
 
@@ -503,7 +667,7 @@ describe("the Databend Cloud gateway's envelope (I19, C4)", () => {
     ["a status of other than three digits", 'status: 4010, message: {"error":{"code":5100,"message":"x"}}: words'],
     ["text before the wrapper", 'proxy said status: 401, message: {"error":{"code":5100,"message":"x"}}: words'],
   ])("a message with %s stays plain text with no upstream fields", (_label, message) => {
-    const reading = readAnswer(json({ error: { kind: "AuthorizationFailed", message } }, 401));
+    const reading = readAnswer(json({ error: { kind: "AuthorizationFailed", message } }, 401), BOUNDS);
     expect(reading).toEqual({
       kind: "refusal",
       refusal: {

@@ -77,12 +77,14 @@ export type DatabendAffect =
  * Something the run did or found that is not the result itself, which the provider turns into a `QueryWarning`.
  *
  * - `use-not-carried`, `settings-not-carried`, `global-settings-changed` and `role-not-carried`: the session
- *   warnings of design 3.7, read from the affect and the echoed session.
+ *   warnings of design 3.7, read from the affect and the echoed session; each key SET GLOBAL changed is already
+ *   passed through `serverWords`.
  * - `transaction-ended`, `transaction-may-stay-open` and `temp-tables-dropped`: what the end-open of design 3.4 did
  *   with a statement that left a transaction or a temporary table open.
  * - `close-failed`: a best-effort final, kill, ROLLBACK or logout that did not answer within its 5 s; a failed final
  *   of a complete result is this notice and never an error, which would report a committed write as failed.
- * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4).
+ * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4), the mode
+ *   already passed through `serverWords`.
  * - `server-warning`: one entry of an answer's `warnings`, which the poll loop of design 3.4 keeps, such as the
  *   warning for a setting name the server ignores; its text is already passed through `serverText`.
  */

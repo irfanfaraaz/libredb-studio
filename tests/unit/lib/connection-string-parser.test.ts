@@ -3,6 +3,7 @@ import {
   parseConnectionString,
   detectConnectionStringType,
   ENGINE_URI_SCHEMES,
+  DATABEND_DSN_CAUTIONS,
   DATABEND_DSN_REFUSALS,
   DATABEND_SSLMODE_NOTICES,
   databendNotAppliedNotice,
@@ -1326,6 +1327,91 @@ describe("parseConnectionString: databend:// DSNs", () => {
     );
   });
 
+  test.each([
+    "databend://cloudapp:2024/Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default?warehouse=w1",
+    "databend://cloudapp:2024?Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:/Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:Secret/Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:Secret?Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloud/app:Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+  ])(
+    "a / or ? before the sign-in's @ is refused, since the URL parser would read the rest as the path: %s",
+    (input) => {
+      const result = parseConnectionString(input);
+      expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+      expect(JSON.stringify(result)).not.toContain("Tail");
+      expect(DATABEND_DSN_REFUSALS.userinfo).toBe(
+        "The DSN's user or password holds / or ?, which end the address part of a URL: percent-encode them as %2F and %3F, or type the password in its own field.",
+      );
+    },
+  );
+
+  test("a percent-encoded / or ? in the sign-in, and an @ only before the path, still parse", () => {
+    const encoded = parseConnectionString("databend://cloudapp:2024%2FSecret%3FTail@host:443/default?warehouse=w1")!;
+    expect([encoded.user, encoded.password, encoded.host, encoded.database]).toEqual([
+      "cloudapp",
+      "2024/Secret?Tail",
+      "host",
+      "default",
+    ]);
+    expect(parseConnectionString("databend://root@host:8000/default?sslmode=disable")!.refusal).toBeUndefined();
+    expect(parseConnectionString("databend:///default?sslmode=disable")!.refusal).toBeUndefined();
+  });
+
+  test("tls_ca_file is not applied: a caution says Studio reads no CA path and where the certificate goes", () => {
+    const result = parseConnectionString("databend://u:p@host/db?tls_ca_file=/etc/databend/ca.pem")!;
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.caFile]);
+    expect(result.tlsFileParam).toBeUndefined();
+    expect(result.ignoredParameters).toBeUndefined();
+    expect(result.sslMode).toBe("verify-system");
+    // Named, never valued: the path stays in the parser.
+    expect(JSON.stringify(result)).not.toContain("/etc/databend/ca.pem");
+    expect(DATABEND_DSN_CAUTIONS.caFile).toBe(
+      "Studio reads no CA file path from a DSN, so tls_ca_file was not applied: paste the certificate's contents into the CA field under SSL / TLS.",
+    );
+  });
+
+  test("an sslmode BendSQL does not read gets Databend's own caution, not the form's TLS sentence", () => {
+    const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    expect(result.unmappedTLSParam).toBeUndefined();
+    expect(result.sslMode).toBeUndefined();
+    expect(DATABEND_DSN_CAUTIONS.sslmode("verify-full")).toBe(
+      "sslmode=verify-full is not a Databend DSN mode (BendSQL reads disable, require and enable), so SSL mode was left as it was: choose one under SSL / TLS.",
+    );
+    const both = parseConnectionString("databend://u:p@host/db?sslmode=verify-ca&tls_ca_file=/ca.pem")!;
+    expect(both.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-ca"), DATABEND_DSN_CAUTIONS.caFile]);
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=require")!.cautions).toBeUndefined();
+  });
+
+  test.each([
+    ["tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com", "eric"],
+    ["tnf34b0rm--elt-wh-medium.gw.aliyun-cn-beijing.default.databend.cn", "elt-wh-medium"],
+    ["Tenant--MyWH.GW.aws-us-east-2.default.Databend.COM.", "MyWH"],
+  ])("an older Databend Cloud host, %s, fills Warehouse from the host when the DSN has no warehouse=", (host, name) => {
+    const result = parseConnectionString(`databend://cloudapp@${host}:443/default`)!;
+    expect(result.host).toBe(host);
+    expect(result.warehouse).toBe(name);
+    expect(result.ignoredParameters).toBeUndefined();
+  });
+
+  test("warehouse= wins over the host's, and a host that is not an older Cloud host fills no Warehouse", () => {
+    const named = "databend://cloudapp@tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com:443/default";
+    expect(parseConnectionString(`${named}?warehouse=small-xy2t`)!.warehouse).toBe("small-xy2t");
+    expect(parseConnectionString(`${named}?warehouse=`)!.warehouse).toBe("eric");
+    for (const host of [
+      "tn3ftqihs.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--eric.ch.aws-us-east-2.default.databend.com",
+      "--eric.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--e_ric.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com.example.net",
+      "db--internal.example.com",
+    ]) {
+      expect(parseConnectionString(`databend://cloudapp@${host}:443/default`)!.warehouse, host).toBeUndefined();
+    }
+  });
+
   test("sslmode=require and sslmode=enable verify the certificate, with a notice saying so (X34)", () => {
     const required = parseConnectionString("databend://u:p@host/db?sslmode=require")!;
     expect(required.sslMode).toBe("verify-system");
@@ -1343,7 +1429,7 @@ describe("parseConnectionString: databend:// DSNs", () => {
   test("an sslmode BendSQL refuses sets no mode and is reported, with the port still the TLS one", () => {
     const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
     expect(result.sslMode).toBeUndefined();
-    expect(result.unmappedTLSParam).toBe("sslmode=verify-full");
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
     expect(result.port).toBe("443");
   });
 
@@ -1369,7 +1455,7 @@ describe("parseConnectionString: databend:// DSNs", () => {
     // BendSQL refuses the DSN at an sslmode it cannot read, wherever it stands.
     const refused = parseConnectionString("databend://u:p@host/db?sslmode=bogus&sslmode=disable")!;
     expect(refused.sslMode).toBeUndefined();
-    expect(refused.unmappedTLSParam).toBe("sslmode=bogus");
+    expect(refused.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("bogus")]);
   });
 
   test("an IPv6 host and a password holding a raw @ or : are read as the URL parser splits them", () => {
@@ -1391,12 +1477,6 @@ describe("parseConnectionString: databend:// DSNs", () => {
 
   test("an empty warehouse= fills nothing", () => {
     expect(parseConnectionString("databend://u:p@host/db?warehouse=")!.warehouse).toBeUndefined();
-  });
-
-  test("tls_ca_file is reported as a file path, as MongoDB's tlsCAFile is", () => {
-    const result = parseConnectionString("databend://u:p@host/db?tls_ca_file=/etc/ca.pem")!;
-    expect(result.tlsFileParam).toBe("tls_ca_file=/etc/ca.pem");
-    expect(result.ignoredParameters).toBeUndefined();
   });
 
   test.each(["access_token", "access_token_file", "private_key_file", "private_key_passphrase_file"])(

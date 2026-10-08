@@ -249,6 +249,26 @@ describe("typedLiteral: databend", () => {
     expect(() => typedLiteral("x", "Map(String, Int32)", "databend", scalar)).toThrow("a value of type Map");
   });
 
+  // The type is the server's own text and reaches the writer verbatim, and the refusal is written into a `--` comment
+  // of the exported file, so the name it carries is printable ASCII and bounded.
+  test("names a type it has no literal for in printable text, cut at 64 characters", () => {
+    const refusal = (declared: string) => {
+      try {
+        typedLiteral("x", declared, "databend", scalar);
+      } catch (error) {
+        if (error instanceof UnwritableValue) return error.message;
+      }
+      return "not refused";
+    };
+
+    expect(refusal("Mystery\nSELECT 2 AS injected;\r\n--\f\u2028\u0085\0end")).toBe(
+      "a value of type Mystery?SELECT 2 AS injected;??--????end",
+    );
+    expect(refusal(`G${"e".repeat(63)}`)).toBe(`a value of type G${"e".repeat(63)}`);
+    expect(refusal(`G${"e".repeat(64)}`)).toBe(`a value of type G${"e".repeat(63)}...`);
+    expect(refusal("Bitmap")).toBe("a value of type Bitmap");
+  });
+
   test("writes a number bare, the unsafe 64-bit integers and the exponents included", () => {
     expect(typedLiteral("-9223372036854775808", "Int64", "databend", scalar)).toBe("-9223372036854775808");
     expect(typedLiteral("18446744073709551615", "Nullable(UInt64)", "databend", scalar)).toBe("18446744073709551615");

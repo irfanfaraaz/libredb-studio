@@ -11,6 +11,7 @@
  * statement's affect and echoed role give, and the end-open plan that closes what a statement left open (a
  * transaction with ROLLBACK, temporary tables with a logout, UC5). Ids and the clock are inputs.
  */
+import { serverWords } from "./errors";
 import type { DatabendAffect, DatabendNotice } from "./transport";
 
 /** The ids one statement carries: the query id of its POST, the session id, and the Cloud gateway's route hint. */
@@ -68,19 +69,23 @@ export const TEMP_TABLES_DROPPED =
 /**
  * The warnings of design 3.7 for one statement: its affect (USE, or SET and UNSET, where `UNSET GLOBAL` reports a
  * false flag), and a role echoed unlike the connect probe's. Either role null gives no role warning: the connect
- * probe itself has none to compare with.
+ * probe itself has none to compare with. Each key SET GLOBAL changed is server text, so it passes `serverWords` with
+ * the connection's `secretForms` before a sentence names it.
  */
 export function sessionNotices(
   affect: DatabendAffect | null,
   role: string | null,
   probeRole: string | null,
+  secretForms: readonly string[],
 ): DatabendNotice[] {
   const notices: DatabendNotice[] = [];
   if (affect?.type === "UseDB" || affect?.type === "UseCatalog") notices.push({ kind: "use-not-carried" });
   if (affect?.type === "ChangeSettings") {
     const globalKeys = affect.keys.filter((_key, index) => affect.isGlobals[index] === true);
     if (globalKeys.length < affect.keys.length) notices.push({ kind: "settings-not-carried" });
-    if (globalKeys.length > 0) notices.push({ kind: "global-settings-changed", keys: globalKeys });
+    if (globalKeys.length > 0) {
+      notices.push({ kind: "global-settings-changed", keys: globalKeys.map((key) => serverWords(key, secretForms)) });
+    }
   }
   if (role !== null && probeRole !== null && role !== probeRole) notices.push({ kind: "role-not-carried" });
   return notices;

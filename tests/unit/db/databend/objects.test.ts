@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { QueryError } from "@/lib/db/errors";
 import { callerBoundTruncationReason, sourceBoundTruncationReason } from "@/lib/db/object-kinds";
+import { secretForms, serverText } from "@/lib/db/utils/server-text";
 import {
   DATABEND_OBJECT_SENTENCES,
   DATABEND_SURFACE_ROW_CUT,
@@ -149,7 +150,7 @@ describe("the design 5.4 statements, exactly, as each surface sends them", () =>
   });
 
   test("countObjects: one statement, the four spellings and an ELSE that keeps the unknown one", async () => {
-    expect(await statementsOf((runner) => countObjects(runner, CONTAINER))).toEqual([SQL.counts]);
+    expect(await statementsOf((runner) => countObjects(runner, CONTAINER, []))).toEqual([SQL.counts]);
   });
 
   test("listObjects for each kind's table_type spelling", async () => {
@@ -285,7 +286,7 @@ describe("countObjects", () => {
         ],
       ),
     );
-    expect(await countObjects(runner, CONTAINER)).toEqual({
+    expect(await countObjects(runner, CONTAINER, [])).toEqual({
       table: { count: 2 },
       view: { count: 0 },
       materialized_view: { count: 1 },
@@ -304,9 +305,30 @@ describe("countObjects", () => {
         [["unknown:STREAM TABLE", "1"]],
       ),
     );
-    const failure = await countObjects(runner, CONTAINER).catch((error: unknown) => error);
+    const failure = await countObjects(runner, CONTAINER, []).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(QueryError);
     expect((failure as QueryError).message).toBe(DATABEND_OBJECT_SENTENCES.unknownTableType("STREAM TABLE"));
+  });
+
+  test("an unknown table_type passes serverText with the connection's forms and the refusal's cut (HASIM-D-5)", async () => {
+    const password = "stand-in-1";
+    const forms = secretForms([password, `reader:${password}`]);
+    const unknown = async (spelling: string) => {
+      const { runner } = scripted(
+        outcome(
+          [
+            ["kind", "String"],
+            ["object_count", "UInt64"],
+          ],
+          [[`unknown:${spelling}`, "1"]],
+        ),
+      );
+      return ((await countObjects(runner, CONTAINER, forms).catch((error: unknown) => error)) as QueryError).message;
+    };
+    expect(await unknown(`x ${password}`)).toBe(
+      DATABEND_OBJECT_SENTENCES.unknownTableType(serverText(password, forms)),
+    );
+    expect(await unknown("T".repeat(400))).toBe(DATABEND_OBJECT_SENTENCES.unknownTableType(`${"T".repeat(300)}...`));
   });
 });
 

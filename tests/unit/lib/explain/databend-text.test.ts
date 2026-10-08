@@ -191,6 +191,47 @@ describe("databendTextStrategy.buildSql", () => {
     );
   });
 
+  // HASIM-D-2: the stage token takes `--`, `/*`, a dollar quote and a bracket into the name as it takes `\'`, so what
+  // the span reader reads as a comment or a literal after them is code there. Measured on v1.2.951:
+  // `EXPLAIN SELECT * FROM @~/--, numbers((SELECT count(*) FROM numbers(7)))` planned a `numbers` scan of 7 rows, so
+  // the argument subquery the span reader reads as a comment ran while binding.
+  test.each(MODES)("%s declines a stage name that runs into a comment, a dollar quote or a bracket", (mode) => {
+    for (const sql of [
+      "SELECT * FROM @~/--, numbers((SELECT nextval(s)))",
+      "SELECT * FROM @~/*, numbers((SELECT nextval(s))) -- */",
+      "SELECT * FROM @~/$$, numbers((SELECT nextval(s))) -- $$",
+      "SELECT * FROM @s\uFEFF--, numbers((SELECT nextval(s)))",
+      "SELECT [@s--x\n] AS a",
+      "SELECT * FROM @s[1]",
+    ]) {
+      expect(databendTextStrategy.buildSql(sql, mode), sql).toBeNull();
+    }
+    expect(databendTextStrategy.buildSql("SELECT * FROM @s -- note", mode)).toBe("EXPLAIN SELECT * FROM @s -- note");
+  });
+
+  /**
+   * A timing guard for the walk: a run of `@` is one stage token, and a nested `[` was read to its closing bracket at
+   * every level and after every `(`. Measured on the walk this replaced: 3.1 seconds for 25k `@`, 2.2 seconds for 50k
+   * nested brackets, and 3.4 seconds for 20k nested `([`.
+   */
+  test("answers in bounded time on a long run of @ and on deeply nested brackets", () => {
+    const BOUND_MS = 200;
+    const adversarial: [string, string][] = [
+      ["a 20k run of @", `SELECT 1 FROM ${"@".repeat(20_000)}`],
+      ["50k nested brackets", `SELECT ${"[".repeat(50_000)}${"]".repeat(50_000)}`],
+      ["20k nested ([", `SELECT ${"([".repeat(20_000)}${"])".repeat(20_000)}`],
+    ];
+
+    for (const [label, sql] of adversarial) {
+      const started = performance.now();
+      const built = databendTextStrategy.buildSql(sql, "estimate");
+      const elapsed = performance.now() - started;
+
+      expect(built, label).toBe(`EXPLAIN ${sql}`);
+      expect(elapsed, `${label} took ${elapsed.toFixed(1)}ms`).toBeLessThan(BOUND_MS);
+    }
+  });
+
   // X06, X29: a subquery opener at depth 2 or more is an argument subquery, which binds
   // by executing, so the background estimate declines it.
   test.each([

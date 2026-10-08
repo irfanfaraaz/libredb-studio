@@ -110,6 +110,7 @@ import { CONNECTION_FORM_DEFAULTS, offersReadOnlyToggle, useConnectionForm } fro
 import { resolveAgentRunConnectionId } from "@/hooks/use-connection-payload";
 import type { DatabaseConnection, DatabaseType } from "@/lib/types";
 import {
+  DATABEND_DSN_CAUTIONS,
   DATABEND_DSN_REFUSALS,
   DATABEND_SSLMODE_NOTICES,
   databendNotAppliedNotice,
@@ -3803,18 +3804,85 @@ describe("a databend:// paste (Databend design 6.2)", () => {
     expect(plain.current.testResult).toEqual({ tone: "warning", message: databendNotAppliedNotice(["role"]) });
   });
 
-  test("a TLS warning keeps the not-applied names and the sslmode notice after it", () => {
-    const file = paste("databend://u:p@host/db?tls_ca_file=/ca.pem&role=r&sslmode=require");
+  test("a tls_ca_file says Studio reads no CA path and where the certificate goes, after the names not applied", () => {
+    const file = paste("databend://u:p@host/db?tls_ca_file=/etc/databend/ca.pem&role=r&sslmode=require");
     expect(file.current.sslMode).toBe("verify-system");
-    expect(file.current.testResult!.tone).toBe("warning");
-    expect(file.current.testResult!.message).toStartWith('"tls_ca_file=/ca.pem" is a file path');
-    expect(file.current.testResult!.message).toEndWith(
-      ` ${databendNotAppliedNotice(["role"])} ${DATABEND_SSLMODE_NOTICES.require}`,
+    expect(file.current.testResult).toEqual({
+      tone: "warning",
+      message: `${databendNotAppliedNotice(["role"])} ${DATABEND_DSN_CAUTIONS.caFile} ${DATABEND_SSLMODE_NOTICES.require}`,
+    });
+    // Not the MongoDB sentence, which says the server reads the file and a pasted CA is used instead of it.
+    expect(file.current.testResult!.message).not.toContain("is a file path");
+    expect(file.current.testResult!.message).not.toContain("/etc/databend/ca.pem");
+    const alone = paste("databend://u:p@host/db?tls_ca_file=/etc/databend/ca.pem");
+    expect(alone.current.testResult).toEqual({ tone: "warning", message: DATABEND_DSN_CAUTIONS.caFile });
+  });
+
+  test("an sslmode BendSQL does not read gets Databend's caution and leaves SSL mode as it was", () => {
+    const unmapped = paste("databend://u:p@host/db?sslmode=verify-full&role=r&tenant=t", (form) =>
+      form.setSSLMode("verify-ca"),
     );
-    const unmapped = paste("databend://u:p@host/db?sslmode=bogus&role=r&tenant=t");
-    expect(unmapped.current.testResult!.tone).toBe("warning");
-    expect(unmapped.current.testResult!.message).toStartWith('TLS setting not applied: "sslmode=bogus"');
-    expect(unmapped.current.testResult!.message).toEndWith(` ${databendNotAppliedNotice(["role", "tenant"])}`);
+    expect(unmapped.current.sslMode).toBe("verify-ca");
+    expect(unmapped.current.testResult).toEqual({
+      tone: "warning",
+      message: `${databendNotAppliedNotice(["role", "tenant"])} ${DATABEND_DSN_CAUTIONS.sslmode("verify-full")}`,
+    });
+    // Not the form's sentence, which lists verify-full among the modes it says the parameter has no equivalent in.
+    expect(unmapped.current.testResult!.message).not.toContain("has no equivalent among");
+  });
+
+  test("a second paste replaces the first one's warehouse, or clears it, so its host is never sent that warehouse", async () => {
+    const onTestConnection = mock<(connection: DatabaseConnection) => Promise<{ success: boolean }>>(async () => ({
+      success: true,
+    }));
+    const { result } = renderHook(() => useConnectionForm({ ...defaultPasteProps, onTestConnection }));
+    const pasteNext = (text: string) => {
+      act(() => result.current.setPasteInput(text));
+      act(() => result.current.handlePasteConnectionString());
+    };
+    pasteNext("databend://cloudapp@tenant.gw.aws-us-east-2.default.databend.com:443/default?warehouse=w1");
+    expect(result.current.warehouse).toBe("w1");
+    pasteNext("databend://root@databend.other-team.example:8000/default?warehouse=w2");
+    expect(result.current.warehouse).toBe("w2");
+    pasteNext("databend://root@databend.other-team.example:8000/default?sslmode=disable");
+    expect(result.current.host).toBe("databend.other-team.example");
+    expect(result.current.warehouse).toBe("");
+    await act(async () => {
+      await result.current.handleTestConnection();
+    });
+    expect(onTestConnection).toHaveBeenCalledTimes(1);
+    expect(onTestConnection.mock.calls[0][0]).not.toHaveProperty("warehouse");
+  });
+
+  test("a paste of another engine's string clears a leftover warehouse too, which that engine never sends", () => {
+    const result = paste("postgres://app:pw@db.example.com:5432/prod", (form) => {
+      form.setType("databend");
+      form.setWarehouse("w1");
+    });
+    expect(result.current.type).toBe("postgres");
+    expect(result.current.warehouse).toBe("");
+  });
+
+  test("an older Databend Cloud host fills Warehouse from the host", () => {
+    const result = paste("databend://cloudapp@tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com:443/default");
+    expect(result.current.host).toBe("tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com");
+    expect(result.current.warehouse).toBe("eric");
+    expect(result.current.testResult!.tone).toBe("success");
+  });
+
+  test("a / in the password before the @ is refused with its sentence, and nothing is filled", () => {
+    const text =
+      "databend://cloudapp:2024/Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default?warehouse=w1";
+    const result = paste(text, (form) => form.setShowPasteInput(true));
+    expect(result.current.testResult).toEqual({ tone: "error", message: DATABEND_DSN_REFUSALS.userinfo });
+    expect(result.current.type).toBe("postgres");
+    expect(result.current.host).toBe("localhost");
+    expect(result.current.port).toBe("5432");
+    expect(result.current.name).toBe("");
+    expect(result.current.database).toBe("");
+    expect(result.current.warehouse).toBe("");
+    expect(result.current.showPasteInput).toBe(true);
+    expect(result.current.pasteInput).toBe(text);
   });
 
   test.each([

@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYAML } from "yaml";
 import {
+  DATABEND_DSN_CAUTIONS,
   DATABEND_DSN_REFUSALS,
   DATABEND_SSLMODE_NOTICES,
   databendNotAppliedNotice,
@@ -274,6 +275,10 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
     keys: Object.keys(DATABEND_SSLMODE_NOTICES),
     quotes: Object.values(DATABEND_SSLMODE_NOTICES),
   },
+  DATABEND_DSN_CAUTIONS: {
+    keys: Object.keys(DATABEND_DSN_CAUTIONS),
+    quotes: [DATABEND_DSN_CAUTIONS.caFile, DATABEND_DSN_CAUTIONS.sslmode("verify-full")],
+  },
   DATABEND_OBJECT_SENTENCES: {
     keys: Object.keys(DATABEND_OBJECT_SENTENCES),
     quotes: [
@@ -357,6 +362,85 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(limits).toContain("a cold start through Studio and multi-node paging are not run yet");
   });
 
+  test("the header sends a DSN to Paste URL, and the overview names no other type's route (owner decision Q6)", () => {
+    const head = DOC.slice(0, DOC.indexOf("## 1. Overview"));
+    expect(rowOf(head, "**Connection string**")).toBe(
+      "| **Connection string** | Not offered: a pasted `https://` address goes into Host, which splits it, and a `databend://` DSN into Paste URL of a new connection, which fills the fields ([4.1](#41-configuration-fields)) |",
+    );
+    const overview = flat(sectionOf(DOC, "## 1. Overview"));
+    expect(overview).not.toContain("`mysql`");
+    // The one fact the unreachable sentence relies on.
+    expect(overview).toContain(
+      "Studio does not use Databend's MySQL handler (port 3307) or its Flight SQL handler (port 8900).",
+    );
+    expect(DATABEND_ERROR_SENTENCES.network("[host]", slot("[port]"), "[cause]")).toContain(
+      "3307 (MySQL) and 8900 (Flight SQL) are not used",
+    );
+  });
+
+  test("a Databend Cloud host, the older one that names its warehouse included, is stated where the billing is", () => {
+    const cloud = flat(sectionOf(DOC, "### 4.4 Databend Cloud: warehouse, cold start and billing"));
+    expect(cloud).toContain("`<tenant>--<warehouse>.gw.<region>.default.databend.com`");
+    expect(cloud).toContain("`databend.com` or `databend.cn`");
+    const older = "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com";
+    expect(new DatabendProvider({ ...CONNECTION, host: older }).getCapabilities().resumesBilledCompute).toBe(true);
+    expect(parseConnectionString(`databend://cloudapp@${older}:443/default`)?.warehouse).toBe("eric");
+    expect(flat(sectionOf(DOC, "### 4.1 Configuration fields"))).toContain(
+      "or, with no `warehouse=`, the warehouse an older Databend Cloud host names (section 4.4)",
+    );
+    expect(flat(sectionOf(DOC, "## 9. Capabilities & labels"))).toContain(
+      "`resumesBilledCompute` is declared when Warehouse is set or the host is Databend Cloud's (section 4.4).",
+    );
+  });
+
+  test("the sign-in latch is promised for one Studio process, wherever it is promised", () => {
+    const latch = flat(sectionOf(DOC, "### 3.7 The sign-in latch"));
+    expect(latch).toContain(
+      "its kill, ROLLBACK and logout included, that Studio process sends that password to that server again only after 15 minutes",
+    );
+    expect(latch).toContain("[D252](../BACKLOG.md)");
+    expect(flat(sectionOf(DOC, "## 13. Known limitations"))).toContain(
+      "The sign-in latch is one Studio process's: several replicas each send a refused password once per 15 minutes",
+    );
+    const features = read("docs/FEATURES.md")
+      .split("\n")
+      .find((line) => line.includes("**Databend:**"));
+    expect(features).toContain("Each Studio process sends a sign-in Databend refused at most once per 15 minutes");
+    const d248 = /^### D248\. [\s\S]*?(?=^### )/m.exec(BACKLOG)?.[0] ?? "";
+    expect(d248).toContain("within one Studio process");
+    expect(d248).toContain("D252");
+  });
+
+  test("the kill is stated as the Sessions panel shows it, which is not the provider's own wording (U98)", () => {
+    const maintenance = flat(sectionOf(DOC, "## 8. Maintenance"));
+    expect(maintenance).toContain('a "Terminate Session?" dialog');
+    expect(maintenance).toContain('"Session [session id] terminated successfully"');
+    expect(maintenance).toContain("[U98](../BACKLOG.md)");
+    // The panel's copy as the shared UI holds it today; U98 changes both, and then this section.
+    expect(read("src/components/monitoring/tabs/SessionsTab.tsx")).toContain("Terminate Session?");
+    const dialog =
+      "will forcefully end the connection and may cause data loss if the session has uncommitted transactions";
+    expect(maintenance).toContain(`says the action "${dialog}"`);
+    expect(flat(read("src/components/monitoring/tabs/SessionsTab.tsx"))).toContain(dialog);
+    expect(read("src/hooks/use-monitoring-data.ts")).toContain("`Session ${pid} terminated successfully`");
+  });
+
+  test("the live check's writes and the readOnly refusal are stated as they happen", () => {
+    const live = flat(sectionOf(DOC, "### 11.3 The live check"));
+    expect(live).toContain("writes only to `studio_demo` and `libredb_demo`");
+    expect(live).toContain("the user `studio_scratch` under the password policy `studio_scratch_policy`");
+    expect(flat(sectionOf(DOC, "### 4.1 Configuration fields"))).toContain(
+      "a seed file that sets it is refused when the file loads",
+    );
+    const recipe = /```yaml\n([\s\S]*?)```/.exec(sectionOf(DOC, "### 12.3 A seed connection"))?.[1] ?? "";
+    const [seed] = parseYAML(recipe.replace(/\$\{\w+\}/g, "filled")) as Record<string, unknown>[];
+    const refused = SeedConnectionSchema.safeParse({ ...seed, readOnly: true });
+    expect(refused.error?.issues.map((issue) => issue.path.join("."))).toEqual(["readOnly"]);
+    expect(flat(sectionOf(DOC, "### 12.3 A seed connection"))).toContain(
+      "`readOnly: true` is refused for this type when the seed file loads (section 4.1)",
+    );
+  });
+
   test("the programmatic example names the factory's entry point and no line of it", () => {
     expect(DOC).toMatch(/`createDatabaseProvider\(\)` \(\[`factory\.ts`\]\(\.\.\/\.\.\/src\/lib\/db\/factory\.ts\)\)/);
     expect(DOC).not.toMatch(/factory\.ts:\d/);
@@ -375,7 +459,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     ]);
     expect(rowOf(fields, "Host")).toBe(`| Host | ${DATABEND_FIELD_HINTS.host} |`);
     expect(rowOf(fields, "Port")).toBe(
-      `| Port | \`${DATABEND_DEFAULT_PORT}\` by default, the query node's HTTP handler; 443 comes from TLS, a DSN or an https:// paste |`,
+      `| Port | \`${DATABEND_DEFAULT_PORT}\` by default, the query node's HTTP handler; 443 comes from a DSN or an https:// paste, and choosing an SSL mode keeps the port, so set 443 by hand for Databend Cloud |`,
     );
     expect(UI.defaultPort).toBe(String(DATABEND_DEFAULT_PORT));
     expect(capabilities.defaultPort).toBe(DATABEND_DEFAULT_PORT);
@@ -395,11 +479,16 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       const [text, message] = row.slice(2, -2).split(" | ");
       const parsed = parseConnectionString(text.slice(1, -1));
       expect(parsed?.type, text).toBe("databend");
-      expect(parsed?.refusal ?? parsed?.notice, text).toBe(message);
+      expect(parsed?.refusal ?? parsed?.cautions?.join(" ") ?? parsed?.notice, text).toBe(message);
       named.add(message);
     }
     expect([...named].sort()).toEqual(
-      [...Object.values(DATABEND_DSN_REFUSALS), ...Object.values(DATABEND_SSLMODE_NOTICES)].sort(),
+      [
+        ...Object.values(DATABEND_DSN_REFUSALS),
+        ...Object.values(DATABEND_SSLMODE_NOTICES),
+        DATABEND_DSN_CAUTIONS.caFile,
+        DATABEND_DSN_CAUTIONS.sslmode("verify-full"),
+      ].sort(),
     );
     const prose = flat(paste);
     for (const scheme of ["`databend://`", "`databend+http://`", "`databend+https://`"]) {
@@ -483,8 +572,9 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "maintenanceRefused",
       ],
       DATABEND_MONITORING_SENTENCES: ["killNeedsId", "killIdRefused", "killAsked", "sessionState"],
-      DATABEND_DSN_REFUSALS: ["fragment", "signIn", "flight", "jdbc", "shellExport"],
+      DATABEND_DSN_REFUSALS: ["fragment", "userinfo", "signIn", "flight", "jdbc", "shellExport"],
       DATABEND_SSLMODE_NOTICES: ["require", "enable"],
+      DATABEND_DSN_CAUTIONS: ["caFile", "sslmode"],
       DATABEND_OBJECT_SENTENCES: [
         "bound",
         "incomplete",
@@ -857,7 +947,9 @@ describe("docs/providers/databend.md quotes what the code says", () => {
 
   test("every backlog id the doc cites is an entry of docs/BACKLOG.md", () => {
     const cited = [...new Set([...DOC.matchAll(/\[([BDUS]\d{1,3})\]\(\.\.\/BACKLOG\.md\)/g)].map((match) => match[1]))];
-    for (const id of ["D246", "D247", "D248", "D249", "U97", "B103", "S2"]) expect(cited).toContain(id);
+    for (const id of ["D246", "D247", "D248", "D249", "D250", "D252", "U97", "U98", "B103", "S2"]) {
+      expect(cited).toContain(id);
+    }
     for (const id of cited) expect(BACKLOG).toMatch(new RegExp(`^### ${id}\\. `, "m"));
   });
 
@@ -894,6 +986,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       "skipped by name",
       "the session's current statement",
       "verified locally",
+      "several replicas",
     ]) {
       expect(limits, fragment).toContain(fragment);
     }

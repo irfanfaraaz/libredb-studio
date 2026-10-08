@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { DatabendError } from "@/lib/db/providers/sql/databend/transport";
+import { serverText } from "@/lib/db/utils/server-text";
 import {
   capturedAnswer,
   idsOf,
@@ -13,6 +14,7 @@ import {
   pathsOf,
   statement,
   TEST_NODE,
+  TEST_PASSWORD,
   testQueryId,
   transportHarness,
 } from "../../../helpers/databend-node-transport";
@@ -166,6 +168,21 @@ describe("an Active transaction (design 3.4; X13)", () => {
     expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-failed", step: "rollback" }]);
   });
 
+  test("the ROLLBACK's chain stops at its poll bound, one per second of its 5 s and the allowance: 105 GETs", async () => {
+    const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
+    // A server that answers every link at once with another one; the scripted clock never runs the 5 s out.
+    const again = { method: "GET" as const, path: R.page(0), reply: ok(rollback, { next_uri: R.page(0) }) };
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE }) },
+      { method: "POST", path: "/v1/query", reply: ok(rollback, { session: echo({}), next_uri: R.page(0) }) },
+      ...Array.from({ length: 105 }, () => again),
+    ]);
+    const outcome = await transport.run(statement("BEGIN"));
+    script.expectDone();
+    expect(script.requests).toHaveLength(2 + 105);
+    expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-failed", step: "rollback" }]);
+  });
+
   test("a ROLLBACK link that fails within its 5 s is a close failure", async () => {
     const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
     const { script, transport } = transportHarness([
@@ -246,6 +263,44 @@ describe("temporary tables (design 3.4, UC5)", () => {
       { method: "POST", path: LOGOUT, reply: { status: 200 } },
     ]);
     await expect(transport.run(statement("SELECT a FROM t"))).rejects.toBeInstanceOf(DatabendError);
+    script.expectDone();
+  });
+});
+
+describe("server text in a notice (HASIM-D-5)", () => {
+  test("an echoed result mode and a SET GLOBAL key that hold the password are withheld, as a server warning is", async () => {
+    const { script, options, transport } = transportHarness([
+      {
+        method: "POST",
+        path: "/v1/query",
+        reply: ok(FIRST, {
+          session: echo({ settings: { http_json_result_mode: `x ${TEST_PASSWORD}` } }),
+          affect: { type: "ChangeSettings", keys: [TEST_PASSWORD], values: ["1"], is_globals: [true] },
+          warnings: [`w ${TEST_PASSWORD}`],
+        }),
+      },
+    ]);
+    const outcome = await transport.run(statement("SET GLOBAL max_threads = 1"));
+    script.expectDone();
+    const withheld = serverText(TEST_PASSWORD, options.secretForms);
+    expect(outcome.notices).toEqual([
+      { kind: "global-settings-changed", keys: [withheld] },
+      { kind: "server-warning", text: withheld },
+      { kind: "result-mode", mode: withheld },
+    ]);
+  });
+
+  test("an echoed result mode is cut at 300 characters, as a refusal's text is", async () => {
+    const { script, transport } = transportHarness([
+      {
+        method: "POST",
+        path: "/v1/query",
+        reply: ok(FIRST, { session: echo({ settings: { http_json_result_mode: "m".repeat(400) } }) }),
+      },
+    ]);
+    expect((await transport.run(statement("SELECT 1"))).notices).toEqual([
+      { kind: "result-mode", mode: `${"m".repeat(300)}...` },
+    ]);
     script.expectDone();
   });
 });

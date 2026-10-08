@@ -453,6 +453,18 @@ describe("the latch key [X03]", () => {
     expect(build({ host, password: TEST_PASSWORD }).latchKey).not.toBe(build({ host, password: "password2" }).latchKey);
   });
 
+  test.each([
+    ["an IPv6 address", ["::1", "[::1]", "0:0:0:0:0:0:0:1", "[0::1]"]],
+    ["a host name and its final dot", ["localhost", "localhost.", "LOCALHOST"]],
+    ["a remote host name and its final dot", ["db.example.test", "db.example.test."]],
+  ])("is one key for %s however it is spelled, while the endpoint keeps each spelling (HASIM-D-6)", (_label, hosts) => {
+    const built = hosts.map((host) => build({ host, password: TEST_PASSWORD, allowInsecureAuth: true }));
+    expect(new Set(built.map((options) => options.latchKey)).size).toBe(1);
+    expect(built.map((options) => options.endpoint.host)).toEqual(
+      hosts.map((host) => host.replace(/^\[|\]$/g, "").toLowerCase()),
+    );
+  });
+
   test("ignores the warehouse, since the user is locked whatever compute is named", () => {
     expect(build({ warehouse: "a" }).latchKey).toBe(build({ warehouse: "b" }).latchKey);
   });

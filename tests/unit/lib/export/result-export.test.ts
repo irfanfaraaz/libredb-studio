@@ -1707,6 +1707,44 @@ describe("buildResultExport: a row with a cell the dialect has no literal for (#
       '-- Row 1 skipped: column "a\\nDROP TABLE x; --?" holds an array that is not a list, which trino has no literal for.',
     );
   });
+
+  // A Databend type is the server's own text, kept verbatim in `columnTypes`, so a hostile or impersonated endpoint
+  // chooses it, and the comment names a type that has no literal by that text.
+  const plantedType = (end: string) =>
+    buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ c: "x" }],
+        fields: ["c"],
+        dialect: "databend",
+        columnTypes: { c: `Mystery${end}SELECT 2 AS injected;${end}--` },
+      }),
+    ).content;
+
+  test("cannot let a declared type end the comment", () => {
+    const content = plantedType("\n");
+
+    expect(content.split("\n")).toHaveLength(1);
+    expect(content).toBe(
+      '-- Row 1 skipped: column "c" holds a value of type Mystery?SELECT 2 AS injected;?--, which databend has no literal for.',
+    );
+  });
+
+  // Databend's own lexer ends a `--` comment at a form feed too (`--[^\n\f]*`), and other replaying clients at the rest.
+  test.each<[string, string]>([
+    ["a carriage return", "\r"],
+    ["a carriage return and a line feed", "\r\n"],
+    ["a form feed", "\f"],
+    ["a vertical tab", "\v"],
+    ["a NUL", "\0"],
+    ["a next-line character", "\u0085"],
+    ["a line separator", "\u2028"],
+    ["a paragraph separator", "\u2029"],
+  ])("cannot let a declared type end the comment at %s", (_, end) => {
+    expect(plantedType(end)).toMatch(
+      /^-- Row 1 skipped: column "c" holds a value of type Mystery\?+SELECT [\x20-\x7e]*$/,
+    );
+  });
 });
 
 describe("buildResultExport: the table the producing query read (#1386)", () => {

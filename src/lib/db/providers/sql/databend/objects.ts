@@ -43,6 +43,7 @@ import { quoteIdentifier } from "@/lib/sql/identifier";
 import { quoteLiteral } from "@/lib/sql/values";
 import type { ColumnSchema, IndexSchema } from "@/lib/types";
 import { decodeOutcome } from "./decode";
+import { serverWords } from "./errors";
 import type { DatabendTruncation, StatementOutcome } from "./transport";
 
 const PROVIDER = "databend";
@@ -278,9 +279,11 @@ export async function listDatabases(
   });
 }
 
+/** Every kind's count; a `table_type` Studio has no kind for is raised by name, through `serverWords` (design 3.13). */
 export async function countObjects(
   runner: DatabendStatementRunner,
   container: DatabendContainer,
+  secretForms: readonly string[],
 ): Promise<Record<string, KindCount>> {
   const counts: Record<string, KindCount> = Object.fromEntries(
     DATABEND_OBJECT_KINDS.map((kind) => [kind, { count: 0 }]),
@@ -290,7 +293,7 @@ export async function countObjects(
     const kind = readText(row.kind);
     if (!(kind in TABLE_TYPES)) {
       const spelling = kind.startsWith(UNKNOWN_KIND_PREFIX) ? kind.slice(UNKNOWN_KIND_PREFIX.length) : kind;
-      throw new QueryError(DATABEND_OBJECT_SENTENCES.unknownTableType(spelling), PROVIDER);
+      throw new QueryError(DATABEND_OBJECT_SENTENCES.unknownTableType(serverWords(spelling, secretForms)), PROVIDER);
     }
     counts[kind] = { count: readNumber(row.object_count) ?? 0 };
   }

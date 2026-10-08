@@ -736,7 +736,7 @@ describe("declared connection-field copy (#1085)", () => {
     expect(databend).toMatchObject({
       label: "Databend",
       color: "text-hue-red-alt",
-      // Self-hosted's HTTP handler port. 443 comes from TLS, a DSN or an https:// paste, never a host heuristic.
+      // Self-hosted's HTTP handler port. 443 comes from a DSN or an https:// paste, never the SSL mode or a host heuristic.
       defaultPort: "8000",
       showConnectionStringToggle: false,
       connectionFields: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],

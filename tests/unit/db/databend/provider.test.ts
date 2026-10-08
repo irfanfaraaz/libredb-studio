@@ -42,6 +42,7 @@ import {
 import { DATABEND_MULTIPLE_STATEMENTS } from "@/lib/db/providers/sql/databend/sql-text";
 import { LimiterFullError } from "@/lib/db/utils/bounded-limiter";
 import { MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
+import { type DatabaseConnection, TUNNEL_FAR_END } from "@/lib/types";
 import {
   answerBody,
   scriptedNodeTransport,
@@ -219,6 +220,27 @@ function fakeDatabend({
   return server;
 }
 
+/** The rows of each page Studio asks for (`max_rows_per_page`), which a page of Databend never exceeds. */
+const PAGE_ROWS = 10_000;
+
+/**
+ * One statement's rows as Databend sends them: at most a page in each answer, the first in the POST's answer and each
+ * next one at the page its link names, the last pointing at the final link. `first` is the POST's answer, `page` the
+ * fake's page reply.
+ */
+function paged(schema: readonly unknown[], rows: readonly unknown[][]) {
+  const pages = Math.ceil(rows.length / PAGE_ROWS);
+  const slice = (n: number) => rows.slice(n * PAGE_ROWS, (n + 1) * PAGE_ROWS);
+  return {
+    first: { schema, data: slice(0), next_uri: pages > 1 ? "PAGE" : "FINAL" } as Fields,
+    page: (path: string, queryId: string): Reply => {
+      const n = Number(path.split("/").at(-1));
+      const next = n + 1 < pages ? `/v1/query/${queryId}/page/${n + 1}` : `/v1/query/${queryId}/final`;
+      return { schema, data: slice(n), next_uri: next };
+    },
+  };
+}
+
 /** A fake whose statements answer `answers` first and the connect reads otherwise. */
 function withConnect(answers: (sql: string) => Reply | Promise<Reply> | undefined = () => undefined) {
   return (sql: string): Reply | Promise<Reply> => answers(sql) ?? connectAnswer(sql) ?? {};
@@ -363,10 +385,40 @@ describe("construction and declarations", () => {
     for (const sql of ["SELECT 'CREATE'", "INSERT INTO t SELECT * FROM created"]) expect(pattern.test(sql)).toBe(false);
   });
 
-  test("resumesBilledCompute is declared exactly when Warehouse is set, read before any connect", () => {
+  test("resumesBilledCompute is declared when Warehouse is set, read before any connect", () => {
     expect(build(fakeDatabend(), { warehouse: "" }).provider.getCapabilities().resumesBilledCompute).toBeUndefined();
     expect(build(fakeDatabend(), { warehouse: null }).provider.getCapabilities().resumesBilledCompute).toBeUndefined();
     expect(build(fakeDatabend(), { warehouse: "wh-1" }).provider.getCapabilities().resumesBilledCompute).toBe(true);
+  });
+
+  test.each([
+    ["the gateway host", "tn3ftqihs.gw.aws-us-east-2.default.databend.com"],
+    ["an older host that names its warehouse", "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com"],
+    ["a host in China", "tnf34b0rm--elt-wh-medium.gw.aliyun-cn-beijing.default.databend.cn"],
+    ["a host in capitals, with a trailing dot", "TN3FTQIHS.GW.AWS-US-EAST-2.DEFAULT.DATABEND.COM."],
+  ])("resumesBilledCompute is declared for a Databend Cloud host with Warehouse empty: %s", (_case, host) => {
+    expect(build(fakeDatabend(), { host, warehouse: "" }).provider.getCapabilities().resumesBilledCompute).toBe(true);
+  });
+
+  test("a host only named like Databend Cloud's is not one, and a tunnel is judged by its far end", () => {
+    for (const host of [
+      "databend.com",
+      "tn3ftqihs.gw.databend.com.example.net",
+      "notdatabend.com",
+      "localhost",
+      8000,
+    ]) {
+      expect(build(fakeDatabend(), { host }).provider.getCapabilities().resumesBilledCompute, String(host)).toBe(
+        undefined,
+      );
+    }
+    const through = (farEnd: string) =>
+      new DatabendProvider({
+        ...testConnection({ host: "127.0.0.1", port: 40123 }),
+        [TUNNEL_FAR_END]: { host: farEnd, port: 443 },
+      } as DatabaseConnection).getCapabilities().resumesBilledCompute;
+    expect(through("tn3ftqihs.gw.aws-us-east-2.default.databend.com")).toBe(true);
+    expect(through("databend.internal")).toBeUndefined();
   });
 
   test("getLabels() answers a copy of the Databend labels", () => {
@@ -476,6 +528,43 @@ describe("connect", () => {
     expect(provider.isConnected()).toBe(false);
   });
 
+  test("an older Cloud host names its warehouse in the resuming sentence, and only Warehouse is sent as the header", async () => {
+    const cloud = {
+      host: "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com",
+      port: 443,
+      ssl: { mode: "verify-system" },
+    };
+    const probe = async (overrides: Record<string, unknown>) => {
+      const fake = fakeDatabend({ answer: () => "hang" });
+      const headers: Partial<Record<string, string>>[] = [];
+      const watched: FakeServer = {
+        ...fake,
+        factory: (options) => {
+          headers.push({ ...options.headers });
+          return fake.factory(options);
+        },
+      };
+      const { provider, time } = build(watched, { ...cloud, ...overrides }, 10_000);
+      const connecting = provider.connect().catch((error: unknown) => error);
+      await until(() => fake.requests.length === 1);
+      time.fire(10_000);
+      const failure = await connecting;
+      expect(failure).toBeInstanceOf(TimeoutError);
+      expect(headers).toHaveLength(1);
+      return { message: (failure as Error).message, header: headers[0]["x-databend-warehouse"] };
+    };
+    expect(await probe({})).toEqual({ message: DATABEND_ERROR_SENTENCES.resuming("eric", "10"), header: undefined });
+    expect(await probe({ warehouse: "wh-1" })).toEqual({
+      message: DATABEND_ERROR_SENTENCES.resuming("wh-1", "10"),
+      header: "wh-1",
+    });
+    // The gateway host carries no warehouse, so nothing is named: its own refusal asks for Warehouse (section 4.4).
+    expect(await probe({ host: "tn3ftqihs.gw.aws-us-east-2.default.databend.com" })).toEqual({
+      message: DATABEND_ERROR_SENTENCES.deadline("10"),
+      header: undefined,
+    });
+  });
+
   test("a second connect replaces the first session and closes it", async () => {
     const fake = fakeDatabend({ answer: withConnect() });
     const { provider } = build(fake);
@@ -491,8 +580,12 @@ describe("connect", () => {
 // ============================================================================
 
 describe("query", () => {
-  async function connected(answers?: (sql: string) => Reply | Promise<Reply> | undefined, overrides = {}) {
-    const fake = fakeDatabend({ answer: withConnect(answers) });
+  async function connected(
+    answers?: (sql: string) => Reply | Promise<Reply> | undefined,
+    overrides = {},
+    page?: (path: string, queryId: string) => Reply | Promise<Reply>,
+  ) {
+    const fake = fakeDatabend({ answer: withConnect(answers), ...(page === undefined ? {} : { page }) });
     const built = build(fake, overrides);
     await built.provider.connect();
     return { fake, ...built, sent: () => fake.requests.length };
@@ -603,10 +696,14 @@ describe("query", () => {
   test("a result cut at the statement budget is marked on pagination and warned about", async () => {
     const width = 5;
     const rows = Array.from({ length: 50_001 }, () => Array.from({ length: width }, () => "1"));
-    const { provider } = await connected((sql) =>
-      sql === "SELECT * FROM wide"
-        ? { schema: Array.from({ length: width }, (_, index) => column(`c${index}`, "Int32")), data: rows }
-        : undefined,
+    const wide = paged(
+      Array.from({ length: width }, (_, index) => column(`c${index}`, "Int32")),
+      rows,
+    );
+    const { provider } = await connected(
+      (sql) => (sql === "SELECT * FROM wide" ? wide.first : undefined),
+      {},
+      wide.page,
     );
     const result = await provider.query("SELECT * FROM wide");
     expect(result.rows).toHaveLength(50_000);
@@ -843,19 +940,22 @@ describe("a statement budget cut on the object surface [X05]", () => {
 
   test("a cut inside a table drops that table and says so", async () => {
     const container = { catalog: "default", database: "libredb_demo" };
+    const columns = paged(
+      COLUMN_SCHEMA.map((name) => column(name)),
+      [
+        ["t1", "a", "Int32", "NO", "", ""],
+        ["t1", "b", "String", "YES", "", ""],
+        ...Array.from({ length: 41_665 }, (_, index) => ["t2", `c${index}`, "Int32", "NO", "", ""]),
+      ],
+    );
     const fake = fakeDatabend({
       answer: withConnect((sql) => {
         if (sql.startsWith("SELECT name AS object_name")) {
           return { schema: [column("object_name")], data: [["t1"], ["t2"]] };
         }
-        if (!sql.startsWith("SELECT `table` AS object_name")) return undefined;
-        const rows = [
-          ["t1", "a", "Int32", "NO", "", ""],
-          ["t1", "b", "String", "YES", "", ""],
-          ...Array.from({ length: 41_665 }, (_, index) => ["t2", `c${index}`, "Int32", "NO", "", ""]),
-        ];
-        return { schema: COLUMN_SCHEMA.map((name) => column(name)), data: rows };
+        return sql.startsWith("SELECT `table` AS object_name") ? columns.first : undefined;
       }),
+      page: columns.page,
     });
     const { provider } = build(fake);
     await provider.connect();
@@ -867,17 +967,15 @@ describe("a statement budget cut on the object surface [X05]", () => {
 
   test("an over-budget describe refuses, naming the bound", async () => {
     const sql = SQL.columns("wide");
+    const columns = paged(
+      COLUMN_SCHEMA.slice(1)
+        .concat("comment")
+        .map((name) => column(name)),
+      Array.from({ length: 41_667 }, (_, index) => [`c${index}`, "Int32", "NO", "", "", ""]),
+    );
     const fake = fakeDatabend({
-      answer: withConnect((sent) =>
-        sent === sql
-          ? {
-              schema: COLUMN_SCHEMA.slice(1)
-                .concat("comment")
-                .map((name) => column(name)),
-              data: Array.from({ length: 41_667 }, (_, index) => [`c${index}`, "Int32", "NO", "", "", ""]),
-            }
-          : undefined,
-      ),
+      answer: withConnect((sent) => (sent === sql ? columns.first : undefined)),
+      page: columns.page,
     });
     const { provider } = build(fake);
     await provider.connect();

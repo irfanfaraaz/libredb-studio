@@ -16,8 +16,9 @@
  *   `$a$` as a variable (`\$[_a-zA-Z][_$a-zA-Z0-9]*`) and reads what lies between two of them as code;
  * - a `$$` run straight after an identifier character: Databend's identifier tail takes `$` (`is_ident_continue`), so
  *   `a$$` is one name there and what the span reader reads as a dollar string is code;
- * - a code-level `@` stage token holding a backslash: `@([^\s,`;'"()]|\\\s|\\'|\\"|\\\\)+` takes `\'` into the name,
- *   so `@s\'; DROP TABLE t; --'` is a stage, a `;` and a DROP there and one statement here;
+ * - a code-level `@` stage token holding a backslash or a run the span reader opens: `@([^\s,`;'"()]|\\\s|\\'|\\"|\\\\)+`
+ *   takes `\'`, `--`, `/*`, `$$` and `[` into the name, so `@s\'; DROP TABLE t; --'` and `@s--;DROP TABLE t` are a
+ *   stage, a `;` and a DROP there and one statement here;
  * - a `/*+` hint holding a `;`: Databend tokenizes a hint body where the span reader sees a block comment, and no hint
  *   needs a `;`;
  * - a `/*+` hint holding a token that can run past the closing star-slash the span reader stops at: wherever the
@@ -25,7 +26,7 @@
  *   a stage name or a `~*` that takes it in moves the end to a later one, and no `;` is needed to hide a statement.
  *
  * The checks that say Studio's reading is not Databend's come before the count, which is only meaningful once the two
- * readings agree.
+ * readings agree. An array literal's contents are code to both readers, so each check holds inside one too.
  */
 
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
@@ -50,7 +51,7 @@ export const DATABEND_IDENTIFIER_DOLLAR =
   "A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again.";
 
 export const DATABEND_STAGE_BACKSLASH =
-  "A stage name (@...) in this text holds a backslash, which Databend reads as part of the name together with the quote after it, so Studio cannot tell where the statement ends. Remove the backslash and run again.";
+  "A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again.";
 
 export const DATABEND_HINT_SEMICOLON =
   "An optimizer hint (/*+ ... */) in this text holds a semicolon, which Databend reads as code and Studio as a comment. Remove the semicolon from the hint and run again.";
@@ -63,15 +64,24 @@ const GRAMMAR = resolveSqlGrammar("databend");
 /** Databend's only dollar literal; any other tag opens a variable token there. */
 const DOLLAR_LITERAL_OPENER = "$$";
 
-/** The characters that end a stage token, from the lexer's `[^\s,`;'"()]`. */
-const STAGE_END = /[\s,`;'"()]/;
+/**
+ * The characters that end a stage token, from the lexer's `[^\s,`;'"()]`. That `\s` is Unicode White_Space, which
+ * JavaScript's `\s` is not: measured on v1.2.951, U+0085 ends a stage name and U+FEFF does not.
+ */
+const STAGE_END = /[\p{White_Space},`;'"()]/u;
 
-/** Whether the stage token whose `@` is at `index` holds a backslash before its first ending character. */
-function stageHoldsBackslash(sql: string, index: number): boolean {
-  for (let i = index + 1; i < sql.length && !STAGE_END.test(sql[i]); i++) {
-    if (sql[i] === "\\") return true;
+/**
+ * Where the stage token whose `@` is at `index` ends, or `undefined` when the span reader reads part of it as other
+ * than plain code: a backslash, which takes the quote or space after it into the name, or any run the span reader
+ * opens there (`--`, `/*`, `$$`, `[`), which Databend reads as part of the name and the span reader can end past it.
+ */
+function plainStageEnd(sql: string, index: number): number | undefined {
+  let i = index + 1;
+  while (i < sql.length && !STAGE_END.test(sql[i])) {
+    if (sql[i] === "\\" || readSqlSpan(sql, i, GRAMMAR) !== null) return undefined;
+    i++;
   }
-  return false;
+  return i;
 }
 
 /** Whether the character before `index` continues a Databend identifier, which takes `$` into its tail. */
@@ -94,10 +104,17 @@ function lexerDisagreement(sql: string): string | null {
   let i = 0;
 
   while (i < sql.length) {
-    const span = readSqlSpan(sql, i, GRAMMAR);
+    // A `[` is stepped into, not over, so an array literal's contents are walked as the rest of the code is.
+    const span = sql[i] === "[" ? null : readSqlSpan(sql, i, GRAMMAR);
     if (span === null) {
-      if (sql[i] === "@" && stageHoldsBackslash(sql, i)) return DATABEND_STAGE_BACKSLASH;
-      i++;
+      if (sql[i] !== "@") {
+        i++;
+        continue;
+      }
+      // The whole stage token is code to both readers when it ends plainly, so the walk resumes after it.
+      const end = plainStageEnd(sql, i);
+      if (end === undefined) return DATABEND_STAGE_BACKSLASH;
+      i = end;
       continue;
     }
     if (span.kind === "dollar-string" && !sql.startsWith(DOLLAR_LITERAL_OPENER, i)) return DATABEND_TAGGED_DOLLAR;

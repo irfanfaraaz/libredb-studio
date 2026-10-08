@@ -15,6 +15,10 @@ import {
   TRANSACTION_MAY_STAY_OPEN,
   USE_NOT_CARRIED,
 } from "@/lib/db/providers/sql/databend/session";
+import { secretForms, serverText } from "@/lib/db/utils/server-text";
+
+/** A connection with no password, whose secret forms are none. */
+const NO_FORMS: readonly string[] = [];
 
 const UUIDS = [
   "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
@@ -86,11 +90,11 @@ describe("the x-databend-session value", () => {
 
 describe("the warnings of design 3.7", () => {
   test("none for a null affect and an unchanged role", () => {
-    expect(sessionNotices(null, "account_admin", "account_admin")).toEqual([]);
+    expect(sessionNotices(null, "account_admin", "account_admin", NO_FORMS)).toEqual([]);
   });
 
   test.each(["UseDB", "UseCatalog"] as const)("%s: USE does not carry over", (type) => {
-    expect(sessionNotices({ type, name: "other" }, null, null)).toEqual([{ kind: "use-not-carried" }]);
+    expect(sessionNotices({ type, name: "other" }, null, null, NO_FORMS)).toEqual([{ kind: "use-not-carried" }]);
   });
 
   test("a session-level SET or UNSET does not carry over (UNSET GLOBAL reports false)", () => {
@@ -100,7 +104,7 @@ describe("the warnings of design 3.7", () => {
       values: ["4", "UTC"],
       isGlobals: [false, false],
     } as const;
-    expect(sessionNotices(affect, null, null)).toEqual([{ kind: "settings-not-carried" }]);
+    expect(sessionNotices(affect, null, null, NO_FORMS)).toEqual([{ kind: "settings-not-carried" }]);
   });
 
   test("a true in is_globals names the keys SET GLOBAL changed for every session", () => {
@@ -110,7 +114,7 @@ describe("the warnings of design 3.7", () => {
       values: ["4", "UTC"],
       isGlobals: [true, true],
     } as const;
-    expect(sessionNotices(affect, null, null)).toEqual([
+    expect(sessionNotices(affect, null, null, NO_FORMS)).toEqual([
       { kind: "global-settings-changed", keys: ["max_threads", "timezone"] },
     ]);
   });
@@ -122,25 +126,39 @@ describe("the warnings of design 3.7", () => {
       values: ["4", "UTC"],
       isGlobals: [false, true],
     } as const;
-    expect(sessionNotices(affect, null, null)).toEqual([
+    expect(sessionNotices(affect, null, null, NO_FORMS)).toEqual([
       { kind: "settings-not-carried" },
       { kind: "global-settings-changed", keys: ["timezone"] },
     ]);
   });
 
+  test("each key SET GLOBAL changed passes serverText with the connection's forms and the refusal's cut (HASIM-D-5)", () => {
+    const password = "stand-in-1";
+    const forms = secretForms([password, `reader:${password}`]);
+    const affect = {
+      type: "ChangeSettings",
+      keys: [password, "k".repeat(400), "max_threads"],
+      values: ["1", "2", "4"],
+      isGlobals: [true, true, true],
+    } as const;
+    expect(sessionNotices(affect, null, null, forms)).toEqual([
+      { kind: "global-settings-changed", keys: [serverText(password, forms), `${"k".repeat(300)}...`, "max_threads"] },
+    ]);
+  });
+
   test("a role unlike the connect probe's does not carry over", () => {
-    expect(sessionNotices(null, "analyst", "account_admin")).toEqual([{ kind: "role-not-carried" }]);
+    expect(sessionNotices(null, "analyst", "account_admin", NO_FORMS)).toEqual([{ kind: "role-not-carried" }]);
   });
 
   test.each([
     [null, "account_admin"],
     ["analyst", null],
   ])("no role warning when the echoed role is %p and the probe's is %p", (role, probeRole) => {
-    expect(sessionNotices(null, role, probeRole)).toEqual([]);
+    expect(sessionNotices(null, role, probeRole, NO_FORMS)).toEqual([]);
   });
 
   test("the affect and the role warnings together", () => {
-    expect(sessionNotices({ type: "UseDB", name: "other" }, "analyst", "public")).toEqual([
+    expect(sessionNotices({ type: "UseDB", name: "other" }, "analyst", "public", NO_FORMS)).toEqual([
       { kind: "use-not-carried" },
       { kind: "role-not-carried" },
     ]);

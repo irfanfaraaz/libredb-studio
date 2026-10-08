@@ -67,9 +67,10 @@ import {
   type RunRegistry,
 } from "@/lib/db/utils/bounded-limiter";
 import { MAX_UNLIMITED_ROWS } from "@/lib/db/utils/query-limiter";
-import type { WithTunnelFarEnd } from "@/lib/types";
+import { TUNNEL_FAR_END, type WithTunnelFarEnd } from "@/lib/types";
 import { SQLBaseProvider } from "../sql-base";
 import { DATABEND_ANSWER_SENTENCES } from "./answer";
+import { databendCloudHostWarehouse, isDatabendCloudHost } from "./cloud-host";
 import {
   buildDatabendConnectionOptions,
   DATABEND_DEFAULT_PORT,
@@ -246,6 +247,18 @@ function toQueryResult(outcome: StatementOutcome, sql: string, executionTime: nu
   };
 }
 
+/**
+ * Whether a request on this connection can resume, and bill, a Databend Cloud warehouse (design 2.4): it names a
+ * Warehouse, or its host is Databend Cloud's, whose older form reaches the warehouse it names with Warehouse empty
+ * (section 4.4). Read from the raw connection, so an unconnected provider answers it; the dialog writes "" for a blank
+ * box, and under a tunnel the server is the far end, never the local forward.
+ */
+function resumesBilledCompute(config: DatabaseConnection & WithTunnelFarEnd): boolean {
+  const warehouse: unknown = config.warehouse;
+  const host: unknown = config[TUNNEL_FAR_END]?.host ?? config.host;
+  return (typeof warehouse === "string" && warehouse !== "") || (typeof host === "string" && isDatabendCloudHost(host));
+}
+
 /** Which of Studio's own stops ended a permit wait: the deadline carries a `TimeoutError` reason. */
 function isDeadline(reason: unknown): boolean {
   return reason instanceof DOMException && reason.name === "TimeoutError";
@@ -280,8 +293,6 @@ export class DatabendProvider extends SQLBaseProvider {
   // ==========================================================================
 
   public override getCapabilities(): ProviderCapabilities {
-    // Read from the raw connection, so an unconnected provider answers it; the dialog writes "" for a blank box.
-    const warehouse: unknown = this.config.warehouse;
     return {
       queryLanguage: "sql",
       // Plain EXPLAIN, never ANALYZE, and a declined screen for the shapes that execute while binding (design 5.6).
@@ -300,7 +311,7 @@ export class DatabendProvider extends SQLBaseProvider {
       supportsMaintenance: true,
       maintenanceOperations: ["kill"],
       maintenanceOperationSpecs: { kill: DATABEND_KILL_SPEC },
-      // A DSN is pasted into Host by the form's own reader (design 6.3), never as a connection string.
+      // An address is split by the Host box's own reader and a DSN by Paste URL (design 6.2), never a connection string.
       supportsConnectionString: false,
       defaultPort: DATABEND_DEFAULT_PORT,
       // Every name in backticks, so a mixed-case or reserved name is never bare (design 5.1); no terminator is set.
@@ -318,7 +329,7 @@ export class DatabendProvider extends SQLBaseProvider {
         relationKind("dynamic_table", "Dynamic Table", "Dynamic Tables"),
       ],
       // A Databend Cloud warehouse resumes, and bills, on any request; self-hosted without one keeps its pulse.
-      ...(typeof warehouse === "string" && warehouse !== "" ? { resumesBilledCompute: true as const } : {}),
+      ...(resumesBilledCompute(this.config) ? { resumesBilledCompute: true as const } : {}),
     };
   }
 
@@ -338,9 +349,12 @@ export class DatabendProvider extends SQLBaseProvider {
   public async connect(): Promise<void> {
     let session: DatabendSession | undefined;
     try {
-      const options = buildDatabendConnectionOptions(this.config as DatabaseConnection & WithTunnelFarEnd, {
+      const built = buildDatabendConnectionOptions(this.config as DatabaseConnection & WithTunnelFarEnd, {
         queryTimeout: this.queryTimeout,
       });
+      // The sentences name the warehouse an older Databend Cloud host carries as they name a Warehouse (section 4.4);
+      // the header is the Warehouse field's alone, already set when the options were built.
+      const options = { ...built, warehouse: built.warehouse ?? databendCloudHostWarehouse(built.endpoint.host) };
       session = {
         options,
         transport: createDatabendHttpTransport(options, this.deps),
@@ -571,7 +585,8 @@ export class DatabendProvider extends SQLBaseProvider {
 
   public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
     const address = this.container(container);
-    return this.surface((run) => countContainerObjects(run, address));
+    const { secretForms } = this.requireSession().options;
+    return this.surface((run) => countContainerObjects(run, address, secretForms));
   }
 
   public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {

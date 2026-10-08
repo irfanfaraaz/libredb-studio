@@ -10,14 +10,18 @@
  *
  * The key is SHA-256 over the length-framed scheme, far end, bastion route, user and password [X03]. The far end is
  * the tunnel's when an SSH tunnel carries the connection, never the local forward, which is a new port for every
- * tunnel and every Test Connection; the warehouse is not framed, because the user is locked whatever compute is
- * named. No secret is kept: the map holds digests.
+ * tunnel and every Test Connection; its host is framed in one spelling, so one server written two ways is one key.
+ * The warehouse is not framed, because the user is locked whatever compute is named. No secret is kept: the map holds
+ * digests.
  *
- * Single flight [X14]: until a key has had a 200 answer, one attempt holds it. Another acquire waits inside its own
- * signal and is refused unsent if the first latches; a proven key never waits. An attempt that ends with neither a
- * 200 nor a latching refusal hands the key to the next waiter.
+ * Single flight [X14]: until a key has had an answer, one attempt holds it, from its POST to its last close. Another
+ * acquire waits inside its own signal and is refused unsent if the first latches; a proven key never waits. Only an
+ * answer read as one proves a key, never a refusal, whatever its status; an attempt released with neither a proof nor
+ * a latch hands the key to the next waiter.
  *
- * At most 256 entries, each lasting 15 minutes: a new key first drops every expired entry, then the oldest [X30].
+ * At most 256 entries, each lasting 15 minutes: a new entry first drops every expired one, then the oldest proven
+ * one, and the oldest latched one only when every entry is latched and live [X30]. A proof is never kept at the cost
+ * of a latch: with every entry latched and live it is not written, and its key stays unproven.
  */
 import { createHash } from "node:crypto";
 import { latchedError, latchesSignIn, type SignInAnswer } from "./errors";
@@ -40,15 +44,20 @@ export interface AuthLatchIdentity {
   readonly password: string;
 }
 
-/** One attempt's hold on its key, which its first answer settles. */
+/** One attempt's hold on its key, from the statement's POST to its last close. */
 export interface AuthAttempt {
+  /** An answer read as one arrived: the key is proven, and every waiter proceeds. */
+  prove(): void;
   /**
-   * Reports an answer: a 200 proves the key, a refusal that `latchesSignIn` of `errors.ts` names latches it, and
-   * anything else hands it on.
+   * Reports a refusal, of any request and over any status: one that `latchesSignIn` of `errors.ts` names latches the
+   * key, and true says so; nothing else changes it.
    */
-  settle(answer: SignInAnswer): void;
-  /** The attempt ended with no answer (a network failure, a timeout or a cancel): the key goes to the next waiter. */
-  abandon(): void;
+  refuse(answer: SignInAnswer): boolean;
+  /**
+   * The attempt sent its last request: an unproven key goes to the next waiter, or every waiter is refused when it
+   * latched. A second call does nothing.
+   */
+  release(): void;
 }
 
 export interface AuthLatch {
@@ -59,10 +68,21 @@ export interface AuthLatch {
   acquire(key: string, signal: AbortSignal): Promise<AuthAttempt>;
 }
 
+/**
+ * One spelling per host: an IPv6 literal, the one validated host holding a colon, as the URL standard serialises it
+ * (`0:0:0:0:0:0:0:1` is `::1`), and a DNS name without its final dot.
+ */
+function canonicalHost(host: string): string {
+  if (host.includes(":")) return new URL(`http://[${host}]/`).hostname.slice(1, -1);
+  return host.endsWith(".") ? host.slice(0, -1) : host;
+}
+
 /** The key of one identity: SHA-256 hex over the length-framed fields, so no field slides into the next. */
 export function authLatchKey(identity: AuthLatchIdentity): string {
   const { scheme, host, port, route, user, password } = identity;
-  const framed = [scheme, host, String(port), route, user, password].map((value) => `${value.length}:${value}`);
+  const framed = [scheme, canonicalHost(host), String(port), route, user, password].map(
+    (value) => `${value.length}:${value}`,
+  );
   return createHash("sha256").update(framed.join(""), "utf8").digest("hex");
 }
 
@@ -93,12 +113,23 @@ export function createAuthLatch(deps: { readonly now: () => number }): AuthLatch
     return deps.now() - entry.at >= AUTH_LATCH_TTL_MS;
   }
 
+  /** The entry to evict for a write of `state`: the oldest proven one, else the oldest latched one for a latch. */
+  function evictable(state: Entry["state"]): string | undefined {
+    for (const [key, entry] of entries) if (entry.state === "proven") return key;
+    return state === "latched" ? (entries.keys().next().value as string) : undefined;
+  }
+
   function write(key: string, state: Entry["state"]): void {
     entries.delete(key);
     if (entries.size >= AUTH_LATCH_MAX_ENTRIES) {
       for (const [other, entry] of entries) if (expired(entry)) entries.delete(other);
     }
-    if (entries.size >= AUTH_LATCH_MAX_ENTRIES) entries.delete(entries.keys().next().value as string);
+    if (entries.size >= AUTH_LATCH_MAX_ENTRIES) {
+      const evicted = evictable(state);
+      // Every entry is latched and live: a proof is not kept at the cost of a latch.
+      if (evicted === undefined) return;
+      entries.delete(evicted);
+    }
     entries.set(key, { state, at: deps.now() });
   }
 
@@ -136,14 +167,17 @@ export function createAuthLatch(deps: { readonly now: () => number }): AuthLatch
       handOn(key);
     };
     return {
-      settle(answer) {
-        // A late 200 from an attempt acquired before a newer refusal never lifts that latch.
-        if (answer.status === 200) {
-          if (liveEntry(key)?.state !== "latched") write(key, "proven");
-        } else if (latchesSignIn(answer)) write(key, "latched");
+      prove() {
+        // A late answer from an attempt acquired before a newer refusal never lifts that latch.
+        if (liveEntry(key)?.state !== "latched") write(key, "proven");
         release();
       },
-      abandon: release,
+      refuse(answer) {
+        if (!latchesSignIn(answer)) return false;
+        write(key, "latched");
+        return true;
+      },
+      release,
     };
   }
 

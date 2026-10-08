@@ -1085,11 +1085,14 @@ function sqlValue(
  * literal in the dialect (#1386). One refused statement stops the whole file on replay, so
  * the row is skipped and named instead. The column name is engine output, so it is written
  * as JSON with everything outside printable ASCII replaced: a line break in it would end
- * the comment and put the rest of the name in the file as a statement.
+ * the comment and put the rest of the name in the file as a statement. What the cell holds
+ * can carry engine output too (a Databend type is the server's own text), so it gets the
+ * same replacement.
  */
 function skippedRow(rowIndex: number, column: string, what: string, dialect: DatabaseType | undefined): string {
   const name = JSON.stringify(column).replace(/[^\x20-\x7e]/g, "?");
-  return `-- Row ${rowIndex + 1} skipped: column ${name} holds ${what}, which ${dialect ?? "this dialect"} has no literal for.`;
+  const held = what.replace(/[^\x20-\x7e]/g, "?");
+  return `-- Row ${rowIndex + 1} skipped: column ${name} holds ${held}, which ${dialect ?? "this dialect"} has no literal for.`;
 }
 
 /**

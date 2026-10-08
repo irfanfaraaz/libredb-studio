@@ -15,7 +15,7 @@ This document is the single reference point for the provider: design, architectu
 | **Query language** | `sql` |
 | **Default port** | `8000`, the query node's HTTP handler; Databend Cloud serves HTTPS on 443 ([4.1](#41-configuration-fields)) |
 | **Connection pooling** | One keep-alive agent per connection, three sockets; every statement runs in a session of its own ([3.4](#34-every-statement-runs-in-a-session-of-its-own)) |
-| **Connection string** | Not offered: a pasted `https://` address or `databend://` DSN goes into Host, which splits it ([4.1](#41-configuration-fields)) |
+| **Connection string** | Not offered: a pasted `https://` address goes into Host, which splits it, and a `databend://` DSN into Paste URL of a new connection, which fills the fields ([4.1](#41-configuration-fields)) |
 | **EXPLAIN** | `databend-text`: plain `EXPLAIN` in both modes, never `EXPLAIN ANALYZE`, and no plan for the shapes that run while binding ([5.6](#56-explain-is-the-planning-form-only)) |
 | **Writes** | Every statement Databend accepts runs as written; no inline row edit, no object edit ([6.3](#63-object-edit-789-not-in-this-version)) |
 | **Transactions** | Not exposed: a transaction a statement leaves open is rolled back when the statement ends ([3.5](#35-what-a-statement-leaves-open-is-closed)) |
@@ -32,7 +32,7 @@ It reads and writes Databend through the same HTTP query API that BendSQL and th
 It lists catalogs, databases, tables, views, materialized views and dynamic tables, describes their columns, shows their DDL, runs any one statement per request, explains a SELECT, and reads the monitoring panels from `system` tables.
 The same type serves a self-hosted query node and a Databend Cloud warehouse: a Cloud connection names its warehouse, and a self-hosted one usually leaves Warehouse empty.
 
-Databend also speaks the MySQL wire protocol on port 3307; that route is the `mysql` type's and is not used here.
+Studio does not use Databend's MySQL handler (port 3307) or its Flight SQL handler (port 8900).
 
 ### 1.1 Concept mapping
 
@@ -68,6 +68,7 @@ Inside `src/lib/db` nothing branches on the type id: what differs is declared by
 | `retry.ts` | Whether a failed request is sent again, and after how long |
 | `session.ts` | The per-statement ids, the session header, the session warnings and the end-open plan |
 | `auth-latch.ts` | The process-wide sign-in latch |
+| `cloud-host.ts` | Which hosts are Databend Cloud's, and the warehouse an older Cloud host names (section 4.4) |
 | `errors.ts` | Every failure's category and the sentence a person reads, through `serverText` |
 | `sql-text.ts` | The statement guard |
 | `decode.ts` | Cells to grid values, column names and the DML count |
@@ -127,12 +128,15 @@ When the ROLLBACK does not report `AutoCommit` for its own id, the warning is in
 
 > The transaction may stay open until Databend's idle timeout (4 hours).
 
+The ROLLBACK's own links are followed inside its 5 seconds and under the poll bound of section 3.2 for those 5 seconds, 105 links; a chain that does not end within both gets the ROLLBACK's close warning below.
+
 A session the answer says still needs keep-alive holds a temporary table, and a `POST /v1/session/logout` ends it, which drops the table:
 
 > Each statement runs in its own session, so Studio ended it, which dropped the temporary tables it created.
 
 A POST that may have reached the server with no answer gets a kill and one logout, since the session id is Studio's own.
 An auth refusal, a middleware 400 or a fail-to-start answer sends nothing more: a kill, ROLLBACK or logout would carry the refused credential again and count toward a lockout.
+A close that Databend answers with a refused sign-in counts the same: the sign-in is latched (section 3.7), and the statement's remaining closes, a resent kill, the ROLLBACK and the logout among them, are not sent.
 Each close is best effort under its own 5 seconds, off the statement's signal; one that does not answer is a warning on a finished statement, never an error that would report a committed write as failed:
 
 > The statement finished, but Studio's request to close the finished statement (final) got no answer within 5 seconds.
@@ -143,10 +147,13 @@ Each close is best effort under its own 5 seconds, off the statement's signal; o
 
 > The statement finished, but Studio's request to end its session (logout) got no answer within 5 seconds.
 
+A close left unsent after a refused sign-in gives its warning too, and an unsent ROLLBACK the warning that the transaction may stay open.
+
 ### 3.6 Retries
 
 A statement POST the server may have received is never sent again, because Databend could run it twice.
 The one exception is a Databend Cloud gateway's `ProvisionWarehouseTimeout`, which the gateway answers without forwarding, so the POST goes again with the same ids while the warehouse resumes.
+A Stop or the deadline in the wait between two such attempts sends nothing more, neither a kill nor a logout, since no attempt reached the warehouse, and the run reads as cancelled or timed out (section 5.8).
 A GET of the chain (a page, the final, the kill) is sent again after a network failure or an intermediary's 429, 502, 503, 504 or 520, since the server re-serves each of them.
 The backoff is 1, 2, 4, 8 and 8 seconds, each 20 percent either way, a `Retry-After` in seconds honoured, and never a wait that reaches the time left: at most six POST attempts and three GET attempts.
 A page that gave no answer within its attempt timer, with statement time left, is asked for again at once, one time, inside the three GET attempts; a second silence ends the statement with "No answer arrived from Databend (a page of the result did not arrive in two attempts)".
@@ -155,10 +162,14 @@ ROLLBACK and logout are never retried.
 ### 3.7 The sign-in latch
 
 Databend counts failed sign-ins for a user under a password policy, and five within 15 minutes lock that user for 15 minutes, during which the right password is refused too (measured, L10: the sixth wrong password and then the right one answer HTTP 500 with code 2215).
-Studio retries on its own (the connection pulse, the fleet check, a tree read and a probe sent at once on activation), so the latch lives in the process: once Databend refuses a sign-in, Studio sends that password to that server again only after 15 minutes, or after the credential changes.
+Studio retries on its own (the connection pulse, the fleet check, a tree read and a probe sent at once on activation), so the latch lives in the process: once Databend refuses a sign-in, on any request of a statement, its kill, ROLLBACK and logout included, that Studio process sends that password to that server again only after 15 minutes, or after the credential changes.
+Each Studio process holds a latch of its own, so several replicas each send a refused password once per 15 minutes, and five or more can still lock the user ([D252](../BACKLOG.md)).
+A gateway's sign-in refusal latches over any HTTP status, 200 included, and only an answer proves a sign-in, never a refusal.
 Two connections with the same key share the latch, a disconnect does not clear it, and a restart does.
 The key is SHA-256 over the scheme, the far end, the SSH bastion route, the user and the password; no secret is kept.
-Until a key has had a 200 answer, one attempt holds it and the others wait, so a refused password is sent once.
+The far end's host is framed in one spelling: an IPv6 address however it is written, and a host name with or without its final dot, are one key, while an error still names the host as configured.
+Until a key has had an answer, one statement holds it and the others wait until it has sent its last request, its closes included, so a refused password is sent once.
+The latch holds 256 keys: a new one takes the place of an expired key first, then of the oldest proven one, and of the oldest latched one only when every key is latched and live; a proof never takes a latched key's place, so its key stays unproven.
 A latched key is refused with no request:
 
 > Databend refused this sign-in at [time] UTC, so Studio will not send this password again before [until] UTC, or until it changes.
@@ -182,6 +193,10 @@ There is no token exchange and no server-minted session, so each request costs o
 | Bound | Value |
 |---|---|
 | One answer | 16 MiB (16,777,216 bytes) per HTTP answer; past it the socket is destroyed, the statement is killed and the run fails as too large |
+| Rows of one answer | the page the statement asked for, `max_rows_per_page` |
+| Columns of one answer | 250,000, the cell budget, since a wider schema keeps no row; inside them, 750,000 keys and commas, three per column |
+| The rest of one answer | 65,536 arrays, objects, keys and values outside its rows and columns |
+| A refusal | its first 65,536 characters are read; a longer one is read by its HTTP status alone |
 | Answer text per statement | 16 MiB (16,777,216 bytes) across its pages; past it the rows read so far are kept and the result is marked limited |
 | Cells | 250,000 cells (rows times columns) per result; past it the rows read so far are kept and the result is marked limited |
 | Rows | the limiter's page for a bounded statement, and 100,000 rows for an unlimited one |
@@ -193,6 +208,13 @@ There is no token exchange and no server-minted session, so each request costs o
 | Kill, final, ROLLBACK and logout | 5 seconds each, off the statement's own signal |
 | Monitoring lists | 50 sessions and 20 slow queries by default, at most 500 |
 | Sign-in latch | 15 minutes per refused sign-in, at most 256 entries |
+
+What one answer costs before the budgets apply is bounded by these, not by its 16 MiB.
+Before an answer is parsed, one pass over its text counts what parsing it would build, outside strings: its rows, its columns and their keys, and every other array, object, key and value.
+An answer that holds more than the table allows is refused as a protocol fault without being parsed, and the statement is killed.
+A row's cells are bounded by the answer's bytes alone, since a page wider than the cell budget is legal and the budget cuts it once it is read.
+The answer is parsed with no reviver, a key named `__proto__` is looked for afterwards, and the rows are checked where they lie and never copied.
+Measured on Node 24 with the old space limited (`wire-heap.test.ts`): a page of 16 MiB of `[]` rows, one of `[null]` rows, and a JSON refusal of 16 MiB of `[]` or `""` are each refused or cut within about 11 MiB of old space.
 
 A cut result says which budget it reached:
 
@@ -216,7 +238,7 @@ No SQL provider bounds the statement text it is handed ([D249](../BACKLOG.md)).
 | Field | Rule |
 |---|---|
 | Host | A host name or address, or a pasted https:// address, which is split into Host and Port. Databend Cloud: the host from Connect in the Cloud console, on port 443 with SSL mode verify-system. Self-hosted: the query node, port 8000 unless http_handler_port was changed. |
-| Port | `8000` by default, the query node's HTTP handler; 443 comes from TLS, a DSN or an https:// paste |
+| Port | `8000` by default, the query node's HTTP handler; 443 comes from a DSN or an https:// paste, and choosing an SSL mode keeps the port, so set 443 by hand for Databend Cloud |
 | User | A SQL user. On Databend Cloud: cloudapp, or a user created with CREATE USER; the email you sign in to the Cloud console with is not a SQL user. |
 | Password | Sent with User as Basic authentication on every request; empty is sent as an empty password |
 | Database | The current database for names a statement does not qualify. Empty means default. |
@@ -224,12 +246,14 @@ No SQL provider bounds the statement text it is handed ([D249](../BACKLOG.md)).
 | Send the password without TLS | Ticked, the password crosses the network in cleartext to this host. Databend Cloud never needs this: it serves HTTPS on port 443. |
 
 The connection-string box is not offered, because it reads `http://` and `https://` as ClickHouse; a pasted address goes into Host, and a DSN goes into Paste URL of a new connection, which fills the fields.
-Paste URL reads `databend://`, `databend+http://` and `databend+https://` as BendSQL reads a DSN: TLS unless `sslmode=disable` (`databend+http://` without TLS), the DSN's port, else 443 with TLS and 80 without, the path as Database and `warehouse=` as Warehouse.
-A spelling Studio does not connect with fills no field and says what to paste instead, and a DSN's `sslmode=require` or `sslmode=enable` fills SSL mode verify-system, not the unverified `require` of section 4.3, and says so:
+Paste URL reads `databend://`, `databend+http://` and `databend+https://` as BendSQL reads a DSN: TLS unless `sslmode=disable` (`databend+http://` without TLS), the DSN's port, else 443 with TLS and 80 without, the path as Database and `warehouse=` as Warehouse, or, with no `warehouse=`, the warehouse an older Databend Cloud host names (section 4.4).
+A paste that names a host sets Warehouse, clearing it when the DSN names none, but keeps a password, user or database the DSN does not carry, so check them after a second paste ([D250](../BACKLOG.md)).
+A spelling Studio does not connect with fills no field and says what to paste instead; a DSN's `sslmode=require` or `sslmode=enable` fills SSL mode verify-system, not the unverified `require` of section 4.3, and says so; and a `tls_ca_file`, or an `sslmode` BendSQL does not read, fills the other fields and says what to set under SSL / TLS:
 
 | Paste | What Studio says |
 |---|---|
 | `databend://cloudapp@host:443/db#x` | The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field. |
+| `databend://cloudapp:pa/ss@host:443/db` | The DSN's user or password holds / or ?, which end the address part of a URL: percent-encode them as %2F and %3F, or type the password in its own field. |
 | `databend://cloudapp@host:443/db?access_token=t` | Token and key-pair sign-in are not supported in this version: paste a DSN that signs in with a SQL user and password, or fill the fields. |
 | `databend+flight://root@localhost:8900/` | Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443. |
 | `databend+grpc://root@localhost:8900/` | Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443. |
@@ -237,13 +261,16 @@ A spelling Studio does not connect with fills no field and says what to paste in
 | `export BENDSQL_DSN="databend://root@localhost:8000/"` | Paste the DSN itself: the databend:// text inside the quotes. |
 | `databend://cloudapp@host:443/db?sslmode=require` | sslmode=require in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system. |
 | `databend://cloudapp@host:443/db?sslmode=enable` | sslmode=enable in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system. |
+| `databend://cloudapp@host:443/db?tls_ca_file=/etc/databend/ca.pem` | Studio reads no CA file path from a DSN, so tls_ca_file was not applied: paste the certificate's contents into the CA field under SSL / TLS. |
+| `databend://cloudapp@host:443/db?sslmode=verify-full` | sslmode=verify-full is not a Databend DSN mode (BendSQL reads disable, require and enable), so SSL mode was left as it was: choose one under SSL / TLS. |
 
-A parameter other than `warehouse`, `sslmode` and `tls_ca_file` is not applied; it is named, never valued, and the other fields are filled in:
+A parameter other than `warehouse`, `sslmode` and `tls_ca_file` is not applied: it is named in a warning, never valued, and the other fields are filled in:
 
 > Not applied: [names]. Studio's Databend connection takes host, port, user, password, database, warehouse and TLS; the other fields were filled in.
 
 The SSL / TLS panel and the SSH tunnel are offered.
-A `readOnly: true` connection is refused when it opens, because the provider does not enforce a read-only mode: connect with a database role that cannot write instead.
+`readOnly: true` is refused for this type, because the provider does not enforce a read-only mode: a seed file that sets it is refused when the file loads, and a connection from the API before any provider is built.
+Connect with a database role that cannot write instead.
 
 Each field is checked when the connection opens, before any socket, and a refusal names the field and never the value:
 
@@ -286,7 +313,8 @@ On Databend Cloud, or with Warehouse set, the refusal adds:
 
 > On Databend Cloud, sign in with a SQL user of the warehouse; the console login is not a SQL user.
 
-Through the Databend Cloud gateway a refused sign-in is a 401 of kind `AuthorizationFailed` wrapping the query node's own 401 and code, and a lockout a 500 wrapping code 2215; both are read and latched like a direct answer.
+Through the Databend Cloud gateway a refused sign-in is a 401 of kind `AuthorizationFailed` wrapping the query node's own 401 and code, and a lockout a 500 wrapping code 2215; both are read and latched like a direct answer, as is either kind over another status, HTTP 200 included.
+A refused sign-in on any request of a statement, its kill, final, ROLLBACK or logout included, is latched the same way.
 A 401 with no sign-in code, on a follow-up request of a running statement, reads "Databend refused a follow-up request of this statement." and is not latched.
 A connection that signs in as `root` with no password gets a warning in the dialog:
 
@@ -310,6 +338,9 @@ A Databend DSN's `sslmode=require` is not this mode: it verifies the certificate
 A Databend Cloud connection names its warehouse, sent as `x-databend-warehouse` on every request; a self-hosted server ignores the header unless its cluster routes by warehouse (it logs one WARN line per request, measured, UC4).
 A suspended warehouse resumes on any request and is billed while it runs, and opening the connection is a request: it runs the version probe and then reads the object tree.
 So with Warehouse set the provider declares `resumesBilledCompute`, and Studio sends the connection no background health checks: no connection pulse and no fleet check, only what a person asks for.
+A host under `databend.com` or `databend.cn` is Databend Cloud's, as BendSQL and databend-jdbc tell it apart, and the provider declares `resumesBilledCompute` for it with Warehouse empty too.
+The older host form `<tenant>--<warehouse>.gw.<region>.default.databend.com` names a warehouse and reaches it with no `x-databend-warehouse` header (measured on the test tenant, 2026-10-08), so a pulse would resume it and bill it.
+For such a host the sentences of this section name the warehouse the host carries, as they name a Warehouse, while only the Warehouse field is sent as the header; a DSN paste of that form fills Warehouse from the host unless the DSN has `warehouse=` (section 4.1).
 A probe or tree read that outlasts its budget on a named warehouse is most likely a resume, and reads:
 
 > Warehouse "[warehouse]" did not answer within [seconds] seconds; it may be resuming. Try again in a minute, or resume it in the Databend Cloud console.
@@ -398,12 +429,17 @@ It reads the text under the Databend grammar row and refuses, with these sentenc
 | `SELECT 1 -- c\fSELECT 2` | This text holds a form feed, which ends a -- comment in Databend but not in Studio's reading. Remove it and run again. |
 | `SELECT $a$ x $a$` | A dollar-quoted run in this text is tagged ($name$), which Databend reads as a variable and not a quote, so the text between two tags is code there and Studio cannot tell where the statement ends. Use $$ quoting and run again. |
 | `SELECT a$$x$$` | A $$ run in this text follows a name with no space, which Databend reads as part of the name and not a quote, so Studio cannot tell where the statement ends. Put a space before the $$ and run again. |
-| `SELECT * FROM @s\'; DROP TABLE t; --'` | A stage name (@...) in this text holds a backslash, which Databend reads as part of the name together with the quote after it, so Studio cannot tell where the statement ends. Remove the backslash and run again. |
+| `SELECT * FROM @s\'; DROP TABLE t; --'` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
+| `SELECT 1 FROM @s--;DROP TABLE t` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
+| `SELECT 1 FROM @s/*;DROP TABLE t;*/` | A stage name (@...) in this text holds a backslash or runs into a comment, a dollar quote or a bracket, which Databend reads as part of the name, so Studio cannot tell where the statement ends. End the name with a space or remove the character, and run again. |
 | `SELECT /*+ ; */ 1` | An optimizer hint (/*+ ... */) in this text holds a semicolon, which Databend reads as code and Studio as a comment. Remove the semicolon from the hint and run again. |
 | `/*+ ' */ SELECT 1 AS shown -- ' */ SELECT 2 AS hidden` | An optimizer hint (/*+ ... */) in this text holds a character that can make Databend end the hint at a later */ than Studio does, so Studio cannot tell which statement runs. Keep the hint to names, numbers and plain quoted values, and run again. |
 
 The form feed row's `\f` stands for the character itself.
-The stage row is one statement to Studio and, without the guard, a stage token, a `;`, `DROP TABLE t` and a `;` to Databend, whose stage token takes `\'` into the name.
+Each stage row is one statement to Studio and, without the guard, a stage token, a `;` and `DROP TABLE t` to Databend.
+Databend's stage token runs to the first Unicode white space, comma, semicolon, quote or parenthesis, and takes `\'`, `--`, `/*`, a dollar quote and a bracket into the name, where Studio's reading opens a quote, a comment, a literal or an array that can end past it (measured on v1.2.951: `SELECT 1 FROM @s--;DROP TABLE t` is "unexpected `DROP`" at the DROP).
+A stage name a space ends passes: `SELECT * FROM @s -- note` is sent.
+The rows from the form feed down are refused inside an array literal too, whose contents are code to both readers.
 The last row is the measured case: without the guard Databend ends the hint at the second `*/` and answers `hidden`, a statement the confirmation gate never saw.
 A plain hint passes: `SELECT /*+ SET_VAR(timezone='UTC') */ now()` is sent.
 Databend's backslash escapes are a fact of the grammar row (`backslashAlwaysEscapes`), so a backslash before a quote never ends a literal in Studio's reading either, and a backslash before a line feed inside a literal leaves it unterminated, as Databend's lexer does ([S2](../BACKLOG.md)).
@@ -472,13 +508,15 @@ So the strategy offers a plan only for a SELECT-shaped statement and declines th
 | `SELECT * FROM fuse_vacuum2()` | Both |
 | `SELECT /*+ SET_VAR(timezone='UTC') */ 1` | Both |
 | `SELECT $a$ x $a$` | Both |
+| `SELECT * FROM @~/--, numbers((SELECT nextval(s)))` | Both |
 | `SELECT 'x` | Both |
 | `INSERT INTO t SELECT 1` | Both |
 
 The estimate declines a subquery at parenthesis depth 2 or more, which is where a table function's argument sits; a depth-1 subquery nested in another parenthesis is declined too, which costs a plan and runs nothing.
 The Explain button sends an argument subquery that names none of the words below, so the binder runs that read.
 The names that decline both modes, as a word or a quoted name, are `MATERIALIZED`, `PIVOT`, `NEXTVAL`, `FUSE_AMEND`, `SET_CACHE_CAPACITY`, `FUSE_VACUUM2`, `FUSE_VACUUM_TEMPORARY_TABLE`, `FUSE_VACUUM_DROP_AGGREGATING_INDEX`, `FUSE_VACUUM_DROP_INVERTED_INDEX`, `SYNC_CRASH_ME`, `ASYNC_CRASH_ME`, `USER_TASK_CANCEL_ONGOING_EXECUTIONS` and `TASK_DEPENDENTS_ENABLE`.
-A form feed, an optimizer hint, a tagged dollar run, a stage name holding a backslash and a run that never closes decline both modes, as the guard refuses them on Run.
+A form feed, an optimizer hint, a tagged dollar run, a stage name holding a backslash or running into a comment, a dollar quote or a bracket, and a run that never closes decline both modes, as the guard refuses them on Run.
+Without the decline and the guard, the stage row's subquery runs hidden: measured on v1.2.951, `EXPLAIN SELECT * FROM @~/--, numbers((SELECT count(*) FROM numbers(7)))` planned a `numbers` scan of 7 rows, so Databend ran the argument subquery that Studio reads as a comment after the user stage `@~/`.
 Over the generated queries of the other dialects, 3 of 50 SELECT-shaped texts got no estimate, all three the SQL Server row's bracketed names, which Databend reads as code.
 The plan is drawn as a tree from the one `explain` column, a node's properties as its detail and `estimated rows` as its row estimate; the raw tab shows the text as Databend printed it.
 
@@ -486,6 +524,7 @@ The plan is drawn as a tree from the one `explain` column, a node's properties a
 
 The SQL INSERT export writes each value as a Databend literal: hex `Binary` through `unhex`, `Variant` through `parse_json`, and the integers and floats exactly, `NaN` and both infinities included.
 A cell of a type Databend has no literal for (`Array`, `Map`, `Tuple`, `Bitmap`, `Interval`, `Geometry`, `Geography`, `Vector`) skips its row, named by row and column in a comment, so no row is written in a wrong form; a NULL cell of those types replays.
+The comment names the type as the server spelled it, cut at 64 characters, and the column name and the type have every character outside printable ASCII replaced by `?`, because both are the server's own text and a line break in either would end the comment and put the rest in the file as a statement.
 Measured by the live check: every row of the every-type table replayed equal or was skipped by name on both builds.
 
 ### 5.8 Cancellation and deadlines
@@ -499,6 +538,7 @@ A kill that does not answer reads:
 > Studio asked Databend to stop the statement and got no answer, so it may still finish.
 
 A cancel before the first answer can miss a statement that is already running, so a kill answered 404 is sent again at 250, 500 and 1,000 ms, and the run reports that the statement may have run, with "cancelled before its first answer" as the cause.
+A Stop or the deadline while the POST waits to be sent again after a Databend Cloud `ProvisionWarehouseTimeout` sends no kill and no logout, and the run reads as cancelled or timed out, since the gateway forwarded none of the attempts (section 3.6).
 The query timeout is sent as `max_execute_time_in_seconds` and is also Studio's deadline; when it passes Studio kills the statement:
 
 > The statement did not finish within [seconds] seconds, so Studio cancelled it.
@@ -578,7 +618,7 @@ On the measured Cloud tenant `system_history.query_history` answered 1003, so th
 
 > The base tables of the default catalog, largest first; other catalogs are not read.
 
-With Warehouse set, no pulse or fleet check runs (section 4.4); a panel opened by a person resumes the warehouse like any other request.
+With Warehouse set, or on a Databend Cloud host, no pulse or fleet check runs (section 4.4); a panel opened by a person resumes the warehouse like any other request.
 
 ## 8. Maintenance
 
@@ -589,7 +629,13 @@ The target is the session id, not the HTTP query id, which `KILL QUERY` answers 
 
 > A Databend session id is 1 to 64 letters, digits and hyphens, as the Sessions panel lists it.
 
+A kill Databend accepts is answered with the provider's own message, which the maintenance route returns to its caller:
+
 > Asked Databend to stop the current statement of session [session id].
+
+The Sessions panel does not show that message, and words a kill its own way for every engine ([U98](../BACKLOG.md)).
+Its kill button opens a "Terminate Session?" dialog, which says the action "will forcefully end the connection and may cause data loss if the session has uncommitted transactions", and a kill that went through is toasted "Session [session id] terminated successfully".
+On Databend the session is not ended: only the statement it is running is stopped, and a session of another client, such as BendSQL, runs its next statement.
 
 Any other operation sends nothing:
 
@@ -627,7 +673,7 @@ The analyze and vacuum cards are never drawn, and are worded true all the same:
 | `CONNECTION_STRING_ACCEPTED` | `false` |
 
 `containerLevels` are Catalog and Database, and `objectKinds` are `table`, `view`, `materialized_view` and `dynamic_table`, each with columns and a SQL source.
-`resumesBilledCompute` is declared only when Warehouse is set (section 4.4).
+`resumesBilledCompute` is declared when Warehouse is set or the host is Databend Cloud's (section 4.4).
 `schemaRefreshPattern` re-reads the tree after a statement that leads with `CREATE`, `DROP`, `ALTER`, `RENAME`, `UNDROP`, `TRUNCATE` or `REPLACE`.
 MCP's metadata tools and plan mode work; agent execution and MCP `run_read_query` do not run a statement on this type ([B103](../BACKLOG.md)).
 
@@ -690,7 +736,8 @@ bun run test
 
 ### 11.3 The live check
 
-`tests/live/databend-live-check.ts --target <name>` runs every scenario through a real `DatabendProvider` against a running server, and writes only to `studio_demo`.
+`tests/live/databend-live-check.ts --target <name>` runs every scenario through a real `DatabendProvider` against a running server, and writes only to `studio_demo` and `libredb_demo`.
+On a local server S7 also creates the user `studio_scratch` under the password policy `studio_scratch_policy` for its one wrong password, and drops both before it ends; on Databend Cloud it creates no user.
 On 2026-10-08 it passed 22 of 22 checks on the pinned v1.2.951-nightly and 21 of 21 on v1.2.881, by digest; the cold start was skipped on both, since it needs a warehouse to suspend, and the materialized-view check on v1.2.881, which has none.
 It covered DDL, DML and MERGE in `studio_demo`; 100,000 rows over 10 pages; a statement past the 16 MiB budget of answer text cut and marked limited; Load More; an unknown table and a syntax error with its position; a wrong password latched so that a second instance sent no request; a cancel and a server deadline, each with one kill answered 200; a lone `BEGIN` rolled back; `USE` and the session echo; the seven pinned settings echoed as sent; a least-privilege user refused a write; the tree, columns and DDL of a table, a materialized view and a view over a dropped table; and the every-type export replay of section 5.7.
 On Databend Cloud, on 2026-10-08, it passed 22 of 22 checks on a test tenant of the same build through the gateway, the 100,000 rows and the 16 MiB budget included, as a user that owns `studio_demo` through its role; the cold start was skipped, since the tenant's SQL user may not suspend its warehouse, and multi-node paging is not run yet.
@@ -756,7 +803,7 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
     managed: true
 ```
 
-`readOnly: true` is refused for this type (section 4.1), and `allowInsecureAuth: true` is the seed's form of the consent of section 4.3.
+`readOnly: true` is refused for this type when the seed file loads (section 4.1), and `allowInsecureAuth: true` is the seed's form of the consent of section 4.3.
 
 ## 13. Known limitations
 
@@ -764,7 +811,7 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - The confirmation gate does not know Databend's destructive forms: `INSERT OVERWRITE`, `REPLACE INTO`, `MERGE INTO`, `OPTIMIZE TABLE ... PURGE`, the `VACUUM` forms, `FLASHBACK TABLE`, `COPY INTO ... PURGE = true`, `REMOVE @stage`, `EXECUTE IMMEDIATE`, `CALL`, a `SETTINGS (...)` clause and the SELECT-shaped writers run with no confirmation ([D246](../BACKLOG.md)).
 - A dollar-quoted run tagged other than `$$` (`$name$`) is refused, because Databend reads `$name` as a variable; use `$$`.
 - A form feed is refused anywhere in the text, because it ends a `--` comment in Databend.
-- A stage name (`@...`) holding a backslash is refused, because Databend's stage token takes `\'` into the name.
+- A stage name (`@...`) holding a backslash, `--`, `/*`, a dollar quote or a bracket is refused, because Databend's stage token takes each into the name while Studio reads a quote, a comment, a literal or an array there; a space ends the name, so a comment can follow it.
 - An optimizer hint whose body holds a `;`, a quote other than a plain single-quoted value, a backslash, `$`, `@`, `~`, `--` or `/*` is refused, because Databend tokenizes a hint's body and can end it at a later `*/`.
 - A temporary table and a transaction end with their statement: each statement runs in a session of its own, so the provider rolls back an open transaction and ends a session holding a temporary table.
 - `USE`, `SET`, `SET VARIABLE` and `SET ROLE` last for their own statement only; set Database on the connection, qualify names, or use `SET GLOBAL`.
@@ -776,6 +823,8 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - Databend lists no columns for a view that no longer plans, such as one over a dropped table, so Studio shows it with no column list rather than as complete.
 - Studio's own monitoring reads leave out only the reading statement itself, so another Studio connection's reads show among the running statements.
 - One HTTP answer over 16 MiB fails as too large, so a result of very wide display text, such as many columns of control characters, fails when its page is large rather than being shown; the result's own budget of answer text is 16 MiB too.
+- A result wider than 250,000 columns fails as a protocol fault rather than being shown with no row, and a refusal longer than 65,536 characters is read by its HTTP status alone, its code and kind unread (section 3.10).
+- The sign-in latch holds 256 keys: with every one latched and live, a successful sign-in on another key is not recorded, so that key's statements go one at a time until a latch expires.
 - A server older than v1.2.881 is not refused: the result says the display mode was not confirmed, and some values may read differently.
 - EXPLAIN gives no plan for the shapes of section 5.6, and the Explain button's argument subqueries run as reads while binding.
 - Every user's running statements on the server or warehouse are in the Sessions panel, and a running `CREATE USER` or `ALTER USER` with `IDENTIFIED BY` shows its password unmasked there, because Databend masks only `PASSWORD = '...'`.
@@ -786,10 +835,11 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - No path-prefixed reverse proxy: Databend's links are origin-relative, so the server must answer at the root of its host and port, with no path prefix.
 - The monitoring panels and sums cover the default catalog only.
 - The SQL INSERT export cannot write `Array`, `Map`, `Tuple`, `Bitmap`, `Interval`, geo or `Vector` values: each such row is skipped by name.
-- A kill stops the session's current statement, not the session: a session of another client, such as BendSQL, runs its next statement.
+- A kill stops the session's current statement, not the session, though the Sessions panel's dialog and toast speak of ending it ([U98](../BACKLOG.md)): a session of another client, such as BendSQL, runs its next statement.
 - Every budget was verified locally and through Databend Cloud's gateway on one warehouse; a cold start through Studio and multi-node paging are not run yet.
 - A seed edited to add a Warehouse while it is open keeps its pulse until the page is reloaded ([U97](../BACKLOG.md)).
-- Driver-based SQL providers hold a whole result with no cell or byte budget, which Databend's provider has ([D247](../BACKLOG.md)), and the pulse of other engines resends a refused password, which the latch prevents here ([D248](../BACKLOG.md)).
+- The sign-in latch is one Studio process's: several replicas each send a refused password once per 15 minutes, so five or more can still lock a user under a password policy ([D252](../BACKLOG.md)).
+- Driver-based SQL providers hold a whole result with no cell or byte budget, which Databend's provider has ([D247](../BACKLOG.md)), and the pulse of other engines resends a refused password, which the latch prevents here within one Studio process ([D248](../BACKLOG.md)).
 
 ## 14. References
 

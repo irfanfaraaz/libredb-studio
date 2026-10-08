@@ -235,10 +235,18 @@ function unescapedLevels(text: string): string[] {
  * as parsed: its raw text holds them escaped, where a form with a quote, a backslash, a slash or a non-ASCII
  * character is not found, so a form in any of them withholds the text too.
  */
-function scrubbed(text: string, ctx: DatabendFailureContext, max: number, decoded: readonly string[] = []): string {
-  const leak = [...decoded, ...unescapedLevels(text)].find((value) => serverText(value, ctx.secretForms) !== value);
-  const safe = serverText(leak ?? text, ctx.secretForms);
+function scrubbed(text: string, secretForms: readonly string[], max: number, decoded: readonly string[] = []): string {
+  const leak = [...decoded, ...unescapedLevels(text)].find((value) => serverText(value, secretForms) !== value);
+  const safe = serverText(leak ?? text, secretForms);
   return safe.length > max ? `${safe.slice(0, max)}...` : safe;
+}
+
+/**
+ * A server text a sentence names on its own, such as an echoed setting or the name of one: withheld whole when it
+ * holds a secret form, escaped or not, and cut as a refusal's text is, before the sentence is built (design 3.13).
+ */
+export function serverWords(text: string, secretForms: readonly string[]): string {
+  return scrubbed(text, secretForms, MAX_REFUSAL_TEXT);
 }
 
 /** The server's words as a sentence of their own, so the sentence after them does not run on from them. */
@@ -296,7 +304,7 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
   const { status, gatewayKind } = refusal;
   const code = refusal.code ?? refusal.upstreamCode;
   // A wrapped refusal shows the query node's own message, not the gateway's wrapper (I19).
-  const detail = scrubbed(refusal.upstreamMessage ?? refusal.text, ctx, MAX_REFUSAL_TEXT, refusal.decoded);
+  const detail = scrubbed(refusal.upstreamMessage ?? refusal.text, ctx.secretForms, MAX_REFUSAL_TEXT, refusal.decoded);
   const details = { code, status, detail };
 
   if (gatewayKind === GATEWAY_RESUMING) return unavailableError(gatewayKind, ctx, details);
@@ -374,8 +382,8 @@ export function answerError(
   if (code === ABORTED_CODE && stop !== null) {
     return stopError(stop, { answered: true, killAcknowledged: true }, ctx);
   }
-  const text = scrubbed(raw.trimEnd(), ctx, MAX_STATEMENT_TEXT);
-  const detail = rawDetail === null ? undefined : scrubbed(rawDetail, ctx, MAX_STATEMENT_TEXT);
+  const text = scrubbed(raw.trimEnd(), ctx.secretForms, MAX_STATEMENT_TEXT);
+  const detail = rawDetail === null ? undefined : scrubbed(rawDetail, ctx.secretForms, MAX_STATEMENT_TEXT);
   if (answer.id === "") {
     const category = code === SETTING_CODE ? "config" : "statement";
     return new DatabendError(category, `${text} ${sentences.nothingRan}`, { code, detail });

@@ -1008,8 +1008,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       });
       return;
     }
-    // A spelling the parser refuses as a whole (a Databend Flight SQL or JDBC URL, a DSN holding a #) applies
-    // nothing, its type included, and the paste stays open with its text so it can be corrected.
+    // A spelling the parser refuses as a whole (a Databend Flight SQL or JDBC URL, a DSN holding a #, a sign-in holding
+    // a / or ?) applies nothing, its type included, and the paste stays open with its text so it can be corrected.
     if (parsed.refusal) {
       setTestResult({ tone: "error", message: parsed.refusal });
       return;
@@ -1026,7 +1026,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     if (parsed.user) setUser(parsed.user);
     if (parsed.password) setPassword(parsed.password);
     if (parsed.database) setDatabase(parsed.database);
-    if (parsed.warehouse) setWarehouse(parsed.warehouse);
+    // A paste that names a server names its warehouse too, or none: a leftover one would go to the new host and
+    // resume, and bill, the previous DSN's compute there.
+    if (parsed.host) setWarehouse(parsed.warehouse ?? "");
     // A scheme that IS the transport (https:// for ClickHouse) carries TLS that no
     // field can express. Without this the form keeps its "disable" default and the
     // connection goes out as plaintext HTTP to a TLS port.
@@ -1068,22 +1070,13 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       });
       return;
     }
-    // Parameters the paste did not apply, named and never valued, then a notice on what an applied one means. A TLS
-    // warning below keeps them after its own sentence, so a Databend paste reports every part that applies.
-    const databendAfterword = [
-      parsed.ignoredParameters ? databendNotAppliedNotice(parsed.ignoredParameters) : undefined,
-      parsed.notice,
-    ].filter(Boolean);
     // A file-path TLS parameter (#842) is read on the machine running the server, which in
     // a container is not the one the string was pasted on. It stays in the URI, and a CA
     // pasted into the form wins over it (see connection-string-parser.ts).
     if (parsed.tlsFileParam) {
       setTestResult({
         tone: "warning",
-        message: [
-          `"${parsed.tlsFileParam}" is a file path, which the server reads when it connects, not this browser. The other fields were filled in. Unless that file is on the server, open SSL / TLS and paste the certificate's contents into the CA field: it is used instead of the file.`,
-          ...databendAfterword,
-        ].join(" "),
+        message: `"${parsed.tlsFileParam}" is a file path, which the server reads when it connects, not this browser. The other fields were filled in. Unless that file is on the server, open SSL / TLS and paste the certificate's contents into the CA field: it is used instead of the file.`,
       });
       return;
     }
@@ -1105,15 +1098,19 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     if (parsed.unmappedTLSParam) {
       setTestResult({
         tone: "warning",
-        message: [
-          `TLS setting not applied: "${parsed.unmappedTLSParam}" has no equivalent among disable, require, verify-system, verify-ca and verify-full. The other fields were filled in, but SSL Mode stays "${sslMode}" - open SSL / TLS and choose one before connecting.`,
-          ...databendAfterword,
-        ].join(" "),
+        message: `TLS setting not applied: "${parsed.unmappedTLSParam}" has no equivalent among disable, require, verify-system, verify-ca and verify-full. The other fields were filled in, but SSL Mode stays "${sslMode}" - open SSL / TLS and choose one before connecting.`,
       });
       return;
     }
-    if (parsed.ignoredParameters) {
-      setTestResult({ tone: "warning", message: databendAfterword.join(" ") });
+    // A Databend paste: the parameters it did not apply, named and never valued, then the TLS parameters it read and
+    // did not apply in Databend's own words, then a notice on what an applied one means.
+    if (parsed.ignoredParameters || parsed.cautions) {
+      const message = [
+        parsed.ignoredParameters ? databendNotAppliedNotice(parsed.ignoredParameters) : undefined,
+        ...(parsed.cautions ?? []),
+        parsed.notice,
+      ].filter(Boolean);
+      setTestResult({ tone: "warning", message: message.join(" ") });
       return;
     }
     setTestResult({

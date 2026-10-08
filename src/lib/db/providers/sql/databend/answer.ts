@@ -6,9 +6,15 @@
  * nested as `{"error":{"kind","message"}}`, I19, and read top-level too) or databend-go's string shape
  * (`{"error","message"}`), and a text one (a panic is 500 `text/plain`, 07 M04e) keeps its body as its text. The
  * gateway wraps a query node's refusal as `status: <n>, message: <json>: <words>`: that one shape is unwrapped into
- * the upstream status, code and message, and no other message text is read. A 200 that is not JSON, a body that does not parse (a
- * `RangeError` included), a key named `__proto__` anywhere, a field of the wrong type, a cell that is not text or
- * null, or a row of another width than the schema is `protocol`.
+ * the upstream status, code and message, and no other message text is read. A 200 that is not JSON, a body that does
+ * not parse (a `RangeError` included), a key named `__proto__` anywhere, a field of the wrong type, a cell that is not
+ * text or null, a row of another width than the schema, or more rows than the page Studio asked for is `protocol`.
+ *
+ * What one answer costs is bounded by what Studio asked for, not by the 16 MiB an answer may be: before a 200 is
+ * parsed, one pass over its text counts what `JSON.parse` would build, outside strings, and refuses an answer holding
+ * more rows than the page, more columns or column keys than the cell budget can keep, or more of anything else than
+ * a fixed allowance. The parse takes no reviver, the rows are checked where they lie and never copied, and a refusal
+ * is read only up to 64 KiB, past which it is read by its status alone.
  *
  * Nothing here classifies a refusal or scrubs its text: `errors.ts` does both, with the connection's secret forms.
  * Pure: no I/O.
@@ -78,6 +84,14 @@ export type DatabendReading =
   | { readonly kind: "answer"; readonly answer: DatabendAnswer }
   | { readonly kind: "refusal"; readonly refusal: DatabendRefusal };
 
+/** What one 200 answer may hold, from the statement Studio sent (design 3.12). */
+export interface AnswerBounds {
+  /** The page's rows: the `max_rows_per_page` of the statement's POST. */
+  readonly rows: number;
+  /** The columns a result can keep a row of: the cell budget, since a wider schema keeps no row. */
+  readonly columns: number;
+}
+
 /** The oldest Databend that knows `http_json_result_mode` (L7, I6). */
 export const RESULT_MODE_FLOOR = "v1.2.881";
 
@@ -92,8 +106,27 @@ export const DATABEND_ANSWER_SENTENCES = Object.freeze({
 const RESULT_MODE_SETTING = "http_json_result_mode";
 const DISPLAY_MODE = "display";
 
-/** Thrown inside the reviver so that a `__proto__` key is told apart from a body that does not parse. */
-class PrototypeKey extends Error {}
+/** The most characters of a refusal that are read: a longer one is read by its status alone, its text cut here. */
+const REFUSAL_CHARS = 64 * 1024;
+/**
+ * The arrays, objects, keys and values an answer may hold outside its rows and columns: its session, settings echo,
+ * error, affect, warnings and stats hold a few hundred.
+ */
+const ANSWER_ALLOWANCE = 65_536;
+/** The keys and separators one column of `schema` holds: its name, its type and the comma between them. */
+const COLUMN_TOKENS = 3;
+
+const QUOTE = 0x22;
+const BACKSLASH = 0x5c;
+const COMMA = 0x2c;
+const COLON = 0x3a;
+const OPEN_ARRAY = 0x5b;
+const CLOSE_ARRAY = 0x5d;
+const OPEN_OBJECT = 0x7b;
+const CLOSE_OBJECT = 0x7d;
+
+/** Where a token of the answer stands: in the value of `data`, of `schema`, or anywhere else. */
+type Region = "data" | "schema" | "answer";
 
 type Body = Readonly<Record<string, unknown>>;
 
@@ -105,20 +138,93 @@ function isJson(contentType: string | null): boolean {
   return contentType?.split(";")[0].trim().toLowerCase() === "application/json";
 }
 
-function refuseProtoKey(key: string, value: unknown): unknown {
-  if (key === "__proto__") throw new PrototypeKey();
-  return value;
+/** The member of the answer a key at its top level names, read from the key's text as it arrived. */
+function regionOf(text: string, keyAt: number, keyEnd: number): Region {
+  if (keyEnd - keyAt === 5 && text.startsWith('"data"', keyAt)) return "data";
+  if (keyEnd - keyAt === 7 && text.startsWith('"schema"', keyAt)) return "schema";
+  return "answer";
 }
 
-/** `JSON.parse` refusing a `__proto__` key at any depth; every failure, a `RangeError` included, is `protocol`. */
-function parse(text: string, status: number): unknown {
-  try {
-    return JSON.parse(text, refuseProtoKey);
-  } catch (error) {
-    const fault =
-      error instanceof PrototypeKey ? DATABEND_PROTOCOL_FAULTS.prototypeKey : DATABEND_PROTOCOL_FAULTS.notJson;
-    throw protocolError(fault, error, status);
+/**
+ * The field an answer holds too much of, found in one pass over its text that allocates nothing, or null. Outside
+ * strings every array, object, key and value after a comma is something `JSON.parse` builds: a row of `data` counts
+ * against the page's rows, a column of `schema` and its keys against the columns, and the rest of the answer against
+ * the allowance, the arrays and objects inside a row or a column included. A row's cells are bounded by the answer's
+ * bytes alone: a page wider than the cell budget is legal, and the budget cuts it once it is read.
+ */
+function oversized(text: string, bounds: AnswerBounds): string | null {
+  let depth = 0;
+  let region: Region = "answer";
+  let keyAt = -1;
+  let keyEnd = -1;
+  let rows = 1;
+  let columns = 1;
+  let columnTokens = 0;
+  let rest = 0;
+  for (let at = 0; at < text.length; at++) {
+    const code = text.charCodeAt(at);
+    if (code === QUOTE) {
+      const start = at;
+      for (at++; at < text.length && text.charCodeAt(at) !== QUOTE; at++) {
+        if (text.charCodeAt(at) === BACKSLASH) at++;
+      }
+      if (depth === 1) {
+        keyAt = start;
+        keyEnd = at;
+      }
+      continue;
+    }
+    if (code === CLOSE_ARRAY || code === CLOSE_OBJECT) {
+      depth -= 1;
+      continue;
+    }
+    if (code === OPEN_ARRAY || code === OPEN_OBJECT) depth += 1;
+    else if (code === COLON && depth === 1) region = regionOf(text, keyAt, keyEnd);
+    else if (code !== COMMA && code !== COLON) continue;
+    const within = depth < 2 ? "answer" : region;
+    const separates = code === COMMA;
+    if (within === "data" && depth === 2 && separates) {
+      if (++rows > bounds.rows) return "data";
+    } else if (within === "data" && depth === 3 && code !== COLON) {
+      // A row, or a cell after a comma.
+    } else if (within === "schema" && depth === 2 && separates) {
+      if (++columns > bounds.columns) return "schema";
+    } else if (within === "schema" && depth === 3 && (separates || code === COLON)) {
+      if (++columnTokens > COLUMN_TOKENS * bounds.columns) return "schema";
+    } else if (within === "schema" && depth === 3) {
+      // A column.
+    } else if (++rest > ANSWER_ALLOWANCE) return within;
   }
+  return null;
+}
+
+/** Whether a parsed value holds a key named `__proto__` at any depth, walked without recursion. */
+function holdsPrototypeKey(root: unknown): boolean {
+  const pending: unknown[] = [root];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== "object" || value === null) continue;
+    if (!Array.isArray(value) && Object.hasOwn(value, "__proto__")) return true;
+    for (const item of Array.isArray(value) ? value : Object.values(value)) {
+      if (typeof item === "object" && item !== null) pending.push(item);
+    }
+  }
+  return false;
+}
+
+/**
+ * `JSON.parse` with no reviver, refusing a `__proto__` key at any depth after it; every failure, a `RangeError`
+ * included, is `protocol`.
+ */
+function parse(text: string, status: number): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw protocolError(DATABEND_PROTOCOL_FAULTS.notJson, error, status);
+  }
+  if (holdsPrototypeKey(parsed)) throw protocolError(DATABEND_PROTOCOL_FAULTS.prototypeKey, undefined, status);
+  return parsed;
 }
 
 function wrongType(field: string): never {
@@ -175,17 +281,14 @@ function readSession(body: Body): DatabendSessionEcho | null {
   const session = record(body, "session", "session");
   if (session === null) return null;
   const settings = record(session, "settings", "session") ?? {};
+  for (const value of Object.values(settings)) if (typeof value !== "string") wrongType("session");
   return {
     raw: session,
     txnState: text(session, "txn_state", "session"),
     needKeepAlive: flag(session, "need_keep_alive", "session") ?? false,
     role: text(session, "role", "session"),
-    settings: Object.fromEntries(Object.entries(settings).map(([key, value]) => [key, textValue(value)])),
+    settings: settings as Readonly<Record<string, string>>,
   };
-}
-
-function textValue(value: unknown): string {
-  return typeof value === "string" ? value : wrongType("session");
 }
 
 /** USE and SET only (07 M09); an affect of any other type is not carried. */
@@ -210,18 +313,21 @@ function readAffect(body: Body): DatabendAffect | null {
   }
 }
 
-function readRows(body: Body, width: number): DatabendCell[][] {
-  return list(body, "data").map((row) => {
+/** The rows as parsed, each checked where it lies and none copied: at most the page's, each as wide as the schema. */
+function readRows(body: Body, width: number, bounds: AnswerBounds): readonly (readonly DatabendCell[])[] {
+  const rows = list(body, "data");
+  if (rows.length > bounds.rows) return wrongType("data");
+  for (const row of rows) {
     if (!Array.isArray(row)) throw protocolError(DATABEND_PROTOCOL_FAULTS.cell);
     if (row.length !== width) throw protocolError(DATABEND_PROTOCOL_FAULTS.width(row.length, width));
-    return row.map((cell: unknown) => {
-      if (cell === null || typeof cell === "string") return cell;
-      throw protocolError(DATABEND_PROTOCOL_FAULTS.cell);
-    });
-  });
+    for (const cell of row) {
+      if (cell !== null && typeof cell !== "string") throw protocolError(DATABEND_PROTOCOL_FAULTS.cell);
+    }
+  }
+  return rows as readonly (readonly DatabendCell[])[];
 }
 
-function readBody(body: Body): DatabendAnswer {
+function readBody(body: Body, bounds: AnswerBounds): DatabendAnswer {
   const schema = list(body, "schema").map(readColumn);
   return {
     id: required(body, "id"),
@@ -232,7 +338,7 @@ function readBody(body: Body): DatabendAnswer {
     warnings: textList(list(body, "warnings"), "warnings"),
     hasResultSet: flag(body, "has_result_set", "has_result_set") ?? schema.length > 0,
     schema,
-    data: readRows(body, schema.length),
+    data: readRows(body, schema.length, bounds),
     nextUri: text(body, "next_uri"),
     affect: readAffect(body),
     session: readSession(body),
@@ -271,10 +377,11 @@ function upstreamOf(message: string): Upstream {
   if (match === null) return {};
   let inner: unknown;
   try {
-    inner = JSON.parse(match[2], refuseProtoKey);
+    inner = JSON.parse(match[2]);
   } catch {
-    return {};
+    // A wrapper whose JSON does not parse is no upstream, read so below as one that lacks the code or message.
   }
+  if (holdsPrototypeKey(inner)) return {};
   const error = isRecord(inner) && isRecord(inner.error) ? inner.error : null;
   if (typeof error?.code !== "number" || typeof error.message !== "string") return {};
   return { upstreamStatus: Number(match[1]), upstreamCode: error.code, upstreamMessage: error.message };
@@ -286,42 +393,53 @@ function gatewayKindOf(body: Body | null, error: Body | null): string | null {
   return typeof kind === "string" ? kind : null;
 }
 
-/** A refusal's code, gateway kind, message and wrapped upstream from a JSON body, else the raw text. */
-function refusalOf(response: NodeResponse): DatabendRefusal {
-  let parsed: unknown;
-  if (isJson(response.contentType)) {
+/**
+ * A refusal's code, gateway kind, message and wrapped upstream from a JSON body, else the raw text. `parsed` is the
+ * body a 200 refusal already had, through `parse`; any other is parsed here only when it is at most 64 KiB, and each
+ * text read from it is cut there too.
+ */
+function refusalOf(response: NodeResponse, parsed?: unknown): DatabendRefusal {
+  const whole = response.text.length <= REFUSAL_CHARS;
+  let json = parsed;
+  if (json === undefined && whole && isJson(response.contentType)) {
     try {
-      parsed = JSON.parse(response.text);
+      json = JSON.parse(response.text);
     } catch {
       // A refusal whose JSON does not parse is read by its status alone, with its raw text.
     }
   }
-  const body = isRecord(parsed) ? parsed : null;
+  const body = isRecord(json) ? json : null;
   const error = isRecord(body?.error) ? body.error : null;
-  const message = [error?.message, body?.message, body?.error].find((value) => typeof value === "string");
+  const found = [error?.message, body?.message, body?.error].find((value) => typeof value === "string");
+  const message = typeof found === "string" ? found.slice(0, REFUSAL_CHARS) : null;
   return {
     status: response.status,
     contentType: response.contentType,
     code: typeof error?.code === "number" ? error.code : null,
     gatewayKind: gatewayKindOf(body, error),
-    text: typeof message === "string" ? message : response.text,
-    decoded: typeof message === "string" || parsed === undefined ? undefined : decodedStrings(parsed),
-    ...(typeof message === "string" ? upstreamOf(message) : {}),
+    text: message ?? response.text.slice(0, REFUSAL_CHARS),
+    decoded: message !== null || json === undefined || !whole ? undefined : decodedStrings(json),
+    ...(message === null ? {} : upstreamOf(message)),
   };
 }
 
-/** One HTTP answer as an answer or a refusal; throws a `protocol` `DatabendError` for a malformed 200. */
-export function readAnswer(response: NodeResponse): DatabendReading {
+/**
+ * One HTTP answer as an answer or a refusal; throws a `protocol` `DatabendError` for a malformed 200, or for one that
+ * holds more than `bounds` allows, which is refused before it is parsed.
+ */
+export function readAnswer(response: NodeResponse, bounds: AnswerBounds): DatabendReading {
   if (response.status !== 200) return { kind: "refusal", refusal: refusalOf(response) };
   if (!isJson(response.contentType)) throw protocolError(DATABEND_PROTOCOL_FAULTS.notAnswer, undefined, 200);
+  const field = oversized(response.text, bounds);
+  if (field !== null) throw protocolError(DATABEND_PROTOCOL_FAULTS.field(field), undefined, 200);
   const body = parse(response.text, 200);
   if (!isRecord(body)) return wrongType("answer");
   // The Cloud gateway's refusal may come over any status, ProvisionWarehouseTimeout among them (design 3.11), with
   // its kind top-level or nested under `error` (I19).
   const nested = isRecord(body.error) ? body.error : null;
   if (gatewayKindOf(body, nested) !== null && body.state === undefined)
-    return { kind: "refusal", refusal: refusalOf(response) };
-  return { kind: "answer", answer: readBody(body) };
+    return { kind: "refusal", refusal: refusalOf(response, body) };
+  return { kind: "answer", answer: readBody(body, bounds) };
 }
 
 /**
@@ -329,7 +447,7 @@ export function readAnswer(response: NodeResponse): DatabendReading {
  * missing echo is a notice with an empty mode: a server below {@link RESULT_MODE_FLOOR} drops the setting it does
  * not know (L7, I6). Nothing is refused.
  */
-export function resultModeNotice(answer: DatabendAnswer): DatabendNotice | null {
+export function resultModeNotice(answer: DatabendAnswer): Extract<DatabendNotice, { kind: "result-mode" }> | null {
   const mode = answer.session?.settings[RESULT_MODE_SETTING] ?? "";
   return mode === DISPLAY_MODE ? null : { kind: "result-mode", mode };
 }

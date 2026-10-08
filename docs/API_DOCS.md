@@ -838,7 +838,7 @@ Four things differ from the other SQL providers:
 **Notes:**
 - `columnTypes` are Databend's declared type strings verbatim, such as `UInt64` or `Nullable(String)`; an integer past 2^53 and every decimal, date and timestamp value arrive as the server's text.
 - A duplicate output name is disambiguated rather than dropped: `fields` carries `id` and `id (2)`.
-- `POST /api/db/maintenance` accepts `kill` only, and its target is a query id from the sessions panel.
+- `POST /api/db/maintenance` accepts `kill` only, and its target is a session id from the Sessions panel (`system.processes.id`), not a query id, which `KILL QUERY` refuses with 1053; the answer's `message` names the session whose current statement Databend was asked to stop.
 - `POST /api/db/cancel` works: cancelling a running statement sends the server a kill for it.
 - Full reference: [`docs/providers/databend.md`](providers/databend.md).
 

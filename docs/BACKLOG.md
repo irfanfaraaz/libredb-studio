@@ -28,10 +28,10 @@ None of it is a GitHub issue.
 **Sections**
 
 - [SQL statement reading](#sql-statement-reading) — S2–S7 · 5
-- [Drivers and connections](#drivers-and-connections) — D1-D249, U17 · 153
+- [Drivers and connections](#drivers-and-connections) — D1-D252, U17 · 156
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U97 · 88
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2-X26, U2-U98 · 89
 - [Dependencies](#dependencies) — P1-P9 · 7
 - [Documentation](#documentation) — DOC3-DOC18 · 15
 - [Release pipeline](#release-pipeline) — REL1-REL8 · 8
@@ -2667,7 +2667,7 @@ Found 2026-10-07 while designing the Databend provider (its memory bounds); pre-
 `useConnectionPulse` (`src/hooks/use-connection-pulse.ts`, `CONNECTION_PULSE_INTERVAL_MS`) posts the active connection to `/api/db/health` every 60 seconds, and the admin Overview (`refreshFleetHealth` in `src/components/admin/tabs/OverviewTab.tsx`) posts every connection to `/api/admin/fleet-health` on the same interval.
 Both reach `getOrCreateProvider` in `src/lib/db/factory.ts`, which caches a provider only after `connect()` succeeds, so a stored password the server refuses is sent again on every tick.
 On an engine whose password policy locks an account after a number of failed sign-ins, a wrong password left in a connection therefore locks that user for everyone, and keeps it locked.
-Databend is the one engine that does not: its provider latches a refused sign-in for 15 minutes before any socket (`auth-latch.ts`, measured with `PASSWORD_MAX_RETRIES = 5` on the local fixture, L10), and with a Warehouse set the pulse sends nothing at all.
+Databend is the one engine that does not, within one Studio process: its provider latches a refused sign-in for 15 minutes before any socket (`auth-latch.ts`, measured with `PASSWORD_MAX_RETRIES = 5` on the local fixture, L10), though each replica keeps a latch of its own (D252), and with a Warehouse set, or on a Databend Cloud host, the pulse sends nothing at all.
 
 Found 2026-10-07 while designing the Databend provider (review 11 #3); pre-existing.
 
@@ -2681,6 +2681,40 @@ So every SQL provider hands its driver or its server whatever statement text the
 Found 2026-10-07 by the external review of the Databend design (X04); pre-existing.
 
 **Done when:** every SQL provider declares a statement text bound the gate and the routes read before any request, with a test per provider that a text one byte over its bound is refused unsent.
+
+### D250. A second pasted connection string keeps the first one's password, user and database
+
+`handlePasteConnectionString` in `src/hooks/use-connection-form.ts` writes Password, User and Database only when the paste carries them (`if (parsed.password) setPassword(parsed.password)`, and the same for the user and the database), for every scheme.
+So a second paste into one open dialog that names another host and no password, or an empty one (`root:@`, BendSQL's own local form), keeps the first paste's password under a green "parsed successfully", and Test Connection sends it to the second host with the second paste's user.
+Measured 2026-10-08 with the real hook on `origin/main` (575eb8ccd) for `postgres://`, `mysql://` (a second paste of `root:@`), ClickHouse `https://` and `redis://`: each probe carried the first password to the second host.
+On the Databend provider's branch a `databend://` pair through the real dialog, route and provider put the first password in the Basic header the second host received.
+It is the sibling of #1125, which made a new connection open with every connection-scoped field at its default; a second paste into the same dialog was left out of that reset.
+The Databend Warehouse field does not follow this rule: a paste that names a host sets Warehouse, or clears it.
+
+Found 2026-10-08 by the red-team round of the Databend provider (HD-1); pre-existing.
+
+**Done when:** a paste that names a host writes every credential and addressing field it reads, clearing the ones the string does not carry, while the deliberate host keep for an `np:` or `lpc:` server stays, with a hook test per scheme that pastes two strings and asserts the probe carries nothing of the first, and `docs/providers/databend.md` section 4.1 drops its note.
+
+### D251. A pasted URL whose password holds an unencoded `/` or `?` is read with the password's tail as the database
+
+`parseGenericURL` in `src/lib/connection-string-parser.ts`, which reads `postgres://`, `mysql://`, `redis://`, `oracle://`, `mssql://`, `db2://`, `clickhouse://` and `http(s)://` and their aliases, hands the text to `new URL`, which ends a URL's address part at the first `/` or `?`.
+So an unencoded `/` in the password moves the split: `postgres://app:2024/Secret-Tail@db.example.com:5432/prod` reads as host `app`, port `2024` and database `Secret-Tail@db.example.com:5432/prod`, and the dialog reports a green "parsed successfully" with that text in Database and in the auto-filled Name; with `?` the tail is dropped.
+Measured 2026-10-08 on `origin/main` (575eb8ccd) for `postgres://` and `mysql://`.
+The Databend DSN parser refuses such a string before `new URL`, with a sentence that says to percent-encode `/` and `?` (`DATABEND_DSN_REFUSALS.userinfo`), as it refuses `#`.
+
+Found 2026-10-08 by the red-team round of the Databend provider (HD-2); pre-existing.
+
+**Done when:** every scheme `parseGenericURL` reads refuses a string with an `@` past the first `/` or `?` after `://`, with a sentence naming the percent-encodings, and parser tests per scheme plus a hook test show that such a paste fills nothing.
+
+### D252. The Databend sign-in latch is kept per process, so each replica sends a refused password once
+
+The sign-in latch (`src/lib/db/providers/sql/databend/auth-latch.ts`) is a map in one Node process, so each Studio replica sends a sign-in Databend refused once per 15 minutes before its own latch holds.
+The chart runs Studio as several replicas through `replicaCount`, or `autoscaling` up to 10 (`charts/libredb-studio/values.yaml`), and the pulse, the fleet check and the tree reads are balanced across them.
+So five or more replicas can send five refused sign-ins inside one 15-minute window and lock the user under a password policy (`PASSWORD_MAX_RETRIES = 5`, L10 in `docs/providers/databend.md`), which the latch exists to prevent.
+
+Found 2026-10-08 by the red-team round of the Databend provider (HD-5); the latch is new with the provider.
+
+**Done when:** a sign-in Databend refused is latched for every replica of one deployment, before any socket, with a test that two latch instances over one shared record send a refused password once between them, and `docs/providers/databend.md` sections 3.7 and 13 drop the per-process scope.
 
 ## Value interpolation
 
@@ -4120,6 +4154,17 @@ Proven with a throwaway test on PR B of the Databend provider: after a refresh t
 Found 2026-10-08 by the red-team round of the Databend precursors (I14); pre-existing, and the Databend provider makes it reachable.
 
 **Done when:** a managed refresh that changes a field the connection resolves through (host, port, database, warehouse, credentials) replaces the active copy and a cosmetic change (name, colour) keeps it, with a hook test for each, or `docs/SEED_CONNECTIONS.md` states that an edit to an open seed takes effect after a reload.
+
+### U98. The Sessions panel words every kill as ending the session, and drops the provider's own message
+
+`SessionsTab` (`src/components/monitoring/tabs/SessionsTab.tsx`) asks "Terminate Session?" before every kill and says the action "will forcefully end the connection and may cause data loss if the session has uncommitted transactions", and `killSession` in `src/hooks/use-monitoring-data.ts` then toasts "Session <id> terminated successfully", dropping the `message` of the `MaintenanceResult` that `POST /api/db/maintenance` returns.
+Neither reads what the provider declares: the kill's `maintenanceOperationSpecs.kill.label` names the operation (Databend's is "Kill Query"), and the result's message says what the engine did.
+On Databend `KILL QUERY` stops the session's current statement and leaves the session open, so the dialog and the toast both claim more than happened, while the provider's own message, "Asked Databend to stop the current statement of session <id>.", reaches only an API caller.
+Measured 2026-10-08 with the maintenance route mocked to return the Databend provider's own result: the toast read "Session <id> terminated successfully".
+
+Found 2026-10-08 by the red-team round of the Databend provider (HD-4); pre-existing for every provider that declares `kill`.
+
+**Done when:** the dialog's title, button and wording come from the provider's kill declaration, and the toast shows the route's `message` when it returns one, with a component test for a provider whose kill stops a statement and one whose kill ends a session, and `docs/providers/databend.md` section 8 drops its note.
 
 ## Dependencies
 

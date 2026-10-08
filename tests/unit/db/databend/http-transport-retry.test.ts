@@ -117,6 +117,58 @@ describe("the statement POST (C10)", () => {
     },
   );
 
+  describe("a stop during the backoff after a ProvisionWarehouseTimeout, which the gateway answers unforwarded (HASIM-D-4)", () => {
+    const resuming: ScriptedStep = {
+      method: "POST",
+      path: "/v1/query",
+      reply: { status: 503, body: { error: { kind: "ProvisionWarehouseTimeout", message: "provision timeout" } } },
+    };
+
+    test.each([
+      ["a cancel", "cancel", "user", "cancelled", S.cancelled],
+      ["the statement deadline", "expire", "user", "timeout", S.deadline("60")],
+      ["a provider statement's deadline", "expire", "provider", "timeout", S.resuming("default", "10")],
+    ] as const)(
+      "%s sends no kill and no logout, and says the statement was not sent",
+      async (_label, how, origin, category, message) => {
+        const run = runSignal();
+        const { script, time, transport } = transportHarness([resuming, resuming], {
+          options: testOptions({ warehouse: "default" }),
+        });
+        // The stop fires in the second backoff, after two attempts the gateway answered.
+        time.onSleep(() => {
+          if (time.sleeps.length === 1) run[how]();
+        });
+        const error = await failure(
+          transport.run(statement("INSERT INTO t VALUES (1)", { origin, signal: run.signal })),
+        );
+        expect(error.category).toBe(category);
+        expect(error.message).toBe(message);
+        expect(script.requests).toHaveLength(2);
+        script.expectDone();
+      },
+    );
+
+    test("a cancel while a resent POST is in flight may have reached Databend: it is killed and logged out", async () => {
+      const { script, time, transport } = transportHarness(
+        [
+          resuming,
+          { method: "POST", path: "/v1/query", reply: { hang: true } },
+          { method: "GET", path: P.kill, reply: { status: 200 } },
+          { method: "POST", path: LOGOUT, reply: { status: 200 } },
+        ],
+        { options: testOptions({ warehouse: "default" }) },
+      );
+      const run = runSignal();
+      const running = failure(transport.run(statement("INSERT INTO t VALUES (1)", { signal: run.signal })));
+      await script.received(2);
+      run.cancel();
+      expect((await running).category).toBe("cancelled");
+      expect(time.sleeps).toEqual([1000]);
+      script.expectDone();
+    });
+  });
+
   test("a ProvisionWarehouseTimeout past the deadline is unavailable, with nothing more sent", async () => {
     const warehouse = testOptions({ warehouse: "wh" }, { queryTimeout: 1000 });
     const { script, transport } = transportHarness(
