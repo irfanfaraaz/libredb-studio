@@ -6510,7 +6510,15 @@ describe("PostgreSQL objects on extension-owned tables (#1599)", () => {
       if (sql.includes("as table_count")) {
         return { rows: [{ table_count: String(tables), index_count: String(indexes) }] };
       }
-      if (sql.includes("GROUP BY kind")) return { rows: [{ kind: "trigger", n: triggers.length }] };
+      // COUNTS_SQL is one UNION whose relation arm carries the same pg_class test, so the trigger
+      // count is answered from the trigger arm's own text, which starts at SELECT 'trigger'.
+      if (sql.includes("GROUP BY kind")) {
+        const triggerArm = sql.slice(sql.indexOf("SELECT 'trigger'"));
+        const triggerArmTested = /c\.oid NOT IN \(SELECT d\.objid FROM pg_depend d [^)]*'pg_class'::regclass/.test(
+          triggerArm,
+        );
+        return { rows: [{ kind: "trigger", n: triggerArmTested ? 1 : 2 }] };
+      }
       if (sql.includes("pg_get_triggerdef"))
         return { rows: tableOwnershipTested ? [] : [{ definition: TRIGGER_DEFINITION }] };
       if (sql.includes("tgname")) return { rows: triggers };
