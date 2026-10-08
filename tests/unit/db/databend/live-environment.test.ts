@@ -12,9 +12,14 @@
  * least-privilege role `studio_ro` and its one user `studio_reader`, which holds that role and nothing else (agent
  * plan mode refuses a superuser).
  *
- * The last block holds the write surface of tests/live/databend-*.ts: only `databend-live-check.ts` writes, and only
- * to `studio_demo` and `libredb_demo`, besides its own scratch user and that user's password policy; the evidence plan writes nothing but temporary tables it created in the same
- * scenario; every other file names no write.
+ * The write-surface block holds tests/live/databend-*.ts: only `databend-live-check.ts` and the evidence plan write.
+ * The live check writes only to `studio_demo` and `libredb_demo`, besides its own scratch user and that user's
+ * password policy (S7); the evidence plan writes nothing but temporary tables it created, plus the `insert` scenario's
+ * rows in `studio_demo.notes` of the local fixture, which seed.sh resets; every other file names no write.
+ *
+ * The evidence harness's run arguments and expectation checks are held too, and the last block holds the captures
+ * the replay reads to the plan: each was sent as the plan's local scenario of its name sends it, and shows what that
+ * scenario expects.
  *
  * Each rule is a pure function from the parsed fixtures to a list of findings, so it is proven both ways: the real
  * tree gives none, and a planted copy with one fault gives the finding that names it.
@@ -24,6 +29,13 @@ import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import { parse as parseYaml } from "yaml";
+import {
+  DATABEND_CAPTURE_RUNS,
+  type DatabendCapture,
+  databendCaptureFiles,
+  loadDatabendCapture,
+} from "../../../helpers/databend-fixtures";
+import { carriedSession, type Exchange, problems, runArguments } from "../../../live/databend-evidence";
 import {
   CLOUD_DEMO_DATABASE,
   EVIDENCE_SCENARIOS,
@@ -64,6 +76,8 @@ interface DatabendFixtures {
   /** tests/live/databend-*.ts by file name. */
   readonly live: Readonly<Record<string, string>>;
   readonly scenarios: readonly EvidenceScenario[];
+  /** The captures the replay reads, every file of every run of `DATABEND_CAPTURE_RUNS`. */
+  readonly captures: readonly DatabendCapture[];
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: Mutable<T[K]> };
@@ -82,7 +96,8 @@ function loadFixtures(): DatabendFixtures {
       .filter((name) => name.startsWith("databend-") && name.endsWith(".ts"))
       .map((name) => [name, readFileSync(path.join(LIVE_DIR, name), "utf8")]),
   );
-  return { services, files, live, scenarios: EVIDENCE_SCENARIOS };
+  const captures = DATABEND_CAPTURE_RUNS.flatMap((run) => databendCaptureFiles(run)).map(loadDatabendCapture);
+  return { services, files, live, scenarios: EVIDENCE_SCENARIOS, captures };
 }
 
 /** A deep copy with one change, for the planted half of each rule. */
@@ -90,6 +105,13 @@ function planted(fixtures: DatabendFixtures, change: (draft: Mutable<DatabendFix
   const draft = structuredClone(fixtures) as Mutable<DatabendFixtures>;
   change(draft);
   return draft;
+}
+
+/** The draft's scenario `name`; a plan without it fails the planting rather than planting nothing. */
+function draftScenario(draft: Mutable<DatabendFixtures>, name: string): Mutable<EvidenceScenario> {
+  const scenario = draft.scenarios.find((entry) => entry.name === name);
+  if (scenario === undefined) throw new Error(`the plan has no scenario ${name}`);
+  return scenario;
 }
 
 const PIN =
@@ -440,8 +462,13 @@ function writeSurfaceFindings({ live }: DatabendFixtures): string[] {
 const READ_VERBS = /^(?:SELECT|SHOW|EXPLAIN|DESC|DESCRIBE|BEGIN|ROLLBACK)\b/i;
 const TEMP_CREATE = /^CREATE TEMP TABLE (\w+) \(/;
 const TEMP_WRITE = /^(?:INSERT INTO|DROP TABLE) (\w+)\b/;
+/** The one write outside a temporary table: rows the `insert` scenario adds to the table seed.sh resets. */
+const NOTES_INSERT = /^INSERT INTO studio_demo\.notes VALUES \(/;
 
-/** The evidence plan writes only temporary tables it created earlier in the same scenario. */
+/**
+ * The evidence plan writes nothing but temporary tables it created earlier in the same scenario, plus the `insert`
+ * scenario's rows in `studio_demo.notes` of the local fixture, which seed.sh resets: on Cloud nothing resets them.
+ */
 function planWriteFindings({ scenarios }: DatabendFixtures): string[] {
   const findings: string[] = [];
   for (const scenario of scenarios) {
@@ -456,6 +483,11 @@ function planWriteFindings({ scenarios }: DatabendFixtures): string[] {
       }
       const written = TEMP_WRITE.exec(step.sql);
       if (written && temporary.has(written[1])) continue;
+      if (scenario.name === "insert" && NOTES_INSERT.test(step.sql)) {
+        if (!Bun.deepEquals(scenario.targets, ["local"]))
+          findings.push("insert writes studio_demo.notes on a target seed.sh does not reset");
+        continue;
+      }
       if (!READ_VERBS.test(step.sql)) findings.push(`${scenario.name} writes: ${step.sql.slice(0, 60)}`);
     }
   }
@@ -794,7 +826,7 @@ describe("the write surface of tests/live/databend-*.ts", () => {
     finds(writeSurfaceFindings(computed), "replays an export into name");
   });
 
-  test("the evidence plan writes only temporary tables it created in the same client session", () => {
+  test("the evidence plan writes only temporary tables of its session and the insert scenario's notes rows", () => {
     clean(planWriteFindings(real));
     const persistent = planted(real, (draft) => {
       draft.scenarios[0].steps.push({ kind: "query", sql: "INSERT INTO libredb_demo.every_type VALUES (9)" });
@@ -809,6 +841,25 @@ describe("the write surface of tests/live/databend-*.ts", () => {
       draft.scenarios[0].steps.push({ kind: "query", sql: "INSERT INTO t_unknown VALUES (1)" });
     });
     finds(planWriteFindings(otherTable), "writes: INSERT INTO t_unknown");
+    const notesElsewhere = planted(real, (draft) => {
+      draft.scenarios[0].steps.push({ kind: "query", sql: "INSERT INTO studio_demo.notes VALUES (9, 'nine')" });
+    });
+    finds(planWriteFindings(notesElsewhere), "version writes: INSERT INTO studio_demo.notes");
+    const notesOnCloud = planted(real, (draft) => {
+      draftScenario(draft, "insert").targets = ["local", "cloud"];
+    });
+    finds(planWriteFindings(notesOnCloud), "insert writes studio_demo.notes on a target seed.sh does not reset");
+    const notesDeleted = planted(real, (draft) => {
+      draftScenario(draft, "insert").steps.push({ kind: "query", sql: "DELETE FROM studio_demo.notes WHERE id = 1" });
+    });
+    finds(planWriteFindings(notesDeleted), "insert writes: DELETE FROM studio_demo.notes");
+    const otherRows = planted(real, (draft) => {
+      draftScenario(draft, "insert").steps.push({
+        kind: "query",
+        sql: "INSERT INTO studio_demo.other VALUES (1, 'a')",
+      });
+    });
+    finds(planWriteFindings(otherRows), "insert writes: INSERT INTO studio_demo.other");
   });
 });
 
@@ -816,8 +867,16 @@ describe("the Cloud target of the evidence plan (plan section 7)", () => {
   const cloud = scenariosFor("cloud");
   const local = scenariosFor("local");
 
-  test("the local target runs every scenario that names no target, unchanged", () => {
-    expect(local).toEqual(EVIDENCE_SCENARIOS.filter((scenario) => scenario.targets === undefined));
+  test("the local target runs every scenario that names no target, unchanged, plus the two that name it alone", () => {
+    expect(local).toEqual(EVIDENCE_SCENARIOS.filter((scenario) => scenario.targets?.includes("local") ?? true));
+    expect(local.filter((scenario) => scenario.targets !== undefined).map((scenario) => scenario.name)).toEqual([
+      "insert",
+      "final-kill",
+    ]);
+    expect(local.filter((scenario) => scenario.targets !== undefined).map((scenario) => scenario.targets)).toEqual([
+      ["local"],
+      ["local"],
+    ]);
     expect(local.some((scenario) => scenario.warehouse !== undefined)).toBe(false);
   });
 
@@ -846,6 +905,157 @@ describe("the Cloud target of the evidence plan (plan section 7)", () => {
   });
 });
 
+// -- the run arguments and the expectation check of tests/live/databend-evidence.ts --------------------------------
+
+/** A captured exchange as the harness checks a live one: the plan step, the status, and the answer as parsed. */
+function asExchange(exchange: DatabendCapture["exchanges"][number]): Exchange {
+  const { status, headers, body } = exchange.response;
+  return {
+    step: exchange.step as Exchange["step"],
+    raw: { request: exchange.request, response: { status, headers, body: JSON.stringify(body) } },
+    answer: body as Exchange["answer"],
+  };
+}
+
+describe("the run arguments and the expectation check of tests/live/databend-evidence.ts", () => {
+  const names = (argv: readonly string[]) => runArguments(argv).scenarios.map((scenario) => scenario.name);
+
+  test("a query carries the newest session an answer held, as BendSQL's handle_session keeps it", () => {
+    const opened = { database: "default", txn_state: "Active" };
+    const echoed = { database: "default", txn_state: "AutoCommit" };
+    expect(carriedSession(undefined, "query", {})).toBeUndefined();
+    expect(carriedSession(undefined, "query", { session: opened })).toEqual(opened);
+    expect(carriedSession(opened, "query", { session: echoed })).toEqual(echoed);
+    // The last page of a statement answers `session: null`, which keeps the session before it.
+    expect(carriedSession(opened, "pages", JSON.parse('{"state":"Succeeded","session":null}'))).toEqual(opened);
+    expect(carriedSession(opened, "kill", {})).toEqual(opened);
+    // A logout ends the client: what the plan sends after it starts with no session.
+    expect(carriedSession(opened, "logout", {})).toBeUndefined();
+  });
+
+  test("a run asks every scenario of its target, as that target runs them", () => {
+    expect(runArguments(["--target", "local"])).toEqual({ target: "local", scenarios: scenariosFor("local") });
+    expect(runArguments(["--target", "cloud"])).toEqual({ target: "cloud", scenarios: scenariosFor("cloud") });
+    expect(() => runArguments(["--target", "staging"])).toThrow("usage: bun tests/live/databend-evidence.ts");
+    expect(() => runArguments([])).toThrow("usage: bun tests/live/databend-evidence.ts");
+  });
+
+  test("--only runs just the scenarios it names, in plan order", () => {
+    expect(names(["--target", "local", "--only", "insert,final-kill"])).toEqual(["insert", "final-kill"]);
+    expect(names(["--only", "final-kill,version", "--target", "local"])).toEqual(["version", "final-kill"]);
+    expect(runArguments(["--target", "cloud", "--only", "session-echo"]).scenarios).toEqual(
+      scenariosFor("cloud").filter((scenario) => scenario.name === "session-echo"),
+    );
+  });
+
+  test("--only refuses a name its target does not run, and a missing list", () => {
+    expect(() => runArguments(["--target", "local", "--only", "insert,nope"])).toThrow(
+      '--only names "nope", which the local target does not run',
+    );
+    expect(() => runArguments(["--target", "local", "--only", "no-warehouse"])).toThrow(
+      '--only names "no-warehouse", which the local target does not run',
+    );
+    expect(() => runArguments(["--target", "cloud", "--only", "insert,final-kill"])).toThrow(
+      '--only names "insert", "final-kill", which the cloud target does not run',
+    );
+    expect(() => runArguments(["--target", "local", "--only", ""])).toThrow('--only names ""');
+    expect(() => runArguments(["--target", "local", "--only"])).toThrow("usage: bun tests/live/databend-evidence.ts");
+  });
+
+  test("statuses holds the status of every exchange in order, wherever a refusal falls", () => {
+    const finalKill = loadDatabendCapture("final-kill").exchanges.map(asExchange);
+    expect(problems({ statuses: [200, 200, 400, 200] }, finalKill)).toEqual([]);
+    expect(problems({ statuses: [200, 200, 200, 200] }, finalKill)).toEqual([
+      'statuses "200,200,400,200", expected "200,200,200,200"',
+    ]);
+    expect(problems({ statuses: [200, 200, 400] }, finalKill)).toEqual([
+      'statuses "200,200,400,200", expected "200,200,400"',
+    ]);
+  });
+});
+
+// -- the captures --------------------------------------------------------------------------------------------------
+
+/** What a scenario sends: its principal, the client-session header of its requests, and its steps in order. */
+interface Sent {
+  readonly principal: string;
+  readonly caps: readonly string[];
+  readonly steps: readonly Readonly<Record<string, unknown>>[];
+}
+
+/**
+ * What a capture sent, each run of `pages` exchanges read as the one step that followed those links. The first
+ * statement carries the plan's own `session`; a later one carries the newest an answer held (checked below), so only
+ * the first is compared here.
+ */
+function sentBy(capture: DatabendCapture): Sent {
+  const steps: Record<string, unknown>[] = [];
+  for (const { step, request } of capture.exchanges) {
+    if (step === "pages" && steps.at(-1)?.kind === "pages") continue;
+    if (step !== "query") steps.push({ kind: step });
+    else {
+      const first = !steps.some((sent) => sent.kind === "query");
+      const body: Readonly<Record<string, unknown>> = request.body ?? {};
+      steps.push({
+        kind: step,
+        sql: body.sql,
+        pagination: body.pagination,
+        ...(first ? { session: body.session } : {}),
+      });
+    }
+  }
+  const caps = [
+    ...new Set(capture.exchanges.map(({ request }) => request.headers["x-databend-client-caps"] ?? "none")),
+  ];
+  return { principal: capture.principal, caps, steps };
+}
+
+/** What a scenario sends, in the shape of {@link sentBy}. */
+function plannedBy(scenario: EvidenceScenario): Sent {
+  const firstQuery = scenario.steps.findIndex((step) => step.kind === "query");
+  const steps = scenario.steps.map((step, index) =>
+    step.kind === "query"
+      ? {
+          kind: step.kind,
+          sql: step.sql,
+          pagination: step.pagination,
+          ...(index === firstQuery ? { session: step.session } : {}),
+        }
+      : { kind: step.kind },
+  );
+  return { principal: scenario.principal, caps: [scenario.clientSession ? "session_header" : "none"], steps };
+}
+
+/**
+ * Each capture the replay reads is a scenario the local target runs (the scenarios that name no target or name local,
+ * as `scenariosFor("local")` picks them), sent as that scenario sends it, and showing what that scenario expects.
+ */
+function captureFindings({ scenarios, captures }: DatabendFixtures): string[] {
+  const findings: string[] = [];
+  const local = scenarios.filter((scenario) => scenario.targets?.includes("local") ?? true);
+  for (const capture of captures) {
+    const name = capture.scenario;
+    const scenario = local.find((entry) => entry.name === name);
+    if (scenario === undefined) {
+      findings.push(`${name} is the capture of no scenario the local target runs`);
+      continue;
+    }
+    const sent = sentBy(capture);
+    const planned = plannedBy(scenario);
+    for (const key of ["principal", "caps"] as const)
+      if (!Bun.deepEquals(sent[key], planned[key]))
+        findings.push(`${name} was sent with ${key} ${JSON.stringify(sent[key])}, not ${JSON.stringify(planned[key])}`);
+    for (let index = 0; index < Math.max(sent.steps.length, planned.steps.length); index += 1) {
+      const [was, plan] = [sent.steps[index], planned.steps[index]];
+      if (!Bun.deepEquals(was, plan))
+        findings.push(`${name} step ${index + 1} was sent as ${JSON.stringify(was)}, not ${JSON.stringify(plan)}`);
+    }
+    for (const problem of problems(scenario.expect, capture.exchanges.map(asExchange)))
+      findings.push(`${name}: ${problem}`);
+  }
+  return findings;
+}
+
 describe("the captures under tests/fixtures/databend", () => {
   test("each manifest names the Studio commit and the harness files that commit did not hold", () => {
     const captures = path.join(ROOT, "tests/fixtures/databend");
@@ -858,5 +1068,40 @@ describe("the captures under tests/fixtures/databend", () => {
       expect(Array.isArray(manifest.uncommitted)).toBe(true);
       for (const file of manifest.uncommitted) expect(HARNESS_PATHS.some((root) => file.startsWith(root))).toBe(true);
     }
+  });
+
+  test("each replayed capture is sent as its local scenario sends it and shows what that scenario expects", () => {
+    expect(real.captures.length).toBeGreaterThan(0);
+    clean(captureFindings(real));
+    const statement = planted(real, (draft) => {
+      const [step] = draftScenario(draft, "insert").steps;
+      if (step.kind === "query") step.sql = "INSERT INTO studio_demo.notes VALUES (6, 'sixth')";
+    });
+    finds(captureFindings(statement), "insert step 1 was sent as", "(3, 'third')", "(6, 'sixth')");
+    const paging = planted(real, (draft) => {
+      const [step] = draftScenario(draft, "final-kill").steps;
+      if (step.kind === "query") step.pagination = { wait_time_secs: 10 };
+    });
+    finds(captureFindings(paging), "final-kill step 1 was sent as", "max_rows_per_page");
+    const stepless = planted(real, (draft) => {
+      draftScenario(draft, "final-kill").steps.pop();
+    });
+    finds(captureFindings(stepless), 'final-kill step 4 was sent as {"kind":"kill"}');
+    const sessionless = planted(real, (draft) => {
+      draftScenario(draft, "insert").clientSession = false;
+    });
+    finds(captureFindings(sessionless), 'insert was sent with caps ["session_header"], not ["none"]');
+    const principal = planted(real, (draft) => {
+      draftScenario(draft, "reader").principal = "default";
+    });
+    finds(captureFindings(principal), 'reader was sent with principal "reader", not "default"');
+    const expectation = planted(real, (draft) => {
+      draftScenario(draft, "final-kill").expect.statuses = [200, 200, 200, 200];
+    });
+    finds(captureFindings(expectation), 'final-kill: statuses "200,200,400,200", expected "200,200,200,200"');
+    const cloudOnly = planted(real, (draft) => {
+      draftScenario(draft, "insert").targets = ["cloud"];
+    });
+    finds(captureFindings(cloudOnly), "insert is the capture of no scenario the local target runs");
   });
 });

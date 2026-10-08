@@ -10,9 +10,9 @@
  * The captures were taken on 2026-10-07 by tests/live/databend-evidence.ts from the `databend-http` fixture of
  * docker/databend/README.md (`tests/fixtures/databend/local-2026-10-07-v1.2.951-nightly/manifest.json`):
  * datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b.
- * Two were added on 2026-10-08 from the same image and fixture through the same scrub, for flows the harness plan
- * does not run (`local-2026-10-08-v1.2.951-nightly/`): `insert`, an INSERT into a table that outlives its session,
- * and `final-kill`, the kill that follows a page of a finalized statement.
+ * Two more, the scenarios the harness plan runs on the local target only, were captured on 2026-10-08 from the same
+ * image and fixture through the same scrub (`local-2026-10-08-v1.2.951-nightly/`): `insert`, an INSERT into a table
+ * that outlives its session, and `final-kill`, the kill that follows a page of a finalized statement.
  *
  * A statement is answered by its text, not by its position. What is BUILT rather than captured: the connect caution's
  * `auth_type` read and every object-surface read (`system.catalogs`, `system.databases`, `system.tables`,

@@ -56,11 +56,15 @@ docker compose -f database-compose.yml rm -sf databend-http databend-http-seed
 | `libredb_demo.every_type_view` | A view over three of its columns |
 | `libredb_demo.every_type_mv` | A materialized view over two of its columns; the pinned image creates one without a license |
 | `libredb_demo.wide_60` | A table of 60 `INT` columns and one row |
-| `studio_demo.notes` | The table the write scenarios of the live check change |
+| `studio_demo.notes` | The table S15 of the live check counts around `studio_reader`'s refused write and S16 describes; the evidence plan's `insert` scenario adds three rows to it each time it runs |
 | role `studio_ro` | `SELECT` on `libredb_demo.*`, nothing else |
 | user `studio_reader` | Password `Reader123pass!`, a fixed test value; holds `studio_ro` as its default role and no other grant (the `public` role every Databend user has aside), the least-privilege user agent plan mode needs, since it refuses a superuser |
 
-The only writers of this server are `seed.sh` and `tests/live/databend-live-check.ts`, which writes only to `studio_demo` and `libredb_demo`; `tests/unit/db/databend/live-environment.test.ts` holds both rules, and the evidence harness creates nothing but temporary tables that end with their session.
+The only writers of this server are `seed.sh`, `tests/live/databend-live-check.ts` and the evidence harness `tests/live/databend-evidence.ts`.
+The live check writes only to `studio_demo` and `libredb_demo`, plus the user `studio_scratch` and its password policy `studio_scratch_policy`, which S7 creates and drops.
+The evidence harness writes nothing but temporary tables it created, which end with their client session, plus the `insert` scenario's rows in `studio_demo.notes` of the local fixture, which `seed.sh` resets.
+No check counts that table's rows against a fixed number: S15 compares the count before and after its refused write.
+`tests/unit/db/databend/live-environment.test.ts` holds each of these rules.
 
 ## The live check
 

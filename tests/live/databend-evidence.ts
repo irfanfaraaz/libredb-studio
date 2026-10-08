@@ -1,8 +1,8 @@
 /**
- * The Databend evidence harness (design 9, D14): it runs every scenario of tests/live/databend-evidence-plan.ts
- * against the `databend-http` fixture of docker/databend/README.md over `node:http`, with no provider import, and
- * writes each scenario's exchanges as tests/fixtures/databend/<target>-<date>-<version>/<scenario>.json, plus a
- * manifest.json naming the Studio commit and the harness files it does not hold as run, the image, the server
+ * The Databend evidence harness (design 9, D14): it runs the scenarios of tests/live/databend-evidence-plan.ts that
+ * its target runs against the `databend-http` fixture of docker/databend/README.md over `node:http`, with no provider
+ * import, and writes each scenario's exchanges as tests/fixtures/databend/<target>-<date>-<version>/<scenario>.json,
+ * plus a manifest.json naming the Studio commit and the harness files it does not hold as run, the image, the server
  * version, the date and each scenario's result and time. The captures feed the transport tests and the replay;
  * tests/fixtures/databend/README.md describes them.
  *
@@ -12,12 +12,21 @@
  * expects stops the run, and nothing is written either. The credentials are read from database-compose.yml and
  * docker/databend/fixture.jsonl, the files that set them.
  *
- * The harness never writes to the fixture: it creates nothing but temporary tables in its own client sessions, which
- * end with the session (tests/unit/db/databend/live-environment.test.ts holds that). A query left running by a failed
- * run is killed before the run stops.
+ * The harness writes nothing but temporary tables it created, which end with their client session, plus the `insert`
+ * scenario's rows in `studio_demo.notes` of the local fixture, which docker/databend/seed.sh resets
+ * (tests/unit/db/databend/live-environment.test.ts holds that). A query left running by a failed run is killed before
+ * the run stops.
  *
- * Run by hand, never by `bun run test` (tests/runner/discover.ts excludes tests/live/), with the fixture up and seeded:
+ * Run by hand, never by `bun run test` (tests/runner/discover.ts excludes tests/live/), with the fixture up and seeded;
+ * the unit test imports `runArguments` and `problems`, and the run starts only when this file is the entry point:
  *   bun tests/live/databend-evidence.ts --target local
+ *   bun tests/live/databend-evidence.ts --target local --only insert,final-kill
+ *
+ * `--only <name>[,<name>...]` runs only the named scenarios of the target, in plan order, and writes them and a
+ * manifest that lists only them into the same `<target>-<date>-v<version>/` directory. A name the target does not run
+ * is refused before anything is sent, and a directory holding a file the run does not write is refused before
+ * anything is written. A run that leaves `version` out still asks it first, for the manifest's server version, and
+ * writes nothing of it.
  *
  * The Cloud target of plan section 7 runs `scenariosFor("cloud")` over HTTPS on 443 with the system trust store, the
  * tenant's warehouse in `x-databend-warehouse`, against the objects the Cloud setup put in `studio_demo`. Everything
@@ -31,7 +40,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
@@ -263,7 +272,7 @@ function send(
   });
 }
 
-interface Answer {
+export interface Answer {
   readonly id?: string;
   readonly state?: string;
   readonly session?: Record<string, unknown> & { txn_state?: string; need_keep_alive?: boolean };
@@ -284,7 +293,21 @@ function parsed(body: string): Answer {
   }
 }
 
-interface Exchange {
+/**
+ * The session a query carries after an exchange: the newest one an answer held, as BendSQL's `handle_session` keeps
+ * its state when an answer has none (the last page of a statement answers `session: null`, which keeps the one before
+ * it). A logout ends the client, and BendSQL sends nothing after it, so a statement the plan sends after one carries
+ * no session, as a new client of the same session id would.
+ */
+export function carriedSession(
+  current: Answer["session"],
+  step: EvidenceStep["kind"],
+  answer: Answer,
+): Answer["session"] {
+  return step === "logout" ? undefined : (answer.session ?? current);
+}
+
+export interface Exchange {
   readonly raw: RawExchange;
   readonly answer: Answer;
   readonly step: EvidenceStep["kind"];
@@ -313,7 +336,7 @@ async function runScenario(endpoint: Endpoint, scenario: EvidenceScenario): Prom
   }
   const exchanges: Exchange[] = [];
   let last: Answer = {};
-  let session: Record<string, unknown> | undefined;
+  let session: Answer["session"];
   const exchange = async (kind: EvidenceStep["kind"], method: "GET" | "POST", target: string, body?: unknown) => {
     const sent = await send(endpoint, method, target, headers, body);
     const answer = parsed(sent.body);
@@ -327,6 +350,7 @@ async function runScenario(endpoint: Endpoint, scenario: EvidenceScenario): Prom
     });
     if (sent.headers["x-databend-session"] !== undefined)
       headers["x-databend-session"] = sent.headers["x-databend-session"];
+    session = carriedSession(session, kind, answer);
     return answer;
   };
   try {
@@ -336,14 +360,12 @@ async function runScenario(endpoint: Endpoint, scenario: EvidenceScenario): Prom
           const payload = { sql: step.sql, pagination: step.pagination, session: session ?? step.session };
           // oxlint-disable-next-line no-await-in-loop -- one request at a time, in plan order.
           last = await exchange("query", "POST", "/v1/query", payload);
-          if (last.session !== undefined) session = last.session;
           break;
         }
         case "pages":
           while (typeof last.next_uri === "string") {
             // oxlint-disable-next-line no-await-in-loop -- each page names the next.
             const page = await exchange("pages", "GET", last.next_uri);
-            if (page.session !== undefined) session = page.session;
             if (last.next_uri === last.final_uri) break;
             last = page;
           }
@@ -377,7 +399,7 @@ async function runScenario(endpoint: Endpoint, scenario: EvidenceScenario): Prom
 }
 
 /** What the scenario's answers show that the plan does not expect, as one problem per fact. */
-function problems(expect: EvidenceExpectation, exchanges: readonly Exchange[]): string[] {
+export function problems(expect: EvidenceExpectation, exchanges: readonly Exchange[]): string[] {
   const first = exchanges[0];
   const queries = exchanges.filter((exchange) => exchange.step === "query");
   const lastAnswer = exchanges[exchanges.length - 1]?.answer;
@@ -393,6 +415,7 @@ function problems(expect: EvidenceExpectation, exchanges: readonly Exchange[]): 
     ["rows", expect.rows, exchanges.reduce((sum, exchange) => sum + rowsOf(exchange), 0)],
     ["last code", expect.lastCode, lastAnswer?.error?.code],
     ["txn_state", expect.txnStates?.join(","), queries.map((exchange) => exchange.answer.session?.txn_state).join(",")],
+    ["statuses", expect.statuses?.join(","), exchanges.map((exchange) => exchange.raw.response.status).join(",")],
   ];
   const found = facts
     .filter(([, want, saw]) => want !== undefined && want !== saw)
@@ -415,13 +438,42 @@ interface ScenarioResult {
   readonly exchanges: number;
 }
 
+const USAGE = "usage: bun tests/live/databend-evidence.ts --target local|cloud [--only <name>[,<name>...]]";
+
+/** The scenario whose `SELECT version()` the manifest names as the server version. */
+const VERSION_SCENARIO = "version";
+
+export interface EvidenceRun {
+  readonly target: EvidenceTarget;
+  readonly scenarios: readonly EvidenceScenario[];
+}
+
+/**
+ * The target and the scenarios a run asks: every scenario of `--target`, or only those `--only` names, in plan order.
+ * A name the target does not run is refused before anything is sent.
+ */
+export function runArguments(argv: readonly string[]): EvidenceRun {
+  const target = argv[argv.indexOf("--target") + 1] as EvidenceTarget | undefined;
+  if (!argv.includes("--target") || (target !== "local" && target !== "cloud")) throw new Error(USAGE);
+  const scenarios = scenariosFor(target);
+  if (!argv.includes("--only")) return { target, scenarios };
+  const only = argv[argv.indexOf("--only") + 1];
+  if (only === undefined) throw new Error(USAGE);
+  const names = only.split(",");
+  const unknown = names.filter((name) => !scenarios.some((scenario) => scenario.name === name));
+  if (unknown.length > 0) {
+    const listed = unknown.map((name) => JSON.stringify(name)).join(", ");
+    const runs = scenarios.map((scenario) => scenario.name).join(", ");
+    throw new Error(`--only names ${listed}, which the ${target} target does not run; it runs ${runs}`);
+  }
+  return { target, scenarios: scenarios.filter((scenario) => names.includes(scenario.name)) };
+}
+
 /** What a line on the terminal may not show, once the endpoint is known: a DNS or TLS error names the host. */
 let printed: EvidenceSecrets | undefined;
 
 async function main(argv: readonly string[]): Promise<number> {
-  const target = argv[argv.indexOf("--target") + 1] as EvidenceTarget | undefined;
-  if (!argv.includes("--target") || (target !== "local" && target !== "cloud"))
-    throw new Error("usage: bun tests/live/databend-evidence.ts --target local|cloud");
+  const { target, scenarios } = runArguments(argv);
   const endpoint = target === "cloud" ? cloudEndpoint() : localEndpoint();
   printed = endpoint.secrets;
   const scrubber = new EvidenceScrubber(endpoint.secrets);
@@ -430,7 +482,13 @@ async function main(argv: readonly string[]): Promise<number> {
   const files: Record<string, unknown> = {};
   const results: ScenarioResult[] = [];
   let version: string | undefined;
-  for (const scenario of scenariosFor(target)) {
+  let serverVersion: unknown;
+  // A run that leaves `version` out asks it all the same, first as the plan does, for the manifest; none of it is
+  // scrubbed or written, so the placeholders of the files start where they would without it.
+  const probe: readonly EvidenceScenario[] = scenarios.some((scenario) => scenario.name === VERSION_SCENARIO)
+    ? []
+    : scenariosFor(target).filter((scenario) => scenario.name === VERSION_SCENARIO);
+  for (const scenario of [...probe, ...scenarios]) {
     const started = performance.now();
     // oxlint-disable-next-line no-await-in-loop -- one scenario at a time, so timings and sessions do not overlap.
     const exchanges = await runScenario(endpoint, scenario);
@@ -438,6 +496,14 @@ async function main(argv: readonly string[]): Promise<number> {
     const found = problems(scenario.expect, exchanges);
     if (found.length > 0) throw new Error(`${scenario.name}: ${found.join("; ")}: nothing written`);
     if (exchanges[0]?.raw.response.status === 200) version ??= exchanges[0]?.raw.response.headers["x-databend-version"];
+    if (scenario.name === VERSION_SCENARIO) {
+      const [row] = (exchanges[0]?.answer.data ?? []) as unknown[][];
+      serverVersion = row?.[0];
+    }
+    if (probe.includes(scenario)) {
+      console.error(`asked ${scenario.name} for the manifest, not written (${exchanges.length} exchanges, ${ms} ms)`);
+      continue;
+    }
     const scrubbed: (ScrubbedExchange & { step: EvidenceStep["kind"] })[] = exchanges.map((exchange) => {
       const { request, response } = scrubber.exchange(exchange.raw);
       return { step: exchange.step, request, response };
@@ -452,8 +518,7 @@ async function main(argv: readonly string[]): Promise<number> {
     console.error(`pass ${scenario.name} (${exchanges.length} exchanges, ${ms} ms)`);
   }
   if (version === undefined) throw new Error("no answer carried x-databend-version");
-  const serverVersion = (files["version.json"] as { exchanges: { response: { body: { data: string[][] } } }[] })
-    .exchanges[0]?.response.body.data[0]?.[0];
+  if (typeof serverVersion !== "string") throw new Error("SELECT version() answered no version");
   files["manifest.json"] = {
     target,
     studioCommit: studioCommit(),
@@ -467,19 +532,28 @@ async function main(argv: readonly string[]): Promise<number> {
 
   const rendered = scrubber.render(files);
   const directory = path.join(OUT, `${target}-${date}-v${version}`);
+  // A file this run does not write would stay beside a manifest that does not name it, as after an --only run into
+  // the directory of a full one.
+  const stray = existsSync(directory) ? readdirSync(directory).filter((name) => !Object.hasOwn(rendered, name)) : [];
+  if (stray.length > 0)
+    throw new Error(
+      `${path.relative(ROOT, directory)} holds ${stray.join(", ")}, which this run does not write: nothing written`,
+    );
   mkdirSync(directory, { recursive: true });
   for (const [name, text] of Object.entries(rendered)) writeFileSync(path.join(directory, name), text);
   console.error(`wrote ${Object.keys(rendered).length} files under ${path.relative(ROOT, directory)}`);
   return 0;
 }
 
-main(process.argv.slice(2)).then(
-  (code) => process.exit(code),
-  (error: unknown) => {
-    const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
-    console.error(printed === undefined ? text : redactForTerminal(text, printed));
-    // The scrub's findings name a file and a label, never the value.
-    if (error instanceof EvidenceLeakError) for (const finding of error.findings) console.error(`  ${finding}`);
-    process.exit(1);
-  },
-);
+// The run starts only when this file is the process's entry point: the unit test imports its checks.
+if (import.meta.main)
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+      const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      console.error(printed === undefined ? text : redactForTerminal(text, printed));
+      // The scrub's findings name a file and a label, never the value.
+      if (error instanceof EvidenceLeakError) for (const finding of error.findings) console.error(`  ${finding}`);
+      process.exit(1);
+    },
+  );

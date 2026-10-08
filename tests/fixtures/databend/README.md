@@ -5,13 +5,19 @@ The Databend transport tests and the replay read these files; no test here reach
 
 ## Where they come from
 
-`tests/live/databend-evidence.ts --target local` runs every scenario of `tests/live/databend-evidence-plan.ts` against the `databend-http` fixture of `docker/databend/README.md` and writes `<target>-<date>-v<version>/<scenario>.json` for each, plus `manifest.json`.
-`--target cloud` runs the same list against a Databend Cloud tenant set up as plan section 7 says, over HTTPS on 443 with the system trust store, through `scenariosFor("cloud")`: every name of `libredb_demo` reads `studio_demo`, three scenarios run on Cloud only, and a gateway refusal is checked as the gateway wraps it.
+`tests/live/databend-evidence.ts --target local` runs the scenarios of `tests/live/databend-evidence-plan.ts` that the local target runs, every one but the three that run on Cloud only, against the `databend-http` fixture of `docker/databend/README.md` and writes `<target>-<date>-v<version>/<scenario>.json` for each, plus `manifest.json`.
+`--target cloud` runs the same list against a Databend Cloud tenant set up as plan section 7 says, over HTTPS on 443 with the system trust store, through `scenariosFor("cloud")`: every name of `libredb_demo` reads `studio_demo`, three scenarios run on Cloud only and two locally only, and a gateway refusal is checked as the gateway wraps it.
 Its inputs come from the environment only, never from a file of this repository: `DATABEND_CLOUD_HOST`, `DATABEND_CLOUD_PORT` and `DATABEND_CLOUD_WAREHOUSE`, and the user and password pairs `DATABEND_CLOUD_STUDIO_*`, `DATABEND_CLOUD_RO_*` and `DATABEND_CLOUD_SCRATCH_*`, plus `DATABEND_CLOUD_USER` and `DATABEND_CLOUD_PASSWORD` when set, which only the scrub reads.
+`--only <name>[,<name>...]` runs only the named scenarios of the target, in plan order, and writes them and a manifest that lists only them into the same `<target>-<date>-v<version>/` directory.
+A name the target does not run is refused before anything is sent, and a directory that already holds a file the run does not write is refused before anything is written.
+A run that leaves out `version` still asks it first, for the manifest's server version, and writes nothing of it.
 The date is the UTC day of the run and the version is the server's `x-databend-version` header.
 `manifest.json` names the target, the Studio commit the harness ran from, the harness files (`database-compose.yml`, `docker/databend/`, the plan, the scrub and the harness) that differ from that commit or are not in it, the image as `tag@digest` (on Cloud, `Databend Cloud`, with a `region` field that is always the placeholder `<region>`), the answer of `SELECT version()`, the date, and each scenario's result, time in milliseconds and number of exchanges.
 A capture whose `uncommitted` list is not empty is not reproducible from its commit alone; capture again from the commit that holds those files.
 A scenario whose answers do not show what the plan expects stops the run, and nothing is written.
+
+The replay reads `local-2026-10-07-v1.2.951-nightly/` for the fifteen scenarios both targets run and `local-2026-10-08-v1.2.951-nightly/` for `insert` and `final-kill`, which run locally only; `DATABEND_CAPTURE_RUNS` in `tests/helpers/databend-fixtures.ts` names the two.
+No test replays `cloud-2026-10-08-v1.2.951-nightly/`, which is kept as the record of the Cloud acceptance of plan section 7.
 
 Each scenario file holds its exchanges in order, each with the plan step that sent it (`query`, `pages`, `next`, `final`, `kill` or `logout`), the request (method, path, allow-listed headers, body) and the answer (status, allow-listed headers, body).
 A body that is not JSON, such as the empty answer to a kill, is kept as `{"text": ...}`.
@@ -48,10 +54,12 @@ An error the harness stops on is printed with the same names replaced, so a DNS 
 | `kill` | A running query, its kill (an empty 200), and the 400 its next page answers afterwards |
 | `final` | A query closed by its final link after the first of three pages, and the 400 its next page answers afterwards |
 | `reader` | `studio_reader` reading `libredb_demo` as `studio_ro` |
+| `insert` | Local only: an `INSERT` into `studio_demo.notes`, a table that outlives the client session, answering one row in `number of rows inserted` with `need_keep_alive: false`, so no logout follows |
+| `final-kill` | Local only: the `final` flow, `Running` with 10 of 25 rows, its final, and the 400 its next page answers, then the kill of the closed query, an empty 200 |
 | `no-warehouse` | Cloud only: no `x-databend-warehouse` header, refused by the gateway with HTTP 400 and `error.kind` `WarehouseHeaderRequired` |
 | `unknown-warehouse` | Cloud only: `x-databend-warehouse: studio_no_such_wh`, refused with HTTP 400 and `error.kind` `BadWarehouse`, the name in the message |
 | `forbidden` | Cloud only: `SHOW WAREHOUSES` as `studio`, refused with HTTP 403 and `error.kind` `ForbiddenAccessUser` |
 
 The answer's `error` keeps `code`, `kind`, `message` and `detail`: the Cloud gateway's own refusals carry a `kind` and no `code` (I19).
 
-The temporary tables are the harness's only writes, and they end with their client session.
+The harness writes nothing but temporary tables it created, which end with their client session, plus the `insert` scenario's rows in `studio_demo.notes` of the local fixture, which `docker/databend/seed.sh` resets.

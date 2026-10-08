@@ -4,20 +4,23 @@
  * read the whole list (tests/unit/db/databend/live-environment.test.ts). Pure: no I/O and no import.
  *
  * Each scenario is one capture, tests/fixtures/databend/<target>-<date>-<version>/<name>.json, holding every exchange
- * of its steps in order. A `query` step posts to /v1/query, carrying the `session` object of the scenario's previous
- * answer as a driver does; the other steps follow a link of the last answer (`pages` every `next_uri` until there is
- * none, `next` one, `final`, `kill`) or end the client session (`logout`). A scenario with `clientSession` sends
+ * of its steps in order. A `query` step posts to /v1/query, carrying the newest `session` object an answer of the
+ * scenario held, as a driver does (a statement's last page answers `session: null`, which keeps the one before it);
+ * the other steps follow a link of the last answer (`pages` every `next_uri` until there is none, `next` one, `final`,
+ * `kill`) or end the client session (`logout`). A scenario with `clientSession` sends
  * `x-databend-client-caps: session_header` and its own `x-databend-session` on every request.
  *
- * The harness never writes to the fixture: a scenario changes nothing but a temporary table it created in its own
- * client session, which ends with the session; the live-environment test holds that rule. `expect` is what the
- * scenario's answers must show, checked before anything is written.
+ * The plan writes nothing but temporary tables it created, each in its own client session and gone with it, plus the
+ * `insert` scenario's rows in `studio_demo.notes` of the local fixture, which docker/databend/seed.sh resets; the
+ * live-environment test holds that rule. `expect` is what the scenario's answers must show, checked before anything is
+ * written.
  *
  * The Cloud target of plan section 7 runs the same list through `scenariosFor("cloud")`: the tenant has no
  * `libredb_demo`, so every name of it reads `studio_demo`, where the Cloud setup put the fixture's objects; a scenario
- * with `targets` runs only on those; and `cloudExpect`, where a scenario has one, replaces `expect`, since the
- * gateway wraps a refusal in an envelope of its own (I19). `warehouse` says what a Cloud scenario sends as
- * `x-databend-warehouse` instead of the tenant's warehouse: nothing, or a name the tenant does not have.
+ * with `targets` runs only on those, so `insert` and `final-kill` run locally only; and `cloudExpect`, where a
+ * scenario has one, replaces `expect`, since the gateway wraps a refusal in an envelope of its own (I19). `warehouse`
+ * says what a Cloud scenario sends as `x-databend-warehouse` instead of the tenant's warehouse: nothing, or a name the
+ * tenant does not have.
  */
 
 /** `default` is the server's default user, `reader` the least-privilege `studio_reader`, `wrong` a bad password. */
@@ -36,7 +39,7 @@ export type EvidenceStep =
       readonly kind: "query";
       readonly sql: string;
       readonly pagination?: EvidencePagination;
-      /** The first request's `session`; later requests carry the previous answer's. */
+      /** The first request's `session`; later requests carry the newest one an answer held. */
       readonly session?: Readonly<Record<string, unknown>>;
     }
   | { readonly kind: "pages" | "next" | "final" | "kill" | "logout" };
@@ -65,6 +68,8 @@ export interface EvidenceExpectation {
   readonly state?: string;
   /** The error code of the last exchange's answer. */
   readonly lastCode?: number;
+  /** The status of every exchange, in order. */
+  readonly statuses?: readonly number[];
   /** Settings the first answer's `session.settings` echo, and names it must not echo. */
   readonly echoes?: Readonly<Record<string, string>>;
   readonly drops?: readonly string[];
@@ -267,6 +272,37 @@ export const EVIDENCE_SCENARIOS: readonly EvidenceScenario[] = [
       { kind: "pages" },
     ],
     expect: { status: 200, state: "Succeeded", rows: 1 },
+  },
+  {
+    // An INSERT into a table that outlives the session, so its answer needs no keep-alive and no logout follows.
+    // Local only: seed.sh resets `studio_demo.notes` on the local fixture, and nothing resets it on Cloud.
+    name: "insert",
+    principal: "default",
+    clientSession: true,
+    targets: ["local"],
+    steps: [
+      {
+        kind: "query",
+        sql: "INSERT INTO studio_demo.notes VALUES (3, 'third'), (4, 'fourth'), (5, 'fifth')",
+        pagination: WAIT,
+      },
+      { kind: "pages" },
+    ],
+    expect: { status: 200, state: "Succeeded", rows: 1, needKeepAlive: false },
+  },
+  {
+    // `final`, then the kill that follows the 400 of the page after the final, as the replay sends it.
+    name: "final-kill",
+    principal: "default",
+    clientSession: false,
+    targets: ["local"],
+    steps: [
+      { kind: "query", sql: "SELECT number FROM numbers(25) ORDER BY number", pagination: PAGED },
+      { kind: "final" },
+      { kind: "next" },
+      { kind: "kill" },
+    ],
+    expect: { status: 200, state: "Running", rows: 10, statuses: [200, 200, 400, 200] },
   },
   {
     name: "no-warehouse",

@@ -1,6 +1,6 @@
 #!/bin/sh
-# The only writer of the Databend fixture (docker/databend/README.md) besides tests/live/databend-live-check.ts.
-# Studio never runs it, and the evidence harness never imports or runs it.
+# The seed of the Databend fixture (docker/databend/README.md), whose other writers are tests/live/databend-live-check.ts
+# and the evidence harness's `insert` scenario. Studio never runs it, and the evidence harness never imports or runs it.
 #
 #   seed.sh <base url>   each line of fixture.jsonl, in order, on the server at <base url>
 #
