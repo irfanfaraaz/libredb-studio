@@ -310,6 +310,51 @@ describe("nothing is written on a leak", () => {
     expect(leakOf(() => scrubber.render({ "a.json": scrubbed })).findings).toContain("a.json holds the password");
   });
 
+  test("a password used as a key, which the allow-list keeps inside a whole field, is found", () => {
+    const scrubber = new EvidenceScrubber(SECRETS);
+    const session = { catalog: "default", settings: { [PASSWORD]: "1" } };
+    const scrubbed = scrubber.exchange(exchange(answer({ session })));
+    expect(JSON.stringify(scrubbed)).toContain(PASSWORD);
+    const error = leakOf(() => scrubber.render({ "a.json": scrubbed }));
+    expect(error.findings).toEqual(["a.json holds the password"]);
+  });
+
+  // A quote and a backslash are escaped inside a JSON text, so the password is there only in its escaped spelling.
+  const ESCAPED: EvidenceSecrets = { users: [{ user: "libredb", password: 'Pro"be\\12' }] };
+
+  test.each([
+    ["a JSON-encoded message", (inner: string) => inner],
+    ["a message wrapping one as the Cloud gateway does", (inner: string) => `status: 401, message: ${inner}: denied`],
+  ])("a password holding a quote and a backslash in %s is found", (_case, wrap) => {
+    const scrubber = new EvidenceScrubber(ESCAPED);
+    const inner = JSON.stringify({ error: { code: 1063, message: `bad password 'Pro"be\\12'` } });
+    const scrubbed = scrubber.exchange(
+      exchange(answer({ error: { code: 401, message: wrap(inner) }, state: "Failed" })),
+    );
+    const error = leakOf(() => scrubber.render({ "a.json": scrubbed }));
+    expect(error.findings).toEqual(["a.json holds the password"]);
+  });
+
+  test("a password used as a key inside a JSON-encoded string is found", () => {
+    const scrubber = new EvidenceScrubber(ESCAPED);
+    const dirty = { note: JSON.stringify({ settings: { 'Pro"be\\12': "1" } }) };
+    expect(leakOf(() => scrubber.render({ "b.json": dirty })).findings).toEqual(["b.json holds the password"]);
+  });
+
+  test("a JSON text is read decoded, so a password in any escaped spelling of it is found, base64 inside included", () => {
+    const scrubber = new EvidenceScrubber(ESCAPED);
+    // The quote and the backslash are JSON unicode escapes here, so only parsing the text gives the password back.
+    const unicode = '{"m": "Pro\\u0022be\\u005c12"}';
+    expect(unicode).not.toContain('Pro"be');
+    expect(leakOf(() => scrubber.render({ "c.json": { note: unicode } })).findings).toEqual([
+      "c.json holds the password",
+    ]);
+    const layered = Buffer.from(JSON.stringify({ note: unicode })).toString("base64");
+    expect(leakOf(() => scrubber.render({ "d.json": { header: layered } })).findings).toEqual([
+      "d.json holds the password",
+    ]);
+  });
+
   test("a clean set renders every file as indented JSON with a final newline", () => {
     const scrubber = new EvidenceScrubber(SECRETS);
     const rendered = scrubber.render({ "a.json": scrubber.exchange(exchange()), "manifest.json": { ok: true } });
@@ -356,6 +401,14 @@ describe("a line for the operator's terminal", () => {
     expect(redacted).toContain("getaddrinfo ENOTFOUND <host>");
     expect(redacted).toContain("DNS:*.gw.<region>.default.databend.com");
     expect(redacted).toContain("tenant <tenant>, warehouse <warehouse>, password <password>");
+  });
+
+  test("names no password escaped inside a JSON text either, as a server's JSON error carries one", () => {
+    const line = `Error: ${JSON.stringify({ message: `bad password 'Pro"be\\12'` })}`;
+    expect(line).toContain('Pro\\"be\\\\12');
+    const redacted = redactForTerminal(line, { users: [{ user: "libredb", password: 'Pro"be\\12' }] });
+    expect(redacted).not.toContain("Pro");
+    expect(redacted).toContain("bad password '<password>'");
   });
 
   test("leaves the stock warehouse name default and a local run's text alone", () => {

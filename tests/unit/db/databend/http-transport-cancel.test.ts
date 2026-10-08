@@ -1,7 +1,8 @@
 /**
  * Cancel, deadline, kill and close (design 3.10; C9; X02, X16, X31): one kill per stop, a hanging kill cut by its own
  * 5 s, a kill answered 404 before the first answer sent again at 250, 500 and 1000 ms, and after a Running answer a
- * cancel that is `cancelled` only on a kill 200 or a 1043 answer. Every timer is the injected `deadline`.
+ * cancel that is `cancelled`, and a deadline that is `timeout`, only on a kill 200 or a 1043 answer. Every timer is
+ * the injected `deadline`.
  */
 import { describe, expect, test } from "bun:test";
 import { DATABEND_ERROR_SENTENCES as S } from "@/lib/db/providers/sql/databend/errors";
@@ -127,7 +128,7 @@ describe("after a Running answer (X02)", () => {
     expect(error.category).toBe("cancelled");
   });
 
-  test("the statement deadline with a failed kill is timeout", async () => {
+  test("the statement deadline with a kill Databend did not acknowledge is outcome-unknown: it may still finish", async () => {
     const { script, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: RUNNING },
       { method: "GET", path: P.page(0), reply: { hang: true } },
@@ -136,7 +137,43 @@ describe("after a Running answer (X02)", () => {
       { method: "GET", path: P.kill, reply: { fail: "network" } },
     ]);
     const run = runSignal();
-    const running = failure(transport.run(statement("SELECT 1", { signal: run.signal })));
+    const running = failure(transport.run(statement("INSERT INTO t VALUES (1)", { signal: run.signal })));
+    await script.received(2);
+    run.expire();
+    const error = await running;
+    script.expectDone();
+    expect(error.category).toBe("outcome-unknown");
+    expect(error.message).toBe(S.deadlineUnacknowledged("60"));
+  });
+
+  test("the statement deadline with a kill a gateway refuses over HTTP 200 is outcome-unknown too", async () => {
+    const resuming = { status: 200, body: { error: { kind: "ProvisionWarehouseTimeout", message: "resuming" } } };
+    const kill = { method: "GET" as const, path: P.kill, reply: resuming };
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      { method: "GET", path: P.page(0), reply: { hang: true } },
+      kill,
+      kill,
+      kill,
+    ]);
+    const run = runSignal();
+    const running = failure(transport.run(statement("INSERT INTO t VALUES (1)", { signal: run.signal })));
+    await script.received(2);
+    run.expire();
+    const error = await running;
+    script.expectDone();
+    expect(error.category).toBe("outcome-unknown");
+    expect(error.message).toBe(S.deadlineUnacknowledged("60"));
+  });
+
+  test("the statement deadline with a kill 200 is timeout: Studio cancelled it", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      { method: "GET", path: P.page(0), reply: { hang: true } },
+      { method: "GET", path: P.kill, reply: { status: 200, body: "", contentType: null } },
+    ]);
+    const run = runSignal();
+    const running = failure(transport.run(statement("INSERT INTO t VALUES (1)", { signal: run.signal })));
     await script.received(2);
     run.expire();
     const error = await running;

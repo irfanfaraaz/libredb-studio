@@ -109,6 +109,9 @@ Every path Studio sends is built in `routes.ts` from the query id Studio chose: 
 A `next_uri` is accepted only when it is exactly the page or final path of this statement, compared as text, so an absolute URL (even one on the same origin), `//`, a backslash, a percent sign, a query string, a fragment, a dot segment, another statement's id and any longer text are each refused as "a next_uri link of a shape Studio does not follow".
 `stats_uri`, `final_uri` and `kill_uri` are never read.
 The first answer must also be for Studio's query id and session, from a node id of the accepted shape, before any page is asked for.
+Every later page must be for the same query id and session, and a page that holds a schema or rows must hold the schema the rows before it were kept under, the same names and types in the same order; a page with neither is a long poll still running.
+A page that breaks either rule is a protocol fault that names another statement, another session or another schema (section 10); none of its rows is kept, and the statement is closed under its own query id and session.
+Every later page of the captures, on the local fixture and on Databend Cloud, passes both rules.
 
 ### 3.4 Every statement runs in a session of its own
 
@@ -135,6 +138,7 @@ A session the answer says still needs keep-alive holds a temporary table, and a 
 > Each statement runs in its own session, so Studio ended it, which dropped the temporary tables it created.
 
 A POST that may have reached the server with no answer gets a kill and one logout, since the session id is Studio's own.
+So does a POST whose HTTP 200 could not be read, malformed or past a bound of section 3.10: the server may have run the statement in Studio's session, and a temporary table it made would otherwise outlive it.
 An auth refusal, a middleware 400 or a fail-to-start answer sends nothing more: a kill, ROLLBACK or logout would carry the refused credential again and count toward a lockout.
 A close that Databend answers with a refused sign-in counts the same: the sign-in is latched (section 3.7), and the statement's remaining closes, a resent kill, the ROLLBACK and the logout among them, are not sent.
 A close's HTTP 200 acknowledges it unless its body is a gateway's refusal, which may come over HTTP 200 as over any other status, so a kill refused that way is no acknowledged cancel and a sign-in refused that way is latched.
@@ -146,7 +150,7 @@ Each close is best effort under its own 5 seconds, off the statement's signal; o
 
 > The statement finished, but Studio's request to end its session (logout) got no answer within 5 seconds.
 
-One answered with anything but its acknowledgment, an error status or a refused sign-in, says so instead:
+One answered with anything but its acknowledgment, an error status, a refused sign-in or, on the ROLLBACK's links, an HTTP 200 that could not be read, says so instead:
 
 > The statement finished, but Studio's request to close the finished statement (final) was answered with an error.
 
@@ -224,7 +228,7 @@ There is no token exchange and no server-minted session, so each request costs o
 
 What one answer costs before the budgets apply is bounded by these, not by its 16 MiB.
 Before an answer is parsed, one pass over its text counts what parsing it would build, outside strings: its rows, its columns and their keys, every other array, object, key and value, and how deep its arrays and objects nest.
-An answer past a bound of the table is refused without being parsed, as a protocol fault that names what was too large (section 10), and the statement is killed.
+An answer past a bound of the table is refused without being parsed, as a protocol fault that names what was too large (section 10), and the statement is killed; when it is the POST's own answer, its session is logged out too (section 3.5).
 The nesting bound keeps a parsed answer within the stack of whatever reads it whole, such as the copy of the echoed session a ROLLBACK sends back, which Node 24 fails to write from a few thousand levels (4,460 measured on 24.14).
 A row's cells are bounded by the answer's bytes alone, since a page wider than the cell budget is legal and the budget cuts it once it is read.
 The answer is parsed with no reviver, a key named `__proto__` is looked for afterwards, and the rows are checked where they lie and never copied.
@@ -266,7 +270,8 @@ No SQL provider bounds the statement text it is handed ([D249](../BACKLOG.md)).
 
 The connection-string box is not offered, because it reads `http://` and `https://` as ClickHouse; a pasted address goes into Host, and a DSN goes into Paste URL of a new connection, which fills the fields.
 Paste URL reads `databend://`, `databend+http://` and `databend+https://` as BendSQL reads a DSN: TLS unless `sslmode=disable` (`databend+http://` without TLS), the DSN's port, else 443 with TLS and 80 without, the path as Database and `warehouse=` as Warehouse, or, with no `warehouse=`, the warehouse an older Databend Cloud host names (section 4.4).
-A paste that names a host sets Warehouse, clearing it when the DSN names none, but keeps a password, user or database the DSN does not carry, so check them after a second paste ([D250](../BACKLOG.md)).
+A paste that names a host sets Warehouse, clearing it when the DSN names none, and clears Send the password without TLS, which no DSN carries, so a box ticked for an earlier connection or paste never sends the password in cleartext to the pasted host.
+It keeps a password, user or database the DSN does not carry, so check them after a second paste ([D250](../BACKLOG.md)).
 A spelling Studio does not connect with fills no field and says what to paste instead; a DSN's `sslmode=require` or `sslmode=enable` fills SSL mode verify-system, not the unverified `require` of section 4.3, and says so; and a `tls_ca_file`, or an `sslmode` BendSQL does not read, fills the other fields and says what to set under SSL / TLS:
 
 | Paste | What Studio says |
@@ -286,6 +291,7 @@ A spelling Studio does not connect with fills no field and says what to paste in
 
 An `@` past the address part is refused even after the sign-in's own `@`, since a password can hold an unencoded `@` before its `/`; percent-encoded, as in `databend://root:pw@host:443/db?role=analyst%40corp`, the text reads one way.
 `tls_ca_file` is not applied, nor is an `sslmode` other than `disable`, `require` and `enable`: each gets its caution above.
+Such an `sslmode` leaves SSL mode as it was, so a DSN without a port gets the scheme's: 80 for `databend+http://` and 443 for `databend://` and `databend+https://`.
 Any other parameter, `warehouse` and the sign-in ones refused above aside, is not applied either: it is named in a warning, never valued, and the other fields are filled in:
 
 > Not applied: [names]. Studio's Databend connection takes host, port, user, password, database, warehouse and TLS; the other fields were filled in.
@@ -338,6 +344,7 @@ On Databend Cloud, or with Warehouse set, the refusal adds:
 Through the Databend Cloud gateway a refused sign-in is a 401 of kind `AuthorizationFailed` wrapping the query node's own 401 and code, and a lockout a 500 wrapping code 2215; both are read and latched like a direct answer, as is either kind over another status, HTTP 200 included.
 A refused sign-in on any request of a statement, its kill, final, ROLLBACK or logout included, is latched the same way.
 A 401 with no sign-in code, on a follow-up request of a running statement, reads "Databend refused a follow-up request of this statement." and is not latched.
+On the statement's own POST such a 401 refused the request before anything ran, so it reads "Databend refused the request before running it: [server text]." with the server's text cut and scrubbed as section 10 says, sends nothing more, and is not latched either.
 A connection that signs in as `root` with no password gets a warning in the dialog:
 
 > Credential warning: Signing in as root with no password works only when the server's root user has no password, and such a user accepts any password or none, so anyone who can reach the server signs in as its administrator. Set a password for root on the server, or connect as a user of your own.
@@ -349,6 +356,7 @@ A password over no TLS is refused before any socket unless the host is a loopbac
 > This connection would send its password to Databend without TLS, to a host that is not this machine, where anyone on the path can read it. Choose an SSL mode under SSL / TLS, connect through an SSH tunnel, or tick Send the password without TLS to accept that risk for this connection. Nothing was sent.
 
 With SSL mode `disable` the dialog offers "Send the password without TLS"; ticked, the refusal is lifted for that connection only, and a seed writes it as `allowInsecureAuth: true`.
+A DSN pasted into Paste URL unticks it (section 4.1), so it is ticked again only for the pasted host.
 Databend Cloud serves HTTPS on 443 with a public certificate: choose `verify-system`.
 A self-hosted query node serves plain HTTP on 8000 unless its HTTP handler is given a certificate; then choose `verify-ca` with its CA, or `verify-full` to check the host name too.
 Through an SSH tunnel the certificate is checked against the tunnel's far end, never the local forward.
@@ -496,6 +504,8 @@ Every other type (Decimal, dates, timestamps, intervals, String, hex Binary, geo
 A `Timestamp` is shown in the server's global time zone without an offset, and a `Timestamp_Tz` with its offset.
 Columns are named through `uniqueFieldNames`, so a repeated name gets a suffix and an empty one becomes "(No column name)", and rows are keyed by position.
 A DML statement answers one row in a `UInt64` column `number of rows inserted`, `updated` or `deleted`; its count is the result's row count, as Trino reports an update count, and the row is kept.
+The result's row count is a number, so a count from 2^53 up is the nearest one, which can be off in its last digits, while the kept row holds the exact count as text.
+Studio's own reads take a figure the same way: an object's row count and size in the tree and the monitoring panels' counts, sizes and durations are exact below 2^53 and the nearest number from 2^53 up.
 DDL answers no result set.
 
 ### 5.5 Session state does not carry over
@@ -568,12 +578,16 @@ A kill that does not answer reads:
 
 A cancel before the first answer can miss a statement that is already running, so a kill answered 404 is sent again at 250, 500 and 1,000 ms, and the run reports that the statement may have run, with "cancelled before its first answer" as the cause.
 A Stop or the deadline while the POST waits to be sent again after a Databend Cloud `ProvisionWarehouseTimeout` sends no kill and no logout, and the run reads as cancelled or timed out, since the gateway forwarded none of the attempts (section 3.6).
-The query timeout is sent as `max_execute_time_in_seconds` and is also Studio's deadline; when it passes Studio kills the statement:
+The query timeout is sent as `max_execute_time_in_seconds` and is also Studio's deadline; when it passes Studio kills the statement, and when Databend acknowledged the kill, or an answer reported code 1043, the run reads:
 
 > The statement did not finish within [seconds] seconds, so Studio cancelled it.
 
+After the first answer, a kill that Databend did not acknowledge leaves the statement's outcome unknown, as it does for Stop:
+
+> The statement did not finish within [seconds] seconds, and Databend did not acknowledge Studio's request to stop it, so it may still finish: check before running it again.
+
 With no first answer by then the cause reads "no first answer within [seconds] seconds".
-That sentence reaches a caller of the provider itself, such as an embedded host's route; Studio's own query route answers a deadline with HTTP 408 and its own sentence, "Query timed out. Please try a simpler query or increase timeout.", and Chromium sends a POST answered 408 on a kept-alive connection again, so in the browser a statement that reaches its deadline can run up to three times, each with its kill ([X27](../BACKLOG.md)).
+The first of these sentences reaches a caller of the provider itself, such as an embedded host's route; Studio's own query route answers a run that timed out with HTTP 408 and its own sentence, "Query timed out. Please try a simpler query or increase timeout.", and Chromium sends a POST answered 408 on a kept-alive connection again, so in the browser a statement that reaches its deadline can run up to three times, each with its kill ([X27](../BACKLOG.md)).
 A statement that waits for a permit longer than its deadline sends nothing:
 
 > Studio's Databend statement slots stayed busy for [seconds] seconds, so nothing was sent. Try again when a running statement finishes.
@@ -584,7 +598,7 @@ A statement that waits for a permit longer than its deadline sends nothing:
 
 The tree has two container levels, Catalog and Database, and four object kinds, each read from the catalog's own `system.tables` by its `table_type`: `table` (`BASE TABLE`), `view` (`VIEW`), `materialized_view` (`MATERIALIZED VIEW`) and `dynamic_table` (`DYNAMIC TABLE`).
 Catalogs come from `system.catalogs`, and a catalog's databases from its own `system.databases` without `system` and `information_schema`; the session's database is marked in the default catalog.
-An object's row count and size come from `system.tables`, and a materialized view is listed with neither, since its row there says 0 rows and 0 bytes whatever it holds (measured on the pinned image).
+An object's row count and size come from `system.tables`, the nearest number from 2^53 up (section 5.4), and a materialized view is listed with neither, since its row there says 0 rows and 0 bytes whatever it holds (measured on the pinned image).
 One statement counts every kind of a database; a `table_type` spelling no kind is read from is raised by name, never dropped:
 
 > Databend reported an object of table_type "[type]", which Studio has no object kind for.
@@ -615,7 +629,14 @@ A bulk read instead drops the partly read last object and says "the bulk column 
 Every kind has a source, labelled "Definition".
 A table, view or dynamic table is read with `SHOW CREATE TABLE <catalog>.<database>.<name> WITH QUOTED_IDENTIFIERS`, which quotes every name so the DDL re-runs; provider statements run under the PostgreSQL dialect, so the names are double-quoted.
 A materialized view is read with `SHOW CREATE MATERIALIZED VIEW`, since `SHOW CREATE TABLE` refuses one with 1302, and its DDL comes back with backticks (L6).
-A definition the bound cuts is marked "the definition stopped at Studio's statement budget of 16,777,216 bytes of answer text", and an empty answer reads "Databend answered no definition for this object."
+The part is `regenerated` and `complete`, since the DDL runs as given, and a caller's character bound marks it truncated without changing its form, as in every provider.
+The DDL is the answer's one row, which the statement budget keeps or drops whole and never cuts, so a definition read that reached the budget is refused rather than shown, as the reads of section 6.1 are:
+
+> Databend's answer to the definition reached Studio's statement budget of 16,777,216 bytes of answer text, so Studio shows none of it rather than part of it.
+
+An object Databend does not hold is Databend's own error, 1025 for a table and 1003 for a database (measured on the pinned image), and an answer with no definition text is raised naming the object, never shown as a part:
+
+> Databend answered no definition for "[object]".
 
 ### 6.3 Object edit (#789): not in this version
 
@@ -732,10 +753,10 @@ Every server text passes `serverText` with the connection's secret forms (the pa
 | A fail-to-start answer (nothing ran) | the server's text, then "Nothing ran." |
 | A sign-in refused, or locked | Databend refused the sign-in for this user. (section 4.2) |
 | A latched sign-in | Databend refused this sign-in at [time] UTC, so this Studio server will not send this password again before [until] UTC, or until it changes. |
-| A follow-up request refused 401 | Databend refused a follow-up request of this statement. |
+| A follow-up request refused 401 with no sign-in code | Databend refused a follow-up request of this statement. |
 | A Cloud statement refused `ForbiddenAccessUser` | Databend Cloud refused this statement for this user: [server text]. |
 | A Cloud request with no sign-in, `AuthorizationRequired` | No sign-in reached Databend Cloud: a proxy between Studio and Databend may drop the Authorization header. |
-| A middleware 400 | Databend refused the request before running it: [server text]. |
+| A middleware 400, or the POST refused 401 with no sign-in code | Databend refused the request before running it: [server text]. |
 | A gateway's warehouse or host refusal | the sentences of section 4.4 |
 | A 503 or 429 on a GET past its retries, with no warehouse named | Databend did not answer within [seconds] seconds ([cause]). Try again in a minute. |
 | No answer to the POST | No answer arrived from Databend ([cause]). If the request reached it, Databend may have run the statement: check before running it again. |
@@ -747,7 +768,7 @@ Every server text passes `serverText` with the connection's secret forms (the pa
 
 With Warehouse set, or on an older Databend Cloud host that names its warehouse (section 4.4), an outcome-unknown sentence adds "A suspended warehouse may still be starting.", and a 503 or 429 on a GET past its retries reads as the resuming sentence of section 4.4.
 A user statement whose connection drops gets the no-answer sentence rather than the unreachable one, because the statement may have run.
-The [fault] of the protocol sentence is one of: "a 200 answer that is not JSON", "a body that does not parse as JSON", "a key named __proto__", "the field [field] of the wrong type", "a cell that is neither text nor null", "a row of [cells] cells for [columns] columns", "a link Studio does not follow", "a next_uri link of a shape Studio does not follow", "an answer for another statement", "an answer for another session", "an answer for another session; a proxy may drop the X-DATABEND-SESSION header" and "more answers than one statement may take".
+The [fault] of the protocol sentence is one of: "a 200 answer that is not JSON", "a body that does not parse as JSON", "a key named __proto__", "the field [field] of the wrong type", "a cell that is neither text nor null", "a row of [cells] cells for [columns] columns", "a link Studio does not follow", "a next_uri link of a shape Studio does not follow", "an answer for another statement", "an answer for another session", "an answer for another session; a proxy may drop the X-DATABEND-SESSION header", "a later page with another schema" and "more answers than one statement may take".
 An answer past a bound of section 3.10 names what was too large: "more rows than the page Studio asked for", "a schema larger than a result can keep", "more values than one answer may hold" or "nesting deeper than one answer may have".
 Each category becomes a house class at the provider's boundary: `auth` an `AuthenticationError`, `config` a `DatabaseConfigError`, `timeout` a `TimeoutError`, `cancelled` a `QueryCancelledError`, a statement error or a too-large answer a `QueryError`, and the rest a `ConnectionError`.
 
@@ -869,12 +890,13 @@ A seed takes the same fields, as [SEED_CONNECTIONS.md](../SEED_CONNECTIONS.md) s
 - A cluster that forwards a request to another node (a sticky node or a warehouse route) forwards it, `Authorization` included, over plain HTTP unless that node's HTTP handler has TLS.
 - A hostile or impersonated endpoint holds the password it receives and can return it transformed, in an encoding Studio does not list, so Studio withholds only the forms it sends.
 - A `Timestamp` is shown in the server's global time zone without an offset (a session `SET timezone` does not carry over), and a `Timestamp_Tz` with its offset.
+- A DML statement's row count, an object's row count or size and a monitoring figure from 2^53 up are the nearest number, not the exact one; a result cell keeps such an integer exact, as text (section 5.4).
 - No path-prefixed reverse proxy: Databend's links are origin-relative, so the server must answer at the root of its host and port, with no path prefix.
 - The monitoring panels and sums cover the default catalog only.
 - The SQL INSERT export cannot write `Array`, `Map`, `Tuple`, `Bitmap`, `Interval`, geo or `Vector` values: each such row is skipped by name.
 - A kill stops the session's current statement, not the session, though the Sessions panel's dialog and toast speak of ending it ([U98](../BACKLOG.md)): a session of another client, such as BendSQL, runs its next statement.
 - Every budget was verified locally and through Databend Cloud's gateway on one warehouse; a cold start through Studio and multi-node paging are not run yet.
-- In the browser a statement that reaches its deadline can run up to three times: the query route answers a deadline with HTTP 408, which Chromium sends again on a kept-alive connection ([X27](../BACKLOG.md)).
+- In the browser a statement that reaches its deadline can run up to three times: the query route answers a run that timed out with HTTP 408, which Chromium sends again on a kept-alive connection ([X27](../BACKLOG.md)).
 - A seed edited to add a Warehouse while it is open keeps its pulse until the page is reloaded ([U97](../BACKLOG.md)).
 - The sign-in latch is one Studio process's: several replicas each send a refused password once per 15 minutes, so five or more can still lock a user under a password policy ([D252](../BACKLOG.md)).
 - Driver-based SQL providers hold a whole result with no cell or byte budget, which Databend's provider has ([D247](../BACKLOG.md)), and the pulse of other engines resends a refused password, which the latch prevents here within one Studio process ([D248](../BACKLOG.md)).

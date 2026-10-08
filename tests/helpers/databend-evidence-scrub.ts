@@ -10,12 +10,14 @@
  * JSON carrying the session id, so it is decoded, scrubbed and encoded again in the same form.
  *
  * `render` turns a set of files into text and refuses the whole set, writing nothing, while any file holds a secret
- * form (each password, raw, percent-encoded in any case, form-encoded or in standard or URL-safe base64 with or
- * without padding, anywhere in a string, and each `user:password`, read after its user's placeholder, and in the
- * same base64 spellings), the host, the tenant, the warehouse, the region, an email address or the egress IP in any spelling
- * the placeholders missed. Every string that reads as base64 is also scanned decoded. The error names the file and what
- * it holds, never the value. A warehouse named `default`, the name Databend Cloud gives a tenant's first warehouse, is
- * not looked for: it identifies no tenant, and every capture names the catalog `default`.
+ * form (each password, raw, percent-encoded in any case, form-encoded, in standard or URL-safe base64 with or
+ * without padding, or escaped inside a JSON text, anywhere in a string, and each `user:password`, read after its user's
+ * placeholder, escaped and in the same base64 spellings), the host, the tenant, the warehouse, the region, an email
+ * address or the egress IP in any spelling the placeholders missed. Keys are scanned as values are, and every string
+ * that reads as base64, and every one of up to 64 KiB that parses as JSON, is also scanned decoded, up to four layers
+ * deep. The error names the file and what it holds, never the value. A warehouse named `default`, the name Databend
+ * Cloud gives a tenant's first warehouse, is not looked for: it identifies no tenant, and every capture names the
+ * catalog `default`.
  */
 
 /** What a run sends or meets that must never reach a capture. Cloud runs name the last five. */
@@ -158,6 +160,20 @@ function base64Forms(secret: string): string[] {
   return [bytes.toString("base64").replace(/=+$/, ""), bytes.toString("base64url")];
 }
 
+/**
+ * A secret's spellings inside a JSON text that a string carries, escaped once and twice, when escaping changes it: a
+ * JSON text inside a longer message, as the Cloud gateway wraps a query node's refusal, is never parsed whole.
+ */
+function jsonForms(secret: string): string[] {
+  const once = JSON.stringify(secret).slice(1, -1);
+  return once === secret ? [] : [once, JSON.stringify(once).slice(1, -1)];
+}
+
+/** The longest string the scan parses as JSON, and how many layers of base64 or JSON inside a string it reads. */
+const NESTED_TEXT_LIMIT = 64 * 1024;
+const NESTED_DEPTH_LIMIT = 4;
+const JSON_TEXT = /^\s*[[{"]/;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -181,7 +197,7 @@ export function redactForTerminal(text: string, secrets: EvidenceSecrets): strin
   const replacements: [string, string][] = [];
   for (const { user, password } of secrets.users) {
     for (const form of base64Forms(`${user}:${password}`)) replacements.push([form, "<credential>"]);
-    for (const form of [password, ...percentForms(password), ...base64Forms(password)])
+    for (const form of [...jsonForms(password), password, ...percentForms(password), ...base64Forms(password)])
       replacements.push([form, "<password>"]);
   }
   const { host, tenant, warehouse, region, egressIp } = secrets;
@@ -218,14 +234,38 @@ function decodeSession(value: string): { id?: unknown } | undefined {
   }
 }
 
-/** Every string in a JSON value, with each one that reads as base64 also decoded. */
-function stringsOf(value: unknown, out: string[] = []): string[] {
-  if (typeof value === "string") {
-    out.push(value);
-    if (BASE64.test(value)) out.push(Buffer.from(value, "base64").toString("utf8"));
-  } else if (Array.isArray(value)) for (const item of value) stringsOf(item, out);
-  else if (isRecord(value)) for (const item of Object.values(value)) stringsOf(item, out);
+/** A string's JSON value when it is a JSON text within the bound, else undefined. */
+function nestedJson(text: string): unknown {
+  if (text.length > NESTED_TEXT_LIMIT || !JSON_TEXT.test(text)) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Every string and every key in a JSON value, each one that reads as base64 also decoded and each one that parses as
+ * JSON also read the same way, up to {@link NESTED_DEPTH_LIMIT} layers in: a secret used as a key, or escaped inside a
+ * JSON text a string carries, is then in the corpus as it was sent.
+ */
+function stringsOf(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (typeof value === "string") textsOf(value, out, depth);
+  else if (Array.isArray(value)) for (const item of value) stringsOf(item, out, depth);
+  else if (isRecord(value))
+    for (const [key, item] of Object.entries(value)) {
+      textsOf(key, out, depth);
+      stringsOf(item, out, depth);
+    }
   return out;
+}
+
+function textsOf(text: string, out: string[], depth: number): void {
+  out.push(text);
+  if (depth >= NESTED_DEPTH_LIMIT) return;
+  if (BASE64.test(text)) textsOf(Buffer.from(text, "base64").toString("utf8"), out, depth + 1);
+  const nested = nestedJson(text);
+  if (nested !== undefined) stringsOf(nested, out, depth + 1);
 }
 
 export class EvidenceScrubber {
@@ -372,13 +412,19 @@ export class EvidenceScrubber {
     const { users, host, tenant, warehouse, region, egressIp } = this.secrets;
     if (
       users.some(({ password }) =>
-        [password, ...percentForms(password), ...base64Forms(password)].some((form) => text.includes(form)),
+        [password, ...percentForms(password), ...base64Forms(password), ...jsonForms(password)].some((form) =>
+          text.includes(form),
+        ),
       )
     )
       labels.push("password");
     if (
       users.some(({ user, password }, index) =>
-        [`<user-${index + 1}>:${password}`, ...base64Forms(`${user}:${password}`)].some((form) => text.includes(form)),
+        [
+          `<user-${index + 1}>:${password}`,
+          ...jsonForms(`<user-${index + 1}>:${password}`),
+          ...base64Forms(`${user}:${password}`),
+        ].some((form) => text.includes(form)),
       )
     )
       labels.push("credential");

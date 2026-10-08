@@ -407,6 +407,24 @@ describe("the panels", () => {
     ]);
   });
 
+  test("a figure from 2^53 up, which decodes as its exact text, is its nearest number, so not exact", async () => {
+    const { runner } = routed({
+      [tableStatsSql()]: outcome(
+        [
+          ["schema_name", "String"],
+          ["table_name", "String"],
+          ["num_rows", "Nullable(UInt64)"],
+          ["data_compressed_size", "Nullable(UInt64)"],
+          ["index_size", "Nullable(UInt64)"],
+        ],
+        [["db", "t", "9007199254740993", "9007199254740993", "2"]],
+      ),
+    });
+    const [stats] = await getTableStats(runner);
+    // 2^53 + 1 has no double, so it reads as 2^53, one off.
+    expect(stats).toMatchObject({ rowCount: 2 ** 53, tableSizeBytes: 2 ** 53, totalSizeBytes: 2 ** 53 + 2 });
+  });
+
   test("storage: one row per database", async () => {
     const { runner } = routed({
       [STORAGE_SQL]: outcome(

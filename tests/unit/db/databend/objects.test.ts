@@ -374,10 +374,12 @@ describe("listObjects", () => {
     });
   });
 
-  test("a count past 2^53, which decodes as its text, is still read as a number", async () => {
-    const { runner } = scripted(outcome(LIST_SCHEMA, [["t", "18446744073709551615", "1", ""]]));
+  test("a count past 2^53, which decodes as its text, is read as its nearest number, so not exact", async () => {
+    const { runner } = scripted(outcome(LIST_SCHEMA, [["t", "18446744073709551615", "9007199254740993", ""]]));
     const [listed] = await listObjects(runner, CONTAINER, "table");
-    expect(listed.rowCount).toBe(Number("18446744073709551615"));
+    expect(listed.rowCount).toBe(2 ** 64);
+    // 2^53 + 1 has no double, so it reads as 2^53, one off.
+    expect(listed.sizeBytes).toBe(2 ** 53);
   });
 
   test("an over-budget list refuses with its sentence [X05]", async () => {
@@ -579,34 +581,40 @@ describe("readObjectSource", () => {
     expect(calls[0].sql).toBe(`SHOW CREATE TABLE ${C}.${D}.${O} WITH QUOTED_IDENTIFIERS`);
   });
 
-  test("a caller's bound marks the part", async () => {
+  test("a caller's bound marks the part and leaves it complete, as in every provider", async () => {
     const { runner } = scripted(outcome(SOURCE_SCHEMA, [["o", DDL]]));
     const [part] = (await readObjectSource(runner, CONTAINER, "table", OBJECT, 6)).parts;
-    expect(part).toMatchObject({ text: "CREATE", truncated: { limit: 6, reason: sourceBoundTruncationReason(6) } });
-  });
-
-  test("a statement budget cut sets the part's truncated [X05]", async () => {
-    const cut = { bound: "bytes", limit: 16_777_216 } as const;
-    const { runner } = scripted(outcome(SOURCE_SCHEMA, [["o", DDL]], cut));
-    const [part] = (await readObjectSource(runner, CONTAINER, "materialized_view", OBJECT)).parts;
     expect(part).toMatchObject({
-      text: DDL,
-      truncated: { limit: cut.limit, reason: DATABEND_OBJECT_SENTENCES.sourceCut(cut) },
+      text: "CREATE",
+      form: "complete",
+      truncated: { limit: 6, reason: sourceBoundTruncationReason(6) },
     });
   });
 
-  test("no definition answered is a refusal part, never an empty text", async () => {
+  // The budget keeps or drops the one row whole, so what it reached is either the whole DDL or none of it: neither is
+  // handed over, and a caller's bound is never applied to a text the provider did not read whole.
+  test("a definition read the statement budget reached is refused naming the bound, never shown [X05]", async () => {
+    const cut = { bound: "bytes", limit: 16_777_216 } as const;
+    await Promise.all(
+      [[["o", DDL]], []].map(async (rows) => {
+        const { runner } = scripted(outcome(SOURCE_SCHEMA, rows, cut));
+        const read = readObjectSource(runner, CONTAINER, "materialized_view", OBJECT, 6);
+        await expect(read).rejects.toBeInstanceOf(QueryError);
+        await expect(read).rejects.toThrow(DATABEND_OBJECT_SENTENCES.incomplete("definition", cut));
+      }),
+    );
+  });
+
+  test("an answer with no definition text raises naming the object, never a part [ADDING_A_PROVIDER]", async () => {
     await Promise.all(
       [[], [["o", "  "]], [["o", null]]].map(async (rows) => {
         const { runner } = scripted(outcome(SOURCE_SCHEMA, rows));
-        const [part] = (await readObjectSource(runner, CONTAINER, "view", OBJECT)).parts;
-        expect(part).toEqual({
-          id: SOURCE_PART_ID,
-          label: DATABEND_OBJECT_SENTENCES.sourceLabel,
-          unavailable: DATABEND_OBJECT_SENTENCES.noDefinition,
-        });
+        const read = readObjectSource(runner, CONTAINER, "view", OBJECT);
+        await expect(read).rejects.toBeInstanceOf(QueryError);
+        await expect(read).rejects.toThrow(`Databend answered no definition for "${OBJECT}".`);
       }),
     );
+    expect(DATABEND_OBJECT_SENTENCES.noDefinition(OBJECT)).toBe(`Databend answered no definition for "${OBJECT}".`);
   });
 });
 
@@ -626,7 +634,7 @@ describe("the sentences", () => {
       DATABEND_OBJECT_SENTENCES.unknownTableType("X"),
       DATABEND_OBJECT_SENTENCES.unknownKind("x"),
       DATABEND_OBJECT_SENTENCES.badLimit(0),
-      DATABEND_OBJECT_SENTENCES.noDefinition,
+      DATABEND_OBJECT_SENTENCES.noDefinition("v"),
       DATABEND_OBJECT_SENTENCES.noPassword("u"),
       DATABEND_OBJECT_SENTENCES.noColumns("v"),
     ];
@@ -635,7 +643,6 @@ describe("the sentences", () => {
       expect(sentence).not.toMatch(DASHES);
     }
     expect(DATABEND_OBJECT_SENTENCES.bulkCut(cut)).toMatch(/^the bulk column read /);
-    expect(DATABEND_OBJECT_SENTENCES.sourceCut(cut)).toMatch(/^the definition /);
     expect(DATABEND_OBJECT_SENTENCES.noColumnsLeftOut(["v"])).toBe(
       'Databend listed no columns for "v", as it does for a view that no longer plans, so it was left out',
     );

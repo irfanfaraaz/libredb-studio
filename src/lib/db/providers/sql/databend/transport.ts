@@ -84,7 +84,7 @@ export type DatabendAffect =
  * - `close-failed`: a best-effort final, ROLLBACK or logout that did not answer within its 5 s; a failed final of a
  *   complete result is this notice and never an error, which would report a committed write as failed.
  * - `close-refused`: a final, ROLLBACK or logout answered with something other than its acknowledgment: an error
- *   status, or a gateway's refusal over HTTP 200.
+ *   status, a gateway's refusal over HTTP 200, or a 200 of the ROLLBACK's chain that could not be read.
  * - `close-skipped`: a close that was never sent, because Databend had refused the sign-in on an earlier request of
  *   the statement and the run sends nothing after that (design 3.5).
  * - `result-mode`: the server echoed an `http_json_result_mode` other than `display` (design section 4), the mode

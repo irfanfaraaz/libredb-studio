@@ -1102,7 +1102,9 @@ describe("the object surface and monitoring delegate to objects.ts and introspec
     ["getIndexStats", (p: DatabendProvider) => p.getIndexStats(), [SQL.indexStats]],
     ["getStorageStats", (p: DatabendProvider) => p.getStorageStats(), [SQL.storage]],
   ])("%s sends exactly its module's statements", async (_name, call, expected) => {
-    const { provider, sent } = await connected();
+    // A definition read raises on an answer with no definition text, so the source statement answers one.
+    const ddl = { schema: [column("Table"), column("Create Table")], data: [["t", "CREATE MATERIALIZED VIEW t"]] };
+    const { provider, sent } = await connected((sql) => (sql === SQL.materializedSource("t") ? ddl : undefined));
     await call(provider);
     expect(sent()).toEqual(expected);
   });

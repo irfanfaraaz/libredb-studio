@@ -83,6 +83,13 @@ export interface ParsedConnection {
    */
   warehouse?: string;
   /**
+   * The consent to send the password without TLS that the paste carries, for the form's box of that name. A Databend
+   * DSN has no parameter that gives it, so a Databend paste answers `false`, and the form clears a consent an earlier
+   * connection or paste left ticked rather than send the password in cleartext to a host nobody consented for. Absent
+   * for every other scheme, whose paste leaves the box as it was: Db2's form shares it.
+   */
+  allowInsecureAuth?: boolean;
+  /**
    * The names of the query parameters the paste did not apply, each once, in the order pasted. Names only: a
    * parameter's value can be a secret, so it never leaves the parser.
    */
@@ -774,8 +781,9 @@ const DATABEND_SIGN_IN_PARAMETERS = new Set([
  * A Databend DSN, read the way BendSQL reads it (`core/src/client.rs`, `from_dsn`): TLS unless `sslmode=disable`,
  * where `require` and `enable` verify the certificate; the DSN's port, else 443 with TLS and 80 without; the path is
  * the database and `warehouse=` the warehouse. `databend+http://` and `databend+https://` set the transport as
- * databend-go reads them, and an explicit `sslmode` wins over either. A repeated parameter takes its last value, as
- * BendSQL's does (databend-go takes the first).
+ * databend-go reads them, and an explicit `sslmode` wins over either; one BendSQL does not read leaves SSL mode as it
+ * was, with a caution, and the port the scheme's. A repeated parameter takes its last value, as BendSQL's does
+ * (databend-go takes the first).
  *
  * Three departures, each refusing rather than guessing: a `#` ends a URL, so a password holding one would be cut short;
  * a `/` or `?` ends the address part, so with one in the user or the password the URL parser reads the rest of the
@@ -807,7 +815,8 @@ function parseDatabendDSN(uri: string): ParsedConnection | null {
   // cannot read refuses the DSN wherever it stands.
   const sslmodes = url.searchParams.getAll("sslmode");
   const sslmode = sslmodes.find((mode) => !DATABEND_SSLMODES.has(mode)) ?? sslmodes.at(-1) ?? null;
-  let tls: TLSIntent = { sslMode: uri.startsWith("databend+http://") ? "disable" : "verify-system" };
+  const plainScheme = uri.startsWith("databend+http://");
+  let tls: TLSIntent = { sslMode: plainScheme ? "disable" : "verify-system" };
   let notice: string | undefined;
   const cautions: string[] = [];
   if (sslmode === "disable") tls = { sslMode: "disable" };
@@ -823,16 +832,18 @@ function parseDatabendDSN(uri: string): ParsedConnection | null {
 
   const warehouse = url.searchParams.getAll("warehouse").at(-1) || databendCloudHostWarehouse(url.hostname);
   const ignored = names.filter((name) => !DATABEND_APPLIED_PARAMETERS.has(name));
+  // An sslmode BendSQL does not read leaves the mode unset, so the port is the scheme's: 80 for +http, else 443.
+  const plain = tls.sslMode === undefined ? plainScheme : tls.sslMode === "disable";
   return {
     type: "databend",
     host: url.hostname || "localhost",
-    // A refused sslmode leaves the mode unset, and BendSQL refuses the DSN, so the port follows the TLS default.
-    port: url.port || (tls.sslMode === "disable" ? "80" : "443"),
+    port: url.port || (plain ? "80" : "443"),
     user: url.username ? safeDecodeURIComponent(url.username) : undefined,
     password: url.password ? safeDecodeURIComponent(url.password) : undefined,
     database: url.pathname.slice(1) || undefined,
     ...(warehouse ? { warehouse } : {}),
     ...tls,
+    allowInsecureAuth: false,
     ...(notice ? { notice } : {}),
     ...(cautions.length > 0 ? { cautions } : {}),
     ...(ignored.length > 0 ? { ignoredParameters: ignored } : {}),

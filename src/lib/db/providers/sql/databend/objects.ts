@@ -25,8 +25,8 @@
  *   view with 1302, which `SHOW CREATE MATERIALIZED VIEW` reads instead (L6).
  *
  * A statement budget cut (design 3.12) is never handed over as complete [X05]: `describeObjects` drops the partly
- * read last object and says so in `truncated`, `readObjectSource` marks its part, and every read whose answer has no
- * such field refuses with a sentence naming the bound.
+ * read last object and says so in `truncated`, and every other read refuses with a sentence naming the bound,
+ * `readObjectSource` among them, since the budget never cuts a definition's one row but only keeps or drops it.
  */
 import { QueryError } from "@/lib/db/errors";
 import { applySourceBound, callerBoundTruncationReason } from "@/lib/db/object-kinds";
@@ -105,8 +105,6 @@ export const DATABEND_OBJECT_SENTENCES = Object.freeze({
     `Databend's answer to the ${surface} reached Studio's statement budget of ${DATABEND_OBJECT_SENTENCES.bound(cut)}, so Studio shows none of it rather than part of it.`,
   bulkCut: (cut: DatabendTruncation) =>
     `the bulk column read stopped at Studio's statement budget of ${DATABEND_OBJECT_SENTENCES.bound(cut)}, so the object it was reading was left out`,
-  sourceCut: (cut: DatabendTruncation) =>
-    `the definition stopped at Studio's statement budget of ${DATABEND_OBJECT_SENTENCES.bound(cut)}`,
   unknownTableType: (spelling: string) =>
     `Databend reported an object of table_type "${spelling}", which Studio has no object kind for.`,
   unknownKind: (kind: string) => `Databend has no object kind "${kind}" in Studio.`,
@@ -115,7 +113,7 @@ export const DATABEND_OBJECT_SENTENCES = Object.freeze({
     `Databend lists no columns for "${object}", as it does for a view that no longer plans, so Studio shows no column list rather than an empty one.`,
   noColumnsLeftOut: (objects: readonly string[]) =>
     `Databend listed no columns for ${objects.map((name) => `"${name}"`).join(", ")}, as it does for a view that no longer plans, so ${objects.length === 1 ? "it was" : "they were"} left out`,
-  noDefinition: "Databend answered no definition for this object.",
+  noDefinition: (object: string) => `Databend answered no definition for "${object}".`,
   noPassword: (user: string) =>
     `The user "${user}" is created with no_password, so the server accepts any password for it.`,
   sourceLabel: "Definition",
@@ -216,7 +214,10 @@ function readText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** A count or size the engine reported, or undefined for a NULL; an integer past 2^53 arrives as its text. */
+/**
+ * A count or size the engine reported, or undefined for a NULL; one past 2^53 arrives as its text and reads as its
+ * nearest number, so not exact.
+ */
 function readNumber(value: unknown): number | undefined {
   if (typeof value === "number") return value;
   return typeof value === "string" ? Number(value) : undefined;
@@ -437,7 +438,13 @@ export async function describeObjects(
   return cut === undefined ? { details } : { details, truncated: cut };
 }
 
-/** One object's DDL as one part: the engine's re-rendering, which runs as given. */
+/**
+ * One object's DDL as one part: the engine's re-rendering, which runs as given, so `complete`, and stays so under a
+ * caller's bound, which marks the part as it does across the fleet. The statement budget keeps or drops the answer's
+ * one row whole and never cuts the text inside it, so a read the budget reached is refused naming the bound, as the
+ * other reads are [X05], rather than handed over. An object Databend does not hold is Databend's own error (1025,
+ * 1003), and an answer with no definition text is raised naming the object, never a part (`ADDING_A_PROVIDER.md`).
+ */
 export async function readObjectSource(
   runner: DatabendStatementRunner,
   container: DatabendContainer,
@@ -445,29 +452,23 @@ export async function readObjectSource(
   object: string,
   limit?: number,
 ): Promise<ObjectSourceDocument> {
-  const path = [container.catalog, container.database, object];
-  const { rows, truncated } = await readRows(runner, databendSourceSql(container, kind, object));
+  const sql = databendSourceSql(container, kind, object);
+  const rows = await readCompleteRows(runner, sql, "definition");
   const text = readText(rows[0]?.[SOURCE_COLUMN]);
-  const base = { id: DATABEND_SOURCE_PART_ID, label: DATABEND_OBJECT_SENTENCES.sourceLabel };
-  if (text.trim() === "") {
-    return { path, kind, parts: [{ ...base, unavailable: DATABEND_OBJECT_SENTENCES.noDefinition }] };
-  }
+  if (text.trim() === "") throw new QueryError(DATABEND_OBJECT_SENTENCES.noDefinition(object), PROVIDER, sql);
   const bounded = applySourceBound(text, limit);
-  const mark =
-    truncated === null
-      ? bounded.truncated
-      : { limit: truncated.limit, reason: DATABEND_OBJECT_SENTENCES.sourceCut(truncated) };
   return {
-    path,
+    path: [container.catalog, container.database, object],
     kind,
     parts: [
       {
-        ...base,
+        id: DATABEND_SOURCE_PART_ID,
+        label: DATABEND_OBJECT_SENTENCES.sourceLabel,
         text: bounded.text,
         language: "sql",
         form: "complete",
         origin: "regenerated",
-        ...(mark === undefined ? {} : { truncated: mark }),
+        ...(bounded.truncated === undefined ? {} : { truncated: bounded.truncated }),
       },
     ],
   };

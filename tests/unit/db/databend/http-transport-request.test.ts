@@ -1,9 +1,11 @@
 /**
  * The Databend HTTP transport's requests and its first answer (design 3.2 to 3.4; C6, C14, C17; X01, I6, I18), on the
  * scripted node transport with injected time: the closed statement body, the headers of every request, the checks the
- * first answer must pass before any page, the loop's result, and the notices it carries.
+ * first answer must pass before any page and every later page after it, the loop's result, and the notices it carries.
  */
 import { describe, expect, test } from "bun:test";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { DatabaseConfigError } from "@/lib/db/errors";
 import { DATABEND_ANSWER_SENTENCES } from "@/lib/db/providers/sql/databend/answer";
 import {
@@ -31,6 +33,7 @@ import {
 
 const FIRST = idsOf(1);
 const P = pathsOf(FIRST.queryId);
+const LOGOUT = "/v1/session/logout";
 
 async function failure(promise: Promise<unknown>): Promise<DatabendError> {
   try {
@@ -249,14 +252,54 @@ describe("the first answer (design 3.4)", () => {
     expect(error.message).toBe(S.middlewareRefused("bad session header"));
   });
 
-  test("a malformed 200 to the POST is protocol and is killed, with no logout", async () => {
+  test.each([
+    ["a 200 that does not parse", { status: 200, body: "<html>" }, F.notJson],
+    ["a 200 that is not JSON", { status: 200, body: "<html>", contentType: "text/html" }, F.notAnswer],
+    [
+      "a 200 past its page",
+      {
+        status: 200,
+        body: answerBody({
+          id: FIRST.queryId,
+          session_id: FIRST.sessionId,
+          schema: [{ name: "a", type: "Int32" }],
+          data: [["1"], ["2"], ["3"]],
+        }),
+      },
+      F.rows,
+    ],
+  ])(
+    "%s to the POST is protocol, killed and logged out: its session may hold a temporary table [X13]",
+    async (_label, reply, fault) => {
+      const { script, transport } = transportHarness([
+        { method: "POST", path: "/v1/query", reply },
+        { method: "GET", path: P.kill, reply: { status: 200 } },
+        { method: "POST", path: LOGOUT, reply: { status: 200 } },
+      ]);
+      const error = await failure(transport.run(statement("CREATE TEMP TABLE t (a INT)", { rowCut: 1 })));
+      script.expectDone();
+      expect(error.category).toBe("protocol");
+      expect(error.message).toBe(S.protocol(fault));
+      // The logout ends the statement's own session, the one the server may hold the table in.
+      expect(script.requests[2].headers["x-databend-session"]).toBe(script.requests[0].headers["x-databend-session"]);
+    },
+  );
+
+  test("an unreadable 200 to the POST whose kill is refused as a sign-in sends no logout: the sign-in latched", async () => {
     const { script, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: { status: 200, body: "<html>" } },
-      { method: "GET", path: P.kill, reply: { status: 200 } },
+      {
+        method: "GET",
+        path: P.kill,
+        reply: { status: 401, body: { error: { code: 5100, message: "Authentication failed" } } },
+      },
     ]);
-    const error = await failure(transport.run(statement("SELECT 1")));
+    expect((await failure(transport.run(statement("CREATE TEMP TABLE t (a INT)")))).message).toBe(
+      S.protocol(F.notJson),
+    );
+    expect((await failure(transport.run(statement("SELECT 1")))).category).toBe("auth");
+    expect(script.requests).toHaveLength(2);
     script.expectDone();
-    expect(error.message).toBe(S.protocol(F.notJson));
   });
 
   test("a refusal of the node transport before any socket is config, and nothing more is sent", async () => {
@@ -348,6 +391,145 @@ describe("the result", () => {
     ]);
     expect((await failure(transport.run(statement("SELECT")))).code).toBe(1065);
     script.expectDone();
+  });
+});
+
+describe("every later page, checked as the first answer is (design 3.4)", () => {
+  const SCHEMA = [
+    { name: "a", type: "Int32" },
+    { name: "b", type: "String" },
+  ];
+  /** A session that would ask for a ROLLBACK and a logout, were the answer that echoed it read as this statement's. */
+  const OPEN = { txn_state: "Active", need_keep_alive: true, settings: { http_json_result_mode: "display" } };
+  const RUNNING = ok(FIRST, { state: "Running", schema: SCHEMA, data: [["1", "x"]], next_uri: P.page(0) });
+
+  test.each([
+    ["another statement", { id: "0".repeat(32) }, F.queryId],
+    ["another session", { session_id: "another" }, F.sessionId],
+    ["a session Databend made itself", { session_id: "" }, F.proxySession],
+  ])("a page for %s is protocol, closed with the statement's own ids", async (_label, fields, fault) => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      {
+        method: "GET",
+        path: P.page(0),
+        reply: ok(FIRST, { schema: SCHEMA, data: [["2", "y"]], session: OPEN, next_uri: P.page(1), ...fields }),
+      },
+      { method: "GET", path: P.kill, reply: { status: 200 } },
+    ]);
+    const error = await failure(transport.run(statement("SELECT a, b FROM t")));
+    // One kill of our own query id in our own session; the other answer's open session closes nothing.
+    script.expectDone();
+    expect(error.category).toBe("protocol");
+    expect(error.message).toBe(S.protocol(fault));
+    expect(script.requests[2].headers["x-databend-session"]).toBe(script.requests[0].headers["x-databend-session"]);
+  });
+
+  test.each([
+    [
+      "its columns in another order",
+      [
+        { name: "b", type: "String" },
+        { name: "a", type: "Int32" },
+      ],
+      [["y", "2"]],
+    ],
+    [
+      "a column of another type",
+      [
+        { name: "a", type: "Int64" },
+        { name: "b", type: "String" },
+      ],
+      [["2", "y"]],
+    ],
+    [
+      "a column of another name",
+      [
+        { name: "a", type: "Int32" },
+        { name: "c", type: "String" },
+      ],
+      [["2", "y"]],
+    ],
+    ["one column more", [...SCHEMA, { name: "c", type: "String" }], [["2", "y", "z"]]],
+    ["rows and no schema", [], [[]]],
+  ])("a page with %s is protocol, and none of its rows is kept", async (_label, schema, data) => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      { method: "GET", path: P.page(0), reply: ok(FIRST, { schema, data, next_uri: P.page(1) }) },
+      { method: "GET", path: P.kill, reply: { status: 200 } },
+    ]);
+    const error = await failure(transport.run(statement("SELECT a, b FROM t")));
+    script.expectDone();
+    expect(error.category).toBe("protocol");
+    expect(error.message).toBe(S.protocol(F.pageSchema));
+  });
+
+  test("after a Starting answer with no schema, the first page's schema is the one every later page carries", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { state: "Starting", next_uri: P.page(0) }) },
+      { method: "GET", path: P.page(0), reply: ok(FIRST, { schema: SCHEMA, data: [["1", "x"]], next_uri: P.page(1) }) },
+      {
+        method: "GET",
+        path: P.page(1),
+        reply: ok(FIRST, { schema: [{ name: "a", type: "Int32" }], data: [["2"]], next_uri: P.page(2) }),
+      },
+      { method: "GET", path: P.kill, reply: { status: 200 } },
+    ]);
+    expect((await failure(transport.run(statement("SELECT a, b FROM t")))).message).toBe(S.protocol(F.pageSchema));
+    script.expectDone();
+  });
+
+  test("a long poll still running, with no schema and no rows, is read as it is, and the next page as well", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: RUNNING },
+      { method: "GET", path: P.page(0), reply: ok(FIRST, { state: "Running", next_uri: P.page(0) }) },
+      { method: "GET", path: P.page(0), reply: ok(FIRST, { schema: SCHEMA, data: [["2", "y"]], next_uri: P.final }) },
+      { method: "GET", path: P.final, reply: ok(FIRST) },
+    ]);
+    const outcome = await transport.run(statement("SELECT a, b FROM t"));
+    script.expectDone();
+    expect(outcome.schema).toEqual(SCHEMA);
+    expect(outcome.rows).toEqual([
+      ["1", "x"],
+      ["2", "y"],
+    ]);
+  });
+
+  test("every captured later page is for its statement's id and session, with its schema, so Databend passes", () => {
+    const root = join(import.meta.dir, "../../../fixtures/databend");
+    interface Captured {
+      readonly exchanges: readonly {
+        readonly request: { readonly method: string; readonly path: string };
+        readonly response: { readonly status: number; readonly body: unknown };
+      }[];
+    }
+    interface Answer {
+      readonly id: string;
+      readonly session_id: string;
+      readonly schema: readonly unknown[];
+    }
+    let pages = 0;
+    for (const run of readdirSync(root).filter((name) => /^(local|cloud)-/.test(name))) {
+      for (const file of readdirSync(join(root, run)).filter((name) => name !== "manifest.json")) {
+        const { exchanges } = JSON.parse(readFileSync(join(root, run, file), "utf8")) as Captured;
+        const firsts = new Map<string, Answer>();
+        for (const { request, response } of exchanges) {
+          const answer = response.body as Answer;
+          if (request.method === "POST" && request.path === "/v1/query" && response.status === 200) {
+            firsts.set(answer.id, answer);
+          }
+          const page = /^\/v1\/query\/([^/]+)\/page\/\d+$/.exec(request.path);
+          if (page === null || response.status !== 200) continue;
+          const first = firsts.get(page[1]) as Answer;
+          expect(answer.id, `${run}/${file}`).toBe(first.id);
+          expect(answer.session_id, `${run}/${file}`).toBe(first.session_id);
+          if (answer.schema.length > 0) expect(answer.schema, `${run}/${file}`).toEqual(first.schema);
+          pages += 1;
+        }
+      }
+    }
+    // select-pages of each run: two later pages each.
+    expect(pages).toBe(4);
   });
 });
 

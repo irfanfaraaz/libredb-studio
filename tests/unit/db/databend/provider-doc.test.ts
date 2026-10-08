@@ -43,6 +43,7 @@ import {
   DATABEND_STATEMENT_BYTES,
   DATABEND_SURFACE_TIMEOUT_MS,
 } from "@/lib/db/providers/sql/databend/connection-options";
+import { decodeOutcome } from "@/lib/db/providers/sql/databend/decode";
 import {
   answerError,
   DATABEND_ERROR_SENTENCES,
@@ -216,6 +217,7 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_ERROR_SENTENCES.deadlineBeforeAnswer("[seconds]"),
       DATABEND_ERROR_SENTENCES.cancelUnanswered,
       DATABEND_ERROR_SENTENCES.deadline("[seconds]"),
+      DATABEND_ERROR_SENTENCES.deadlineUnacknowledged("[seconds]"),
       DATABEND_ERROR_SENTENCES.cancelled,
       DATABEND_ERROR_SENTENCES.protocol("[fault]"),
       DATABEND_ERROR_SENTENCES.server(slot("[status]"), "[server text]"),
@@ -237,6 +239,7 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_PROTOCOL_FAULTS.queryId,
       DATABEND_PROTOCOL_FAULTS.sessionId,
       DATABEND_PROTOCOL_FAULTS.proxySession,
+      DATABEND_PROTOCOL_FAULTS.pageSchema,
       DATABEND_PROTOCOL_FAULTS.pollBound,
       DATABEND_PROTOCOL_FAULTS.rows,
       DATABEND_PROTOCOL_FAULTS.schema,
@@ -295,13 +298,13 @@ const QUOTED: Readonly<Record<string, { readonly keys: readonly string[]; readon
       DATABEND_OBJECT_SENTENCES.bound(BYTES_CUT),
       DATABEND_OBJECT_SENTENCES.incomplete("[surface]", BYTES_CUT),
       DATABEND_OBJECT_SENTENCES.bulkCut(BYTES_CUT),
-      DATABEND_OBJECT_SENTENCES.sourceCut(BYTES_CUT),
+      DATABEND_OBJECT_SENTENCES.incomplete("definition", BYTES_CUT),
       DATABEND_OBJECT_SENTENCES.unknownTableType("[type]"),
       DATABEND_OBJECT_SENTENCES.unknownKind("[kind]"),
       DATABEND_OBJECT_SENTENCES.badLimit(slot("[limit]")),
       DATABEND_OBJECT_SENTENCES.noColumns("[object]"),
       DATABEND_OBJECT_SENTENCES.noColumnsLeftOut(["[object]"]),
-      DATABEND_OBJECT_SENTENCES.noDefinition,
+      DATABEND_OBJECT_SENTENCES.noDefinition("[object]"),
       DATABEND_OBJECT_SENTENCES.noPassword("[user]"),
       DATABEND_OBJECT_SENTENCES.sourceLabel,
     ],
@@ -580,6 +583,31 @@ describe("docs/providers/databend.md quotes what the code says", () => {
     expect(read("access_token=t&role=r")?.refusal).toBe(DATABEND_DSN_REFUSALS.signIn);
   });
 
+  test("a paste past an unread sslmode gets the scheme's port and unticks the cleartext consent, as 4.1 and 4.3 say", () => {
+    const fields = flat(sectionOf(DOC, "### 4.1 Configuration fields"));
+    expect(fields).toContain(
+      "Such an `sslmode` leaves SSL mode as it was, so a DSN without a port gets the scheme's: 80 for `databend+http://` and 443 for `databend://` and `databend+https://`.",
+    );
+    const port = (scheme: string) => parseConnectionString(`${scheme}root@host/db?sslmode=verify-full`)?.port;
+    expect([port("databend+http://"), port("databend://"), port("databend+https://")]).toEqual(["80", "443", "443"]);
+    expect(fields).toContain("and clears Send the password without TLS, which no DSN carries,");
+    expect(flat(sectionOf(DOC, "### 4.3 TLS and the password rule"))).toContain(
+      "A DSN pasted into Paste URL unticks it (section 4.1), so it is ticked again only for the pasted host.",
+    );
+    for (const scheme of ["databend://", "databend+http://", "databend+https://"])
+      expect(parseConnectionString(`${scheme}root@host/db`)?.allowInsecureAuth, scheme).toBe(false);
+  });
+
+  test("a count from 2^53 up is the nearest number, as 5.4 says, while the row keeps it exact", () => {
+    expect(flat(sectionOf(DOC, "### 5.4 Result shape"))).toContain(
+      "The result's row count is a number, so a count from 2^53 up is the nearest one, which can be off in its last digits, while the kept row holds the exact count as text.",
+    );
+    const column = "number of rows updated";
+    const decoded = decodeOutcome({ schema: [{ name: column, type: "UInt64" }], rows: [["9007199254740993"]] }, "U");
+    expect(decoded.rowCount).toBe(2 ** 53);
+    expect(decoded.rows).toEqual([{ [column]: "9007199254740993" }]);
+  });
+
   test("an @ past the address part is refused whatever the address part holds, and reads one way encoded", () => {
     const prose = flat(sectionOf(DOC, "### 4.1 Configuration fields"));
     const encoded = "databend://root:pw@host:443/db?role=analyst%40corp";
@@ -626,6 +654,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "deadlineBeforeAnswer",
         "cancelUnanswered",
         "deadline",
+        "deadlineUnacknowledged",
         "cancelled",
         "protocol",
         "server",
@@ -644,6 +673,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "queryId",
         "sessionId",
         "proxySession",
+        "pageSchema",
         "pollBound",
         "rows",
         "schema",
@@ -677,7 +707,6 @@ describe("docs/providers/databend.md quotes what the code says", () => {
         "bound",
         "incomplete",
         "bulkCut",
-        "sourceCut",
         "unknownTableType",
         "unknownKind",
         "badLimit",
@@ -1203,6 +1232,7 @@ describe("docs/providers/databend.md quotes what the code says", () => {
       "several replicas",
       "its first 100 different server warnings",
       "no query id for a running statement",
+      "from 2^53 up are the nearest number",
     ]) {
       expect(limits, fragment).toContain(fragment);
     }

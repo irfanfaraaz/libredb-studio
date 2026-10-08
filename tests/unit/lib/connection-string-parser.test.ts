@@ -1279,7 +1279,23 @@ describe("parseConnectionString: databend:// DSNs", () => {
       database: "default",
       warehouse: "small-xy2t",
       sslMode: "verify-system",
+      allowInsecureAuth: false,
     });
+  });
+
+  test("a DSN gives no consent to a password without TLS, so every Databend paste clears it", () => {
+    for (const dsn of [
+      "databend://u:p@host/db",
+      "databend+http://u:p@host:8000/db",
+      "databend+https://u:p@host/db?sslmode=disable",
+      "databend://u:p@host/db?sslmode=verify-full",
+    ]) {
+      expect(parseConnectionString(dsn)!.allowInsecureAuth, dsn).toBe(false);
+    }
+    // Db2's form shares the box, and a db2:// paste says nothing of it, so it leaves it as it was.
+    expect(parseConnectionString("db2://u:p@host:50000/db")).not.toHaveProperty("allowInsecureAuth");
+    // A refusal fills nothing.
+    expect(parseConnectionString("databend://u:p@host/db#x")).not.toHaveProperty("allowInsecureAuth");
   });
 
   test("TLS is on unless sslmode=disable, as BendSQL reads the DSN", () => {
@@ -1468,11 +1484,18 @@ describe("parseConnectionString: databend:// DSNs", () => {
     expect(parseConnectionString("databend://u:p@host/db?sslmode=disable")!.notice).toBeUndefined();
   });
 
-  test("an sslmode BendSQL refuses sets no mode and is reported, with the port still the TLS one", () => {
+  test("an sslmode BendSQL refuses sets no mode and is reported, with the port the scheme's: 80 for +http, else 443", () => {
     const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
     expect(result.sslMode).toBeUndefined();
     expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
     expect(result.port).toBe("443");
+    const plain = parseConnectionString("databend+http://u:p@host/db?sslmode=verify-full")!;
+    expect(plain.sslMode).toBeUndefined();
+    expect(plain.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    expect(plain.port).toBe("80");
+    expect(parseConnectionString("databend+https://u:p@host/db?sslmode=verify-full")!.port).toBe("443");
+    // The DSN's own port wins over either default.
+    expect(parseConnectionString("databend+http://u:p@host:8000/db?sslmode=verify-full")!.port).toBe("8000");
   });
 
   test("other parameters are named once each, in order, and never valued", () => {

@@ -3831,6 +3831,17 @@ describe("a databend:// paste (Databend design 6.2)", () => {
     expect(unmapped.current.testResult!.message).not.toContain("has no equivalent among");
   });
 
+  test("a databend+http:// paste with an sslmode BendSQL does not read fills Port 80 from the scheme, never 443", () => {
+    const plain = paste("databend+http://u:p@db.example.com/db?sslmode=verify-full");
+    expect(plain.current.type).toBe("databend");
+    expect(plain.current.port).toBe("80");
+    expect(plain.current.testResult).toEqual({
+      tone: "warning",
+      message: DATABEND_DSN_CAUTIONS.sslmode("verify-full"),
+    });
+    expect(paste("databend://u:p@db.example.com/db?sslmode=verify-full").current.port).toBe("443");
+  });
+
   test("a second paste replaces the first one's warehouse, or clears it, so its host is never sent that warehouse", async () => {
     const onTestConnection = mock<(connection: DatabaseConnection) => Promise<{ success: boolean }>>(async () => ({
       success: true,
@@ -3852,6 +3863,48 @@ describe("a databend:// paste (Databend design 6.2)", () => {
     });
     expect(onTestConnection).toHaveBeenCalledTimes(1);
     expect(onTestConnection.mock.calls[0][0]).not.toHaveProperty("warehouse");
+  });
+
+  test("a second paste never keeps the first host's consent to a password without TLS, so the new host gets none", async () => {
+    const onTestConnection = mock<(connection: DatabaseConnection) => Promise<{ success: boolean }>>(async () => ({
+      success: true,
+    }));
+    const { result } = renderHook(() => useConnectionForm({ ...defaultPasteProps, onTestConnection }));
+    const pasteNext = (text: string) => {
+      act(() => result.current.setPasteInput(text));
+      act(() => result.current.handlePasteConnectionString());
+    };
+    const probe = async () => {
+      await act(async () => {
+        await result.current.handleTestConnection();
+      });
+      return onTestConnection.mock.calls.at(-1)![0];
+    };
+    pasteNext("databend+http://root:pw@databend-a.example:8000/default");
+    act(() => result.current.setAllowInsecureAuth(true));
+    const first = await probe();
+    expect(first).toMatchObject({ host: "databend-a.example", allowInsecureAuth: true });
+    // No TLS: the consent is what lets the password go.
+    expect(first).not.toHaveProperty("ssl");
+    pasteNext("databend+http://root:pw@databend-b.example:8000/default");
+    expect(result.current.sslMode).toBe("disable");
+    expect(result.current.allowInsecureAuth).toBe(false);
+    const second = await probe();
+    expect(second).toMatchObject({ host: "databend-b.example", password: "pw" });
+    expect(second).not.toHaveProperty("allowInsecureAuth");
+  });
+
+  test("a databend:// paste clears a consent the form held from another connection; a db2:// paste leaves it", () => {
+    const databend = paste("databend+http://root:pw@databend-b.example:8000/default", (form) => {
+      form.setType("db2");
+      form.setAllowInsecureAuth(true);
+    });
+    expect(databend.current.type).toBe("databend");
+    expect(databend.current.allowInsecureAuth).toBe(false);
+    // Db2's form shares the box: its own paste is unchanged and keeps what the user ticked.
+    const db2 = paste("db2://db2inst1:pw@db2.example:50000/TESTDB", (form) => form.setAllowInsecureAuth(true));
+    expect(db2.current.type).toBe("db2");
+    expect(db2.current.allowInsecureAuth).toBe(true);
   });
 
   test("a paste of another engine's string clears a leftover warehouse too, which that engine never sends", () => {

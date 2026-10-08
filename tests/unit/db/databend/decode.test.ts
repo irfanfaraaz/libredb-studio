@@ -156,12 +156,24 @@ describe("decodeOutcome: the one-row DML answer", () => {
     expect(result.rowCount).toBe(0);
   });
 
-  test("a count beyond 2^53 cannot be a number, so rowCount stays the row count", () => {
-    const result = decodeOutcome(
-      { schema: [{ name: "number of rows inserted", type: "UInt64" }], rows: [["18446744073709551615"]] },
-      SQL,
-    );
-    expect(result.rowCount).toBe(1);
+  test("a count from 2^53 up is the nearest number, while its row keeps the exact count as text", () => {
+    const decode = (count: string) =>
+      decodeOutcome({ schema: [{ name: "number of rows inserted", type: "UInt64" }], rows: [[count]] }, SQL);
+    const largest = decode("18446744073709551615");
+    expect(largest.rowCount).toBe(2 ** 64);
+    expect(largest.rows).toEqual([{ "number of rows inserted": "18446744073709551615" }]);
+    // 2^53 + 1 has no double: the nearest is 2^53, one off, which is why the row keeps the text.
+    expect(decode("9007199254740993").rowCount).toBe(2 ** 53);
+  });
+
+  test("a count cell that is NULL or not a number leaves rowCount the row count", () => {
+    for (const count of [null, "abc", "1e3"]) {
+      const result = decodeOutcome(
+        { schema: [{ name: "number of rows deleted", type: "UInt64" }], rows: [[count]] },
+        SQL,
+      );
+      expect(result.rowCount).toBe(1);
+    }
   });
 
   test("a query that merely aliases a column so is read as a query when its shape differs", () => {

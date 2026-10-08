@@ -1,8 +1,9 @@
 /**
  * The client session and the end-open of design 3.4 and 3.7 (C11; X13): only the statement's own session is ever
  * sent, an `Active` transaction is rolled back under a new query id with its links followed inside the same 5 s and no
- * second end-open, `Fail` sends nothing, a session that still needs keep-alive is logged out, and a POST with no
- * answer gets one kill and one logout with our session id.
+ * second end-open, a ROLLBACK link answered with a 200 it cannot read is a refused close and one with no answer a
+ * failed one, `Fail` sends nothing, a session that still needs keep-alive is logged out, and a POST with no answer
+ * gets one kill and one logout with our session id.
  */
 import { describe, expect, test } from "bun:test";
 import { DATABEND_ERROR_SENTENCES as S, DATABEND_PROTOCOL_FAULTS as F } from "@/lib/db/providers/sql/databend/errors";
@@ -196,6 +197,52 @@ describe("an Active transaction (design 3.4; X13)", () => {
     expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-refused", step: "rollback" }]);
   });
 
+  test.each([
+    ["a body that does not parse", { status: 200, body: "<html>" }],
+    ["a body that is not JSON", { status: 200, body: "<html>", contentType: "text/html" }],
+    ["a field of the wrong type", { status: 200, body: { id: ROLLBACK_ID, state: 7 } }],
+    [
+      "nesting past its bound",
+      { status: 200, body: `{"id":"x","state":"Running","x":${"[".repeat(70)}${"]".repeat(70)}}` },
+    ],
+  ])(
+    "a ROLLBACK link answered with %s was answered: a refused close, never one that got no answer",
+    async (_label, reply) => {
+      const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
+      const { script, transport } = transportHarness([
+        { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE }) },
+        { method: "POST", path: "/v1/query", reply: ok(rollback, { session: echo({}), next_uri: R.page(0) }) },
+        { method: "GET", path: R.page(0), reply },
+      ]);
+      const outcome = await transport.run(statement("BEGIN"));
+      script.expectDone();
+      expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-refused", step: "rollback" }]);
+    },
+  );
+
+  test("a ROLLBACK link that gets no answer is a failed close", async () => {
+    const rollback = { queryId: ROLLBACK_ID, sessionId: FIRST.sessionId };
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE }) },
+      { method: "POST", path: "/v1/query", reply: ok(rollback, { session: echo({}), next_uri: R.page(0) }) },
+      { method: "GET", path: R.page(0), reply: { fail: "network" } },
+    ]);
+    const outcome = await transport.run(statement("BEGIN"));
+    script.expectDone();
+    expect(outcome.notices).toEqual([{ kind: "transaction-ended" }, { kind: "close-failed", step: "rollback" }]);
+  });
+
+  test("a ROLLBACK answered with a 200 it cannot read may leave the transaction open, and the session is logged out", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: ACTIVE }) },
+      { method: "POST", path: "/v1/query", reply: { status: 200, body: "<html>" } },
+      { method: "POST", path: LOGOUT, reply: { status: 200 } },
+    ]);
+    const outcome = await transport.run(statement("BEGIN"));
+    script.expectDone();
+    expect(outcome.notices).toEqual([{ kind: "transaction-may-stay-open" }, { kind: "temp-tables-dropped" }]);
+  });
+
   test("a ROLLBACK that hangs is cut by its own 5 s deadline", async () => {
     const { script, time, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: ok(FIRST, { session: echo({ txn_state: "Active" }) }) },
@@ -218,7 +265,7 @@ describe("an Active transaction (design 3.4; X13)", () => {
 });
 
 describe("an echoed session nested past what an answer may have (REV-T-1)", () => {
-  test("is a protocol fault before it is parsed: the statement is killed, and no ROLLBACK stringifies it", async () => {
+  test("is a protocol fault before it is parsed: killed and logged out, and no ROLLBACK stringifies it", async () => {
     // Written as text: JSON.stringify overflows on 50,000 levels, in this test as in the ROLLBACK's body.
     const deep = `${"[".repeat(50_000)}${"]".repeat(50_000)}`;
     const session = `{"txn_state":"Active","need_keep_alive":false,"settings":{"http_json_result_mode":"display"},"x":${deep}}`;
@@ -226,12 +273,15 @@ describe("an echoed session nested past what an answer may have (REV-T-1)", () =
     const { script, transport } = transportHarness([
       { method: "POST", path: "/v1/query", reply: { status: 200, body } },
       { method: "GET", path: P.kill, reply: { status: 200 } },
+      // The answer was not read, so its session may hold a temporary table: the logout has no body to stringify.
+      { method: "POST", path: LOGOUT, reply: { status: 200 } },
     ]);
     const error = await transport.run(statement("SELECT version()")).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(DatabendError);
     expect((error as DatabendError).category).toBe("protocol");
     expect((error as DatabendError).message).toBe(S.protocol(F.depth));
     script.expectDone();
+    expect(script.requests[2].body).toBeUndefined();
   });
 });
 

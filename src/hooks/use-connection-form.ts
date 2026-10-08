@@ -1029,6 +1029,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     // A paste that names a server names its warehouse too, or none: a leftover one would go to the new host and
     // resume, and bill, the previous DSN's compute there.
     if (parsed.host) setWarehouse(parsed.warehouse ?? "");
+    // A Databend paste names no consent to a cleartext password, so it clears one left ticked for another host; a
+    // parse that says nothing of it leaves it as it was, db2:// among them, the one other paste whose form shows it.
+    if (parsed.allowInsecureAuth !== undefined) setAllowInsecureAuth(parsed.allowInsecureAuth);
     // A scheme that IS the transport (https:// for ClickHouse) carries TLS that no
     // field can express. Without this the form keeps its "disable" default and the
     // connection goes out as plaintext HTTP to a TLS port.

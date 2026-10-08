@@ -65,6 +65,8 @@ export const DATABEND_ERROR_SENTENCES = Object.freeze({
   deadlineBeforeAnswer: (seconds: string) => `no first answer within ${seconds} seconds`,
   cancelUnanswered: "Studio asked Databend to stop the statement and got no answer, so it may still finish.",
   deadline: (seconds: string) => `The statement did not finish within ${seconds} seconds, so Studio cancelled it.`,
+  deadlineUnacknowledged: (seconds: string) =>
+    `The statement did not finish within ${seconds} seconds, and Databend did not acknowledge Studio's request to stop it, so it may still finish: check before running it again.`,
   cancelled: "The query was cancelled.",
   protocol: (what: string) =>
     `Databend's answer did not follow its HTTP protocol (${what}), so Studio stopped and cancelled the statement.`,
@@ -91,6 +93,7 @@ export const DATABEND_PROTOCOL_FAULTS = Object.freeze({
   queryId: "an answer for another statement",
   sessionId: "an answer for another session",
   proxySession: "an answer for another session; a proxy may drop the X-DATABEND-SESSION header",
+  pageSchema: "a later page with another schema",
   pollBound: "more answers than one statement may take",
   rows: "more rows than the page Studio asked for",
   schema: "a schema larger than a result can keep",
@@ -333,7 +336,11 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
   if (gatewayKind !== null && GATEWAY_HOST.has(gatewayKind)) {
     return new DatabendError("config", sentences.hostRefused, details);
   }
-  if (status === 401) return new DatabendError("protocol", sentences.followUpRefused, details);
+  if (status === 401) {
+    // The POST was refused before anything ran; only a request after it follows up a running statement.
+    const message = ctx.request === "post" ? sentences.middlewareRefused(detail) : sentences.followUpRefused;
+    return new DatabendError("protocol", message, details);
+  }
   if (ctx.request === "post" && status === 400 && code === 400) {
     return new DatabendError("config", sentences.middlewareRefused(detail), details);
   }
@@ -348,7 +355,12 @@ export function refusalError(refusal: DatabendRefusal, ctx: DatabendFailureConte
   return new DatabendError("server", sentences.server(status, detail), details);
 }
 
-/** Studio's own cancel or deadline, with what the run knew when it stopped (design 3.10; X02, X07). */
+/**
+ * Studio's own cancel or deadline, with what the run knew when it stopped (design 3.10; X02, X07). After the first
+ * answer either one stopped the statement only when Databend acknowledged the kill; otherwise the statement may
+ * still finish, and the failure is `outcome-unknown`. A probe or surface read on a named warehouse keeps X07's
+ * resuming sentence for its deadline.
+ */
 export function stopError(stop: DatabendStop, state: DatabendStopState, ctx: DatabendFailureContext): DatabendError {
   const provider = ctx.origin === "provider";
   if (!provider && !state.answered && !state.killAcknowledged) {
@@ -364,8 +376,12 @@ export function stopError(stop: DatabendStop, state: DatabendStopState, ctx: Dat
   }
   // A probe or surface read that outlasts its budget on a named warehouse is most likely a resume (X07).
   const wait = seconds(ctx.timeoutMs);
-  const message = provider && ctx.warehouse ? sentences.resuming(ctx.warehouse, wait) : sentences.deadline(wait);
-  return new DatabendError("timeout", message);
+  if (provider && ctx.warehouse) return new DatabendError("timeout", sentences.resuming(ctx.warehouse, wait));
+  // After the first answer the deadline stopped the statement only when Databend acknowledged the kill [X02].
+  if (state.answered && !state.killAcknowledged) {
+    return new DatabendError("outcome-unknown", sentences.deadlineUnacknowledged(wait));
+  }
+  return new DatabendError("timeout", sentences.deadline(wait));
 }
 
 /**

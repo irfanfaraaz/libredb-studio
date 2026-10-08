@@ -13,7 +13,8 @@
  *   after this run's last close, so a refused password is sent once.
  * - The statement POST carries a closed body built field by field (design 3.3) and new ids from `session.ts`. Its
  *   first answer must be for our query id and our session, from a node id of the accepted shape; a fail-to-start answer
- *   (`id` empty) has nothing to close.
+ *   (`id` empty) has nothing to close. Every later page must be for our query id and our session too, and one that
+ *   holds a schema or rows must hold the schema the rows so far were kept under; a page with neither is a long poll.
  * - The loop keeps the last echoed session, the first non-empty schema, the rows, the first 100 different warnings
  *   with a count of the rest, and the affect; it follows `next_uri` alone, and stops at the row, cell and byte budgets
  *   of design 3.12 or past the poll bound. Every answer is read within the page the POST asked for and the columns the
@@ -23,16 +24,18 @@
  *   server already ended it (an in-body error, a budget cut, a complete result), else the kill. A final or a kill is
  *   best effort under its own 5 s, off the statement's signal, and acknowledged only by a 200 that is not a gateway's
  *   refusal; a failed final of a complete result is a notice, never an error, which would report a committed write as
- *   failed [X02]. A POST that may have reached the server with no answer also sends one logout, since the session id
- *   is ours [X13]; a POST another status refused (`server`) is killed alone. An auth refusal, of the POST, a page or a
- *   close, a middleware 400 or a fail-to-start sends nothing more: a kill, ROLLBACK or logout would carry the refused
- *   credential again and count toward a lockout, and a logout left unsent so is told apart from one unanswered.
+ *   failed [X02]. A POST that may have reached the server with no answer read, its 200 unreadable included, also sends
+ *   one logout, since the session id is ours [X13]; a POST another status refused (`server`) is killed alone. An auth
+ *   refusal, of the POST, a page or a close, a middleware 400 or a fail-to-start sends nothing more: a kill, ROLLBACK or
+ *   logout would carry the refused credential again and count toward a lockout, and a logout left unsent so is told
+ *   apart from one unanswered.
  * - The end-open reads the server's flags, never SQL text: an `Active` transaction is rolled back under a new query
  *   id with its links followed inside the same 5 s, and a session still needing keep-alive is logged out, which drops
- *   its temporary tables. The echoed session never leaves `run()`.
+ *   its temporary tables. A ROLLBACK link answered with a 200 it cannot read was answered, so it is a refused close,
+ *   never an unanswered one. The echoed session never leaves `run()`.
  * - A cancel before the first answer can miss the statement, so a kill answered 404 is sent again at 250, 500 and
- *   1000 ms; after the first answer a cancel is `cancelled` only when Databend acknowledged the kill or an answer
- *   reported 1043 [X02].
+ *   1000 ms; after the first answer a cancel is `cancelled`, and a deadline `timeout`, only when Databend acknowledged
+ *   the kill or an answer reported 1043, and otherwise the statement may still finish [X02].
  *
  * Time, sleep, randomness, ids and deadlines are injected deps with production defaults, so no test waits on a real
  * timer [X16]. Every request goes through `createNodeTransport`, the one socket path.
@@ -235,14 +238,41 @@ class StoppedBetweenAttempts extends Error {
   }
 }
 
+/**
+ * A 200 a read close (the ROLLBACK and its links) could not read, malformed or past a bound of design 3.12: an answer
+ * arrived, so the close was refused, never left unanswered.
+ */
+const UNREADABLE = "unreadable";
+
+/** What one close got: what it was answered, a 200 it could not read, or null when nothing arrived. */
+type CloseAnswer = Exchanged | typeof UNREADABLE | null;
+
 /** A close Databend acknowledged: answered 200, and not with a gateway's refusal over HTTP 200. */
-function acknowledged(exchanged: Exchanged | null): boolean {
-  return exchanged?.response.status === 200 && exchanged.reading?.kind !== "refusal";
+function acknowledged(answer: CloseAnswer): boolean {
+  return answer !== UNREADABLE && answer?.response.status === 200 && answer.reading?.kind !== "refusal";
 }
 
-/** The notice of a close that was not acknowledged: refused when an answer came, failed when none did. */
-function closeNotice(exchanged: Exchanged | null, step: DatabendCloseStep): DatabendNotice {
-  return { kind: exchanged === null ? "close-failed" : "close-refused", step };
+/** The notice of a close that was not acknowledged: refused when an answer came, read or not, failed when none did. */
+function closeNotice(answer: CloseAnswer, step: DatabendCloseStep): DatabendNotice {
+  return { kind: answer === null ? "close-failed" : "close-refused", step };
+}
+
+/** The answer a read close got, when one arrived and read as an answer. */
+function answerOf(answer: CloseAnswer): DatabendAnswer | null {
+  return answer !== UNREADABLE && answer?.reading?.kind === "answer" ? answer.reading.answer : null;
+}
+
+/** A kill answered 404: the statement is not registered yet, so before the first answer it is sent again. */
+function notFound(answer: CloseAnswer): boolean {
+  return answer !== UNREADABLE && answer?.response.status === 404;
+}
+
+/** Whether two schemas name the same columns with the same types, in the same order. */
+function sameSchema(one: readonly DatabendColumn[], other: readonly DatabendColumn[]): boolean {
+  return (
+    one.length === other.length &&
+    one.every((column, index) => column.name === other[index].name && column.type === other[index].type)
+  );
 }
 
 /** A refusal of the node transport before any socket, such as the egress guard's, which names no address. */
@@ -359,7 +389,12 @@ class StatementRun {
   /** A POST that ended with no answer read: by the run's stop, the network, a cap, or a malformed 200. */
   private async postFailed(error: unknown): Promise<DatabendError> {
     if (error instanceof StoppedBetweenAttempts) return unsentStopError(this.stop(), this.context("post"));
-    if (error instanceof DatabendError) return this.abandon(error, null);
+    if (error instanceof DatabendError) {
+      // A 200 that could not be read, malformed or past a bound: the server may hold the statement and a temporary
+      // table in our session, so it is closed as a POST with no answer is.
+      await this.closeUnanswered();
+      return error;
+    }
     if (!(error instanceof TransportError)) return configError(error);
     const unanswered = { answered: false, killAcknowledged: false };
     // A TLS failure or a redirect never reached the query server's handler.
@@ -380,16 +415,11 @@ class StatementRun {
     answer: DatabendAnswer,
     response: NodeResponse,
   ): Promise<StatementOutcome & { role: string | null }> {
-    const { ids } = this;
     if (answer.id === "" && answer.error !== null) {
       throw answerError({ id: answer.id, error: answer.error }, this.context("post"), null);
     }
-    if (answer.id !== ids.queryId) throw await this.abandon(protocolError(DATABEND_PROTOCOL_FAULTS.queryId), null);
-    if (answer.sessionId !== ids.sessionId) {
-      // An empty echo is a session Databend made itself: the header did not arrive.
-      const fault = answer.sessionId ? DATABEND_PROTOCOL_FAULTS.sessionId : DATABEND_PROTOCOL_FAULTS.proxySession;
-      throw await this.abandon(protocolError(fault), null);
-    }
+    const identity = this.identityFault(answer);
+    if (identity !== null) throw await this.abandon(protocolError(identity), null);
     if (answer.nodeId === null || !NODE_ID.test(answer.nodeId)) {
       throw await this.abandon(protocolError(DATABEND_PROTOCOL_FAULTS.field("node_id")), null);
     }
@@ -460,9 +490,32 @@ class StatementRun {
       if (polls > maxPolls) return { kind: "refused", error: protocolError(DATABEND_PROTOCOL_FAULTS.pollBound) };
       // oxlint-disable-next-line no-await-in-loop -- each page names the next.
       const page = await this.page(link.path, gathered.session);
+      // Checked before anything of it is kept, so the close reads the last session of this statement's own answers.
+      const fault = this.pageFault(page.answer, gathered.schema);
+      if (fault !== null) return { kind: "refused", error: protocolError(fault) };
       current = page.answer;
       bytes += page.bytes;
     }
+  }
+
+  /** Why an answer is not this statement's: one for another query id, or for another session than ours. */
+  private identityFault(answer: DatabendAnswer): string | null {
+    if (answer.id !== this.ids.queryId) return DATABEND_PROTOCOL_FAULTS.queryId;
+    if (answer.sessionId === this.ids.sessionId) return null;
+    // An empty echo is a session Databend made itself: the header did not arrive.
+    return answer.sessionId ? DATABEND_PROTOCOL_FAULTS.sessionId : DATABEND_PROTOCOL_FAULTS.proxySession;
+  }
+
+  /**
+   * Why a later page is not this statement's, checked as its first answer is: another query id or session, or a
+   * schema unlike the one the rows so far were kept under, names and types in order. Until a schema is kept, a page's
+   * schema is not compared, and a page with no schema and no rows is a long poll still running.
+   */
+  private pageFault(answer: DatabendAnswer, kept: readonly DatabendColumn[]): string | null {
+    const identity = this.identityFault(answer);
+    if (identity !== null || kept.length === 0) return identity;
+    if (answer.schema.length === 0 && answer.data.length === 0) return null;
+    return sameSchema(answer.schema, kept) ? null : DATABEND_PROTOCOL_FAULTS.pageSchema;
   }
 
   /** Keeps a server warning, once, among the first `DATABEND_WARNING_LIMIT` different ones; one past them is counted. */
@@ -609,8 +662,9 @@ class StatementRun {
   }
 
   /**
-   * One close under its budget; its answer, or null when none arrived or the run's sign-in was refused, which sends
-   * nothing. A refusal of the close is reported to the latch like one of the POST.
+   * One close under its budget: what it was answered, `UNREADABLE` for a 200 a read close could not read, or null when
+   * nothing arrived or the run's sign-in was refused, which sends nothing. A refusal of the close is reported to the
+   * latch like one of the POST.
    */
   private async closeExchange(
     request: RetryRequest,
@@ -622,9 +676,9 @@ class StatementRun {
       readonly body?: string;
       readonly read?: boolean;
     } = {},
-  ): Promise<Exchanged | null> {
+  ): Promise<CloseAnswer> {
     if (this.signInRefused) return null;
-    const exchanged = await this.exchange({
+    const answer = await this.exchange({
       request,
       method,
       path,
@@ -634,9 +688,12 @@ class StatementRun {
       signal: budget.signal,
       endsAt: budget.endsAt,
       read: extra.read ?? false,
-    }).catch(() => null);
-    if (exchanged?.reading?.kind === "refusal") this.refused(exchanged.reading.refusal);
-    return exchanged;
+    }).catch(
+      // Only a read close reads its 200 as an answer, which throws `protocol` when it cannot; it still arrived.
+      (error: unknown): CloseAnswer => (error instanceof DatabendError ? UNREADABLE : null),
+    );
+    if (answer !== UNREADABLE && answer?.reading?.kind === "refusal") this.refused(answer.reading.refusal);
+    return answer;
   }
 
   /**
@@ -648,9 +705,9 @@ class StatementRun {
     const budget = this.closeBudget();
     for (;;) {
       // oxlint-disable-next-line no-await-in-loop -- a resent kill follows a 404.
-      const exchanged = await this.closeExchange("kill", "GET", killPath(this.ids.queryId), budget);
-      if (acknowledged(exchanged)) return true;
-      const wait = exchanged?.response.status === 404 ? resends.shift() : undefined;
+      const answer = await this.closeExchange("kill", "GET", killPath(this.ids.queryId), budget);
+      if (acknowledged(answer)) return true;
+      const wait = notFound(answer) ? resends.shift() : undefined;
       if (wait === undefined) return false;
       // oxlint-disable-next-line no-await-in-loop -- the wait before the kill is resent.
       await this.deps.sleep(wait, budget.signal);
@@ -659,11 +716,11 @@ class StatementRun {
 
   /** Closes a statement the server already ended; its failure is a notice, never an error [X02]. */
   private async final(): Promise<void> {
-    const exchanged = await this.closeExchange("final", "GET", finalPath(this.ids.queryId), this.closeBudget());
-    if (!acknowledged(exchanged)) this.notices.push(closeNotice(exchanged, "final"));
+    const answer = await this.closeExchange("final", "GET", finalPath(this.ids.queryId), this.closeBudget());
+    if (!acknowledged(answer)) this.notices.push(closeNotice(answer, "final"));
   }
 
-  private async logout(): Promise<Exchanged | null> {
+  private async logout(): Promise<CloseAnswer> {
     return this.closeExchange("logout", "POST", LOGOUT_PATH, this.closeBudget());
   }
 
@@ -675,9 +732,9 @@ class StatementRun {
     if (plan.includes("logout") && keepAlive) {
       // A logout a refused sign-in left unsent never went unanswered.
       const skipped = this.signInRefused;
-      const exchanged = await this.logout();
-      if (acknowledged(exchanged)) this.notices.push({ kind: "temp-tables-dropped" });
-      else this.notices.push(skipped ? { kind: "close-skipped", step: "logout" } : closeNotice(exchanged, "logout"));
+      const answer = await this.logout();
+      if (acknowledged(answer)) this.notices.push({ kind: "temp-tables-dropped" });
+      else this.notices.push(skipped ? { kind: "close-skipped", step: "logout" } : closeNotice(answer, "logout"));
     }
   }
 
@@ -694,7 +751,7 @@ class StatementRun {
       body: rollbackBody(session.raw),
       read: true,
     });
-    const answer = posted?.reading?.kind === "answer" ? posted.reading.answer : null;
+    const answer = answerOf(posted);
     this.notices.push(rollbackNotice(queryId, answer && { id: answer.id, txnState: answer.session?.txnState ?? null }));
     if (answer === null) return true;
     let next = answer.nextUri;
@@ -704,7 +761,7 @@ class StatementRun {
       const followed =
         // oxlint-disable-next-line no-await-in-loop -- each answer names the next link.
         link.kind === "refused" || polls > maxPolls ? null : await this.followRollback(link.path, budget);
-      const followedAnswer = followed?.reading?.kind === "answer" ? followed.reading.answer : null;
+      const followedAnswer = answerOf(followed);
       if (followedAnswer === null) {
         this.notices.push(closeNotice(followed, "rollback"));
         break;
@@ -714,11 +771,11 @@ class StatementRun {
     return answer.session?.needKeepAlive ?? true;
   }
 
-  /** One GET of the ROLLBACK's chain inside its budget; what it was answered, or null when nothing arrived. */
-  private async followRollback(
-    path: string,
-    budget: { signal: AbortSignal; endsAt: number },
-  ): Promise<Exchanged | null> {
+  /**
+   * One GET of the ROLLBACK's chain inside its budget: what it was answered, a 200 it could not read, or null when
+   * nothing arrived.
+   */
+  private async followRollback(path: string, budget: { signal: AbortSignal; endsAt: number }): Promise<CloseAnswer> {
     return this.closeExchange("rollback", "GET", path, budget, { read: true });
   }
 

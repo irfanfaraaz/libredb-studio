@@ -127,7 +127,10 @@ function readText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** A number Databend reported, or undefined for a NULL; an integer past 2^53 arrives as its text. */
+/**
+ * A number Databend reported, or undefined for a NULL; an integer past 2^53 arrives as its text and reads as its
+ * nearest number, so not exact.
+ */
 function readNumber(value: unknown): number | undefined {
   if (typeof value === "number") return value;
   return typeof value === "string" ? Number(value) : undefined;

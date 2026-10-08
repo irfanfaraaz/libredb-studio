@@ -4,7 +4,8 @@
  * a refusal of a close latches like one of the POST, and the run sends nothing after it; a gateway refusal over HTTP
  * 200 latches and only an answer proves a key; two tunnels to one far end share a key; two concurrent runs on an
  * unproven key send one request, the second only after the first's closes; a latch wait cut short by the run's own
- * signal is its stop, with nothing sent.
+ * signal is its stop, with nothing sent; a 401 with no sign-in code latches nothing and is worded by the request it
+ * refused, the POST or a follow-up.
  */
 import { describe, expect, test } from "bun:test";
 import { AUTH_LATCH_TTL_MS, createAuthLatch } from "@/lib/db/providers/sql/databend/auth-latch";
@@ -264,6 +265,36 @@ describe("a refused sign-in", () => {
     expect((await failure(transport.run(statement("SELECT 1")))).message).toStartWith(
       "Databend refused this sign-in at",
     );
+    script.expectDone();
+  });
+});
+
+describe("a 401 with no sign-in code (design 3.13)", () => {
+  test("on the POST is the request refused before it ran, never a follow-up, sends nothing more and does not latch", async () => {
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: { status: 401, body: "Unauthorized", contentType: "text/plain" } },
+      { method: "POST", path: "/v1/query", reply: ok(idsOf(2)) },
+    ]);
+    const refused = await failure(transport.run(statement("SELECT 1")));
+    expect(refused.category).toBe("protocol");
+    expect(refused.message).toBe(S.middlewareRefused("Unauthorized"));
+    await transport.run(statement("SELECT 2"));
+    expect(sent(script.requests)).toEqual(["POST /v1/query", "POST /v1/query"]);
+    script.expectDone();
+  });
+
+  test("on a page is a refused follow-up request, killed, and does not latch", async () => {
+    const P = pathsOf(FIRST.queryId);
+    const { script, transport } = transportHarness([
+      { method: "POST", path: "/v1/query", reply: ok(FIRST, { state: "Running", next_uri: P.page(0) }) },
+      { method: "GET", path: P.page(0), reply: { status: 401, body: { error: { code: 5104, message: "mismatch" } } } },
+      { method: "GET", path: P.kill, reply: { status: 200 } },
+      { method: "POST", path: "/v1/query", reply: ok(idsOf(2)) },
+    ]);
+    const refused = await failure(transport.run(statement("SELECT 1")));
+    expect(refused.category).toBe("protocol");
+    expect(refused.message).toBe(S.followUpRefused);
+    await transport.run(statement("SELECT 2"));
     script.expectDone();
   });
 });

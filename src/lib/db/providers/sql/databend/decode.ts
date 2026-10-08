@@ -14,7 +14,8 @@
  *
  * Columns are named by `uniqueFieldNames` and rows keyed positionally by `keyRowsByPosition`, which refuses a row
  * whose width is not the schema's. A one-row answer in a single `UInt64` column `number of rows inserted|updated|deleted`
- * is a DML statement's (M08b, M08f, M08i): its count is the `rowCount`, as Trino reports a statement's update count.
+ * is a DML statement's (M08b, M08f, M08i): its count is the `rowCount`, as Trino reports a statement's update count,
+ * and a count from 2^53 up, which the row keeps as its exact text, is the nearest number there, so not exact.
  * A SELECT aliasing a `UInt64` value to that name in that shape cannot be told apart on the wire and is read the same.
  */
 import { keyRowsByPosition } from "@/lib/db/utils/positional-rows";
@@ -35,6 +36,8 @@ const FLOAT_TYPES = new Set(["Float32", "Float64"]);
 /** The column a DML statement answers its count in, and its declared type (M08b, M08f, M08i). */
 const DML_COUNT_COLUMN = /^number of rows (?:inserted|updated|deleted)$/;
 const DML_COUNT_TYPE = "UInt64";
+/** A count's exact text from 2^53 up, which the cell keeps and the result's count reads as its nearest number. */
+const WHOLE_NUMBER_TEXT = /^\d+$/;
 
 const NULLABLE = /^Nullable\((.*)\)$/;
 
@@ -79,6 +82,8 @@ export function decodeOutcome(outcome: Pick<StatementOutcome, "schema" | "rows">
   ) {
     const count = values[0][0];
     if (typeof count === "number") rowCount = count;
+    // `rowCount` is a number, so a count from 2^53 up is its nearest one there and exact only in the row.
+    else if (typeof count === "string" && WHOLE_NUMBER_TEXT.test(count)) rowCount = Number(count);
   }
   return { fields, rows, rowCount, columnTypes };
 }

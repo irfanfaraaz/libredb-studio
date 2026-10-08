@@ -76,10 +76,11 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
   };
   const page = (schema: string, row: string) =>
     filled(`{"id":"q","session_id":"s","node_id":"n","state":"Running","schema":${schema},"data":[`, row, "]}");
-  // Page `n` of different warnings and no row, linking the next page; within one answer's allowance of values.
-  const warningsPage = (queryId: string, n: number): Buffer => {
+  // Page `n` of different warnings and no row, linking the next page; within one answer's allowance of values. It is
+  // the statement's own, as every later page must be.
+  const warningsPage = (queryId: string, sessionId: string, n: number): Buffer => {
     const count = 60_000;
-    const head = `{"id":"${queryId}","session_id":"s","node_id":"n","state":"Running","schema":[],"data":[],"warnings":[`;
+    const head = `{"id":"${queryId}","session_id":"${sessionId}","node_id":"n","state":"Running","schema":[],"data":[],"warnings":[`;
     const tail = `],"next_uri":"/v1/query/${queryId}/page/${n + 1}"}`;
     const prefix = `"p${String(n).padStart(4, "0")}w`;
     const buffer = Buffer.allocUnsafe(head.length + count * 14 - 1 + tail.length);
@@ -107,14 +108,15 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
     requests.push(`${request.method} ${url.replace(/[0-9a-f]{32}/, "<id>")}`);
     request.resume();
     const json = { "content-type": "application/json" };
+    // The session every request of the statement carries, which its answers echo.
+    const header = Buffer.from(String(request.headers["x-databend-session"]), "base64url").toString("utf8");
+    const sessionId = (JSON.parse(header) as { id: string }).id;
     if (request.method === "POST" && where === "post") {
       response.writeHead(status, json);
       response.end(body);
     } else if (request.method === "POST") {
       // The first answer, for the statement's own ids: running, and pointing at its first page.
       const queryId = String(request.headers["x-databend-query-id"]);
-      const header = Buffer.from(String(request.headers["x-databend-session"]), "base64url").toString("utf8");
-      const sessionId = (JSON.parse(header) as { id: string }).id;
       response.writeHead(200, json);
       response.end(
         JSON.stringify({
@@ -130,7 +132,7 @@ async function runCase(deps: ChildDeps, shape: string): Promise<ChildReport> {
     } else if (where === "pages" && url.includes("/page/")) {
       const [, , , queryId, , n] = url.split("/");
       response.writeHead(200, json);
-      response.end(warningsPage(queryId, Number(n)));
+      response.end(warningsPage(queryId, sessionId, Number(n)));
     } else if (url.endsWith("/page/0")) {
       response.writeHead(status, json);
       response.end(body);

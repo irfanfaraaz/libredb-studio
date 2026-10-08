@@ -60,6 +60,7 @@ function refusal(overrides: Partial<DatabendRefusal> = {}): DatabendRefusal {
 }
 
 const answered = { answered: true, killAcknowledged: false };
+const acknowledged = { answered: true, killAcknowledged: true };
 const unanswered = { answered: false, killAcknowledged: false };
 
 /** One row: the category, the house class `toDatabaseError` gives it, and the sentence. */
@@ -210,6 +211,21 @@ describe("a refused sign-in (L10, UC1, UC2, UC6)", () => {
       ConnectionError,
       S.followUpRefused,
     );
+  });
+
+  test("another 401 on the POST is the request refused before it ran, never a follow-up, protocol", () => {
+    for (const code of [5104, null]) {
+      const error = refusalError(refusal({ status: 401, code, text: "Unauthorized" }), context());
+      expectRow(error, "protocol", ConnectionError, S.middlewareRefused("Unauthorized"));
+      expect(error.status).toBe(401);
+    }
+  });
+
+  test("another 401 on the POST shows the server's words scrubbed and cut, as the middleware's 400 does", () => {
+    const scrubbed = refusalError(refusal({ status: 401, text: `denied ${TEST_PASSWORD}` }), context());
+    expect(scrubbed.message).toBe(S.middlewareRefused(WITHHELD));
+    const cut = refusalError(refusal({ status: 401, text: "x".repeat(400) }), context());
+    expect(cut.message).toBe(S.middlewareRefused(`${"x".repeat(300)}...`));
   });
 });
 
@@ -637,17 +653,66 @@ describe("our cancel and our deadline (X02, X07)", () => {
     );
   });
 
-  test("our deadline after an answer is timeout, whatever the kill did", () => {
+  test("our deadline after an answer, with the kill acknowledged, is timeout: Studio cancelled it", () => {
     const ctx = context({ timeoutMs: 60_000 });
-    const house = expectRow(stopError("deadline", answered, ctx), "timeout", TimeoutError, S.deadline("60"), ctx);
+    const house = expectRow(stopError("deadline", acknowledged, ctx), "timeout", TimeoutError, S.deadline("60"), ctx);
     expect((house as TimeoutError).timeout).toBe(60_000);
     expect((house as TimeoutError).query).toBe(SQL);
     expect(S.deadline("60")).toBe("The statement did not finish within 60 seconds, so Studio cancelled it.");
   });
 
+  test("our deadline after an answer, with a kill Databend did not acknowledge, is outcome-unknown (X02)", () => {
+    expectRow(
+      stopError("deadline", answered, context()),
+      "outcome-unknown",
+      ConnectionError,
+      S.deadlineUnacknowledged("60"),
+    );
+    expect(S.deadlineUnacknowledged("60")).toBe(
+      "The statement did not finish within 60 seconds, and Databend did not acknowledge Studio's request to stop it, so it may still finish: check before running it again.",
+    );
+  });
+
+  test("an unacknowledged deadline names no starting warehouse: the warehouse already answered", () => {
+    expectRow(
+      stopError("deadline", answered, context({ warehouse: "wh" })),
+      "outcome-unknown",
+      ConnectionError,
+      S.deadlineUnacknowledged("60"),
+    );
+  });
+
+  test("a provider statement's deadline after an answer needs an acknowledged kill too", () => {
+    const ctx = context({ origin: "provider", timeoutMs: 10_000 });
+    expectRow(
+      stopError("deadline", answered, ctx),
+      "outcome-unknown",
+      ConnectionError,
+      S.deadlineUnacknowledged("10"),
+      ctx,
+    );
+    expectRow(stopError("deadline", acknowledged, ctx), "timeout", TimeoutError, S.deadline("10"), ctx);
+  });
+
   test("a deadline under a second is said exactly, never as 0 seconds", () => {
-    expectRow(stopError("deadline", answered, context({ timeoutMs: 40 })), "timeout", TimeoutError, S.deadline("0.04"));
-    expectRow(stopError("deadline", answered, context({ timeoutMs: 1 })), "timeout", TimeoutError, S.deadline("0.001"));
+    expectRow(
+      stopError("deadline", acknowledged, context({ timeoutMs: 40 })),
+      "timeout",
+      TimeoutError,
+      S.deadline("0.04"),
+    );
+    expectRow(
+      stopError("deadline", acknowledged, context({ timeoutMs: 1 })),
+      "timeout",
+      TimeoutError,
+      S.deadline("0.001"),
+    );
+    expectRow(
+      stopError("deadline", answered, context({ timeoutMs: 40 })),
+      "outcome-unknown",
+      ConnectionError,
+      S.deadlineUnacknowledged("0.04"),
+    );
   });
 
   test("a 1043 answer under our deadline is timeout", () => {
@@ -691,7 +756,12 @@ describe("our cancel and our deadline (X02, X07)", () => {
   });
 
   test("a user statement's timeout never gives the resuming sentence", () => {
-    expectRow(stopError("deadline", answered, context({ warehouse: "wh" })), "timeout", TimeoutError, S.deadline("60"));
+    expectRow(
+      stopError("deadline", acknowledged, context({ warehouse: "wh" })),
+      "timeout",
+      TimeoutError,
+      S.deadline("60"),
+    );
   });
 
   test("a provider statement's cancel needs a kill 200 or a 1043 too", () => {
@@ -715,10 +785,16 @@ describe("our cancel and our deadline (X02, X07)", () => {
       S.cancelUnanswered,
     );
     expectRow(
-      transportFailure(new TransportError("timeout", "timed out"), answered, context()),
+      transportFailure(new TransportError("timeout", "timed out"), acknowledged, context()),
       "timeout",
       TimeoutError,
       S.deadline("60"),
+    );
+    expectRow(
+      transportFailure(new TransportError("timeout", "timed out"), answered, context()),
+      "outcome-unknown",
+      ConnectionError,
+      S.deadlineUnacknowledged("60"),
     );
   });
 });
