@@ -569,7 +569,7 @@ The empty states and caption say what each list covers:
 
 On the measured Cloud tenant `system_history.query_history` answered 1003, so the slow-query panel was empty there.
 
-> Query stats come from system_history.query_history, which needs Databend's history tables (on by default on Databend Cloud) and GRANT SELECT ON system_history.*, and fills in batches, so the newest statements arrive late.
+> Query stats come from system_history.query_history, which needs Databend's history tables (not every Databend Cloud tenant has them) and GRANT SELECT ON system_history.*, and fills in batches, so the newest statements arrive late.
 
 > No statement is running: this list covers every user's running statements on the server or warehouse, not only this connection's.
 

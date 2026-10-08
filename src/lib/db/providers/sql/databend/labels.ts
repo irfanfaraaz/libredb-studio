@@ -18,7 +18,7 @@ export const DATABEND_LABEL_SENTENCES = Object.freeze({
   vacuumGlobalDesc:
     "Databend's VACUUM TABLE removes data files past the Time Travel retention period, which Studio does not send; run it in the editor.",
   slowQueriesEmptyState:
-    "Query stats come from system_history.query_history, which needs Databend's history tables (on by default on Databend Cloud) and GRANT SELECT ON system_history.*, and fills in batches, so the newest statements arrive late.",
+    "Query stats come from system_history.query_history, which needs Databend's history tables (not every Databend Cloud tenant has them) and GRANT SELECT ON system_history.*, and fills in batches, so the newest statements arrive late.",
   sessionsEmptyState:
     "No statement is running: this list covers every user's running statements on the server or warehouse, not only this connection's.",
   tableStatsCaption: "The base tables of the default catalog, largest first; other catalogs are not read.",
